@@ -30,18 +30,6 @@ from typing import List, Tuple, Optional
 import time
 import glob
 
-
-import numpy as np
-import pandas as pd
-import pickle
-import cv2
-import tkinter as tk
-from tkinter import ttk, messagebox
-import os
-from typing import List, Tuple, Optional
-import time
-import glob
-
 try:
     from evaluation_tab import find_session_triplets as _find_session_triplets
     _HAS_EVAL_TAB = True
@@ -75,11 +63,6 @@ def scan_folders_for_sessions(root_folder: str, search_parents: bool = True) -> 
     return sessions
 
 
-def _scan_folders_fallback(root_folder: str, search_parents: bool) -> List[dict]:
-        
-        # Look for labels file in multiple locations
-        labels_path = None
-        video_dir = os.path.dirname(video_path)
 def _scan_folders_fallback(root_folder: str, search_parents: bool) -> List[dict]:
     """Minimal fallback used when evaluation_tab is not importable."""
     search_dirs = [root_folder]

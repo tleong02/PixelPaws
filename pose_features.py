@@ -53,7 +53,7 @@ class PoseFeatureExtractor:
         
         if file_extension == 'csv':
             # Load CSV with first 3 rows as headers
-            df = pd.read_csv(filepath, dtype='a')
+            df = pd.read_csv(filepath)
             # Combine rows 0 and 1 to create column names: bodypart_coordinate
             new_headers = df.iloc[0, 1:] + '_' + df.iloc[1, 1:]
             # Replace 'likelihood' with 'prob' for consistency
