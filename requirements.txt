@@ -1,0 +1,23 @@
+# PixelPaws Dependencies
+# Install all at once: pip install -r requirements.txt
+
+# Core scientific computing
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Computer vision & image processing
+opencv-python>=4.5.0
+Pillow>=8.3.0
+
+# Data file handling
+h5py>=3.1.0
+
+# Machine learning
+xgboost>=1.5.0
+scikit-learn>=1.0.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Model interpretability (optional but recommended)
+shap>=0.40.0

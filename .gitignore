@@ -1,0 +1,48 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Project data / outputs ───────────────────────────────────────────────────
+videos/
+features/
+results/
+analysis/
+evaluations/
+
+# ── Trained classifiers ──────────────────────────────────────────────────────
+*.pkl
+classifiers/
+
+# ── Large research files ─────────────────────────────────────────────────────
+*.tif
+*.tiff
+*.h5
+*.hdf5
+
+# ── Backup / old GUI versions ─────────────────────────────────────────────────
+PixelPaws_GUI_v2.py
+PixelPaws_GUI_FIXED.py
+PixelPaws_GUI_FIXED_for_claude.py
+PixelPaws_GU.py
+brightness_features_backup.py
+brightness_features_cpu_backup.py
+enable_pytorch_gpu_fixed.py
+
+# ── Project config (user-specific) ───────────────────────────────────────────
+PixelPaws_project.json
+
+# ── Claude Code local config ─────────────────────────────────────────────────
+.claude/
+
+# ── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

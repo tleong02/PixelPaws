@@ -1,0 +1,21 @@
+# PixelPaws - Minimal Requirements (GPU Enabled)
+
+numpy>=1.19.0
+pandas>=1.1.0
+scipy>=1.5.0
+scikit-learn>=0.23.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
+xgboost>=3.0.0
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+tensorflow>=2.8.0
+Pillow>=8.0.0
+h5py>=2.10.0
+tables>=3.6.0
+tqdm>=4.50.0
+
+# PyTorch with CUDA 12.1 (for GPU acceleration)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchvision>=0.15.0
