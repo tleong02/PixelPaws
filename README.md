@@ -31,7 +31,7 @@ PixelPaws is a desktop GUI that takes [DeepLabCut](https://github.com/DeepLabCut
 
 Manual scoring of animal behavior videos is slow, subjective, and doesn't scale. PixelPaws automates this by combining two complementary feature types:
 
-- **Pose kinematics** — pairwise distances, joint angles, and velocities computed from DeepLabCut keypoints across multiple timescales (implements the [BAREfoot](https://github.com/YttriLab/BAREfoot) algorithm)
+- **Pose kinematics** — pairwise distances, joint angles, and velocities computed from DeepLabCut keypoints across multiple timescales
 - **Pixel brightness** — raw pixel intensity in small ROIs around key body parts (e.g. paw, snout) directly from the video frames
 
 Together these give the classifier both *where the animal is* and *what the pixels look like*, making it robust to behaviors that involve subtle local changes (licking, flinching) as well as large postural shifts (rearing, grooming).
