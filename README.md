@@ -157,7 +157,7 @@ A live training visualization window shows cross-validation progress, ROC curves
 
 | Parameter | Default | Notes |
 |---|---|---|
-| n_estimators | 1700 | Matches BAREfoot paper |
+| n_estimators | 1700 |
 | max_depth | 6 | |
 | learning_rate | 0.01 | |
 | colsample_bytree | 0.2 | |
