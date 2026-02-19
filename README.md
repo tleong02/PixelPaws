@@ -322,6 +322,14 @@ Once the files are in place the images will render automatically on GitHub.
 
 ---
 
+## Attribution
+
+Pose kinematic and pixel brightness feature extraction is based on the algorithm described in:
+
+> Barkai O, Zhang B, et al. *BAREfoot: Behavior with Automatic Recognition and Evaluation.* Cell Reports Methods, 2025. https://github.com/OmerBarkai/BAREfoot
+
+---
+
 ## License
 
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free for academic and non-commercial use; commercial use requires permission.

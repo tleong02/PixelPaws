@@ -5,6 +5,13 @@ This version uses NumPy vectorization and parallel processing to maximize CPU sp
 Often faster than naive GPU approaches due to zero transfer overhead.
 
 Speed: 2-3x faster than standard CPU implementation
+
+Brightness feature extraction (ROI pixel intensity, log ratios, temporal derivatives)
+is based on the algorithm described in:
+
+    Barkai O, Zhang B, et al. "BAREfoot: Behavior with Automatic Recognition and
+    Evaluation." Cell Reports Methods, 2025.
+    https://github.com/OmerBarkai/BAREfoot
 """
 
 import numpy as np
