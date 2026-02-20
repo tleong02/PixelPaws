@@ -412,10 +412,10 @@ class CropForDLCApp:
         param_row = ttk.Frame(crop_frame)
         param_row.pack(**pad)
 
-        self.x_var = tk.IntVar(value=0)
+        self.x_var = tk.IntVar(value=286)
         self.y_var = tk.IntVar(value=0)
-        self.w_var = tk.IntVar(value=640)
-        self.h_var = tk.IntVar(value=480)
+        self.w_var = tk.IntVar(value=761)
+        self.h_var = tk.IntVar(value=720)
 
         for label, var in [("X:", self.x_var), ("Y:", self.y_var),
                            ("W:", self.w_var), ("H:", self.h_var)]:
@@ -582,6 +582,100 @@ class CropForDLCApp:
         self._log(f"Crop selected: x={x}  y={y}  w={w}  h={h}")
 
     # ------------------------------------------------------------------
+    # Batch confirmation dialog
+    # ------------------------------------------------------------------
+
+    def _ask_batch_confirm(self, video_path, x, y, w, h, result_holder, event):
+        """
+        Show a modal dialog for one video in a batch run.
+        Called on the main thread via root.after().
+        Sets result_holder[0] to 'crop', 'skip', or 'cancel', then signals event.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Confirm crop — {Path(video_path).name}")
+        dlg.grab_set()
+        dlg.resizable(True, True)
+
+        # --- Preview frame ---
+        preview_img = None
+        try:
+            import cv2
+            from PIL import Image, ImageDraw, ImageTk
+
+            cap = cv2.VideoCapture(video_path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total > 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+            ret, frame = cap.read()
+            cap.release()
+
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                fh, fw = frame_rgb.shape[:2]
+
+                max_disp_w, max_disp_h = 720, 540
+                scale = min(max_disp_w / fw, max_disp_h / fh, 1.0)
+                disp_w = int(fw * scale)
+                disp_h = int(fh * scale)
+
+                pil_img = Image.fromarray(frame_rgb).resize(
+                    (disp_w, disp_h), Image.LANCZOS)
+                draw = ImageDraw.Draw(pil_img)
+
+                rx0 = int(x * scale)
+                ry0 = int(y * scale)
+                rx1 = int((x + w) * scale)
+                ry1 = int((y + h) * scale)
+                # Green crop rectangle with a dark shadow for visibility
+                draw.rectangle([rx0 + 1, ry0 + 1, rx1 + 1, ry1 + 1],
+                               outline=(0, 0, 0), width=2)
+                draw.rectangle([rx0, ry0, rx1, ry1],
+                               outline=(0, 220, 0), width=2)
+
+                preview_img = ImageTk.PhotoImage(pil_img)
+        except Exception:
+            pass
+
+        if preview_img:
+            canvas = tk.Canvas(dlg, width=preview_img.width(),
+                               height=preview_img.height(),
+                               highlightthickness=0)
+            canvas.pack(padx=8, pady=(8, 4))
+            canvas.create_image(0, 0, anchor="nw", image=preview_img)
+            canvas._img = preview_img  # prevent GC
+        else:
+            ttk.Label(dlg,
+                      text="(Frame preview unavailable — install Pillow and OpenCV)",
+                      foreground="gray").pack(padx=16, pady=12)
+
+        ttk.Label(
+            dlg,
+            text=f"{Path(video_path).name}\n"
+                 f"Crop: x={x}  y={y}  w={w}  h={h}",
+            justify="center",
+        ).pack(pady=4)
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=(4, 10))
+
+        def _done(choice):
+            result_holder[0] = choice
+            dlg.destroy()
+            event.set()
+
+        ttk.Button(btn_row, text="Crop this video",
+                   command=lambda: _done("crop")).pack(
+            side="left", padx=8, ipadx=8, ipady=3)
+        ttk.Button(btn_row, text="Skip",
+                   command=lambda: _done("skip")).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel all",
+                   command=lambda: _done("cancel")).pack(side="left", padx=8)
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _done("cancel"))
+        dlg.wait_visibility()
+        dlg.lift()
+
+    # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
@@ -635,9 +729,40 @@ class CropForDLCApp:
                 if not os.path.isdir(video):
                     log(f"Error: not a directory: {video}")
                     return
-                process_batch(video, x, y, w, h, outdir, project,
-                              crf=crf, start_time=start_time, end_time=end_time,
-                              log_fn=log, progress_fn=progress)
+
+                video_exts = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+                videos = sorted(f for f in Path(video).iterdir()
+                                if f.is_file() and f.suffix.lower() in video_exts)
+                if not videos:
+                    log(f"No video files found in: {video}")
+                    return
+
+                n = len(videos)
+                log(f"Found {n} video(s). Confirm each crop before processing.")
+
+                for i, vp in enumerate(videos):
+                    result_holder = [None]
+                    ev = threading.Event()
+                    self.root.after(
+                        0, self._ask_batch_confirm,
+                        str(vp), x, y, w, h, result_holder, ev,
+                    )
+                    ev.wait()
+
+                    decision = result_holder[0]
+                    if decision == "cancel":
+                        log("Batch cancelled.")
+                        break
+                    elif decision == "skip":
+                        log(f"Skipped: {vp.name}")
+                        continue
+
+                    def _prog(p, i=i, n=n):
+                        progress((i + p) / n)
+
+                    process_single(str(vp), x, y, w, h, outdir, project,
+                                   crf=crf, start_time=start_time, end_time=end_time,
+                                   log_fn=log, progress_fn=_prog)
             else:
                 if not os.path.isfile(video):
                     log(f"Error: file not found: {video}")
