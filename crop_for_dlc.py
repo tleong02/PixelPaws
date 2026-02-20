@@ -589,18 +589,20 @@ class CropForDLCApp:
         """
         Show a modal dialog for one video in a batch run.
         Called on the main thread via root.after().
-        Sets result_holder[0] to 'crop', 'skip', or 'cancel', then signals event.
+        result_holder[0] is set to (decision, x, y, w, h) where decision is
+        'crop', 'skip', or 'cancel'.  event is signalled when done.
         """
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Confirm crop — {Path(video_path).name}")
         dlg.grab_set()
         dlg.resizable(True, True)
 
-        # --- Preview frame ---
-        preview_img = None
+        # --- Load base frame (no rectangle) for live redraw ---
+        base_pil = None
+        frame_scale = 1.0
         try:
             import cv2
-            from PIL import Image, ImageDraw, ImageTk
+            from PIL import Image, ImageTk  # noqa: F401 (presence check)
 
             cap = cv2.VideoCapture(video_path)
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -612,54 +614,82 @@ class CropForDLCApp:
             if ret:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 fh, fw = frame_rgb.shape[:2]
-
-                max_disp_w, max_disp_h = 720, 540
-                scale = min(max_disp_w / fw, max_disp_h / fh, 1.0)
-                disp_w = int(fw * scale)
-                disp_h = int(fh * scale)
-
-                pil_img = Image.fromarray(frame_rgb).resize(
+                max_disp_w, max_disp_h = 720, 500
+                frame_scale = min(max_disp_w / fw, max_disp_h / fh, 1.0)
+                disp_w = int(fw * frame_scale)
+                disp_h = int(fh * frame_scale)
+                from PIL import Image
+                base_pil = Image.fromarray(frame_rgb).resize(
                     (disp_w, disp_h), Image.LANCZOS)
-                draw = ImageDraw.Draw(pil_img)
-
-                rx0 = int(x * scale)
-                ry0 = int(y * scale)
-                rx1 = int((x + w) * scale)
-                ry1 = int((y + h) * scale)
-                # Green crop rectangle with a dark shadow for visibility
-                draw.rectangle([rx0 + 1, ry0 + 1, rx1 + 1, ry1 + 1],
-                               outline=(0, 0, 0), width=2)
-                draw.rectangle([rx0, ry0, rx1, ry1],
-                               outline=(0, 220, 0), width=2)
-
-                preview_img = ImageTk.PhotoImage(pil_img)
         except Exception:
             pass
 
-        if preview_img:
-            canvas = tk.Canvas(dlg, width=preview_img.width(),
-                               height=preview_img.height(),
+        # Canvas (or fallback label)
+        canvas = None
+        canvas_tk_img = [None]  # mutable ref to prevent GC
+        if base_pil:
+            canvas = tk.Canvas(dlg, width=base_pil.width, height=base_pil.height,
                                highlightthickness=0)
-            canvas.pack(padx=8, pady=(8, 4))
-            canvas.create_image(0, 0, anchor="nw", image=preview_img)
-            canvas._img = preview_img  # prevent GC
+            canvas.pack(padx=8, pady=(8, 2))
         else:
             ttk.Label(dlg,
                       text="(Frame preview unavailable — install Pillow and OpenCV)",
                       foreground="gray").pack(padx=16, pady=12)
 
-        ttk.Label(
-            dlg,
-            text=f"{Path(video_path).name}\n"
-                 f"Crop: x={x}  y={y}  w={w}  h={h}",
-            justify="center",
-        ).pack(pady=4)
+        # --- Editable crop params ---
+        param_frame = ttk.LabelFrame(dlg, text="Crop Parameters")
+        param_frame.pack(fill="x", padx=8, pady=4)
+        param_row = ttk.Frame(param_frame)
+        param_row.pack(pady=4)
 
+        xv = tk.IntVar(value=x)
+        yv = tk.IntVar(value=y)
+        wv = tk.IntVar(value=w)
+        hv = tk.IntVar(value=h)
+
+        for lbl, var in [("X:", xv), ("Y:", yv), ("W:", wv), ("H:", hv)]:
+            ttk.Label(param_row, text=lbl).pack(side="left")
+            ttk.Spinbox(param_row, textvariable=var, from_=0, to=9999,
+                        width=6).pack(side="left", padx=4)
+
+        def _redraw_preview(*_):
+            if base_pil is None or canvas is None:
+                return
+            try:
+                cx, cy, cw, ch = int(xv.get()), int(yv.get()), int(wv.get()), int(hv.get())
+            except (tk.TclError, ValueError):
+                return
+            from PIL import ImageDraw, ImageTk
+            img = base_pil.copy()
+            draw = ImageDraw.Draw(img)
+            s = frame_scale
+            rx0, ry0 = int(cx * s), int(cy * s)
+            rx1, ry1 = int((cx + cw) * s), int((cy + ch) * s)
+            draw.rectangle([rx0 + 1, ry0 + 1, rx1 + 1, ry1 + 1],
+                           outline=(0, 0, 0), width=2)
+            draw.rectangle([rx0, ry0, rx1, ry1],
+                           outline=(0, 220, 0), width=2)
+            tk_img = ImageTk.PhotoImage(img)
+            canvas_tk_img[0] = tk_img
+            canvas.create_image(0, 0, anchor="nw", image=tk_img)
+
+        for v in (xv, yv, wv, hv):
+            v.trace_add("write", _redraw_preview)
+        _redraw_preview()
+
+        ttk.Label(dlg, text=Path(video_path).name,
+                  foreground="gray").pack(pady=(0, 2))
+
+        # --- Buttons ---
         btn_row = ttk.Frame(dlg)
-        btn_row.pack(pady=(4, 10))
+        btn_row.pack(pady=(2, 10))
 
         def _done(choice):
-            result_holder[0] = choice
+            try:
+                result_holder[0] = (choice, int(xv.get()), int(yv.get()),
+                                    int(wv.get()), int(hv.get()))
+            except (tk.TclError, ValueError):
+                result_holder[0] = (choice, x, y, w, h)
             dlg.destroy()
             event.set()
 
@@ -737,30 +767,49 @@ class CropForDLCApp:
                     log(f"No video files found in: {video}")
                     return
 
-                n = len(videos)
-                log(f"Found {n} video(s). Confirm each crop before processing.")
+                log(f"Found {len(videos)} video(s) — confirm crops before encoding starts.")
 
-                for i, vp in enumerate(videos):
+                # --- Phase 1: collect decisions for all videos up front ---
+                # Each dialog starts with the params from the previous dialog so
+                # any per-video adjustment carries forward automatically.
+                plan = []   # list of (video_path, decision, cx, cy, cw, ch)
+                cur_x, cur_y, cur_w, cur_h = x, y, w, h
+                for vp in videos:
                     result_holder = [None]
                     ev = threading.Event()
                     self.root.after(
                         0, self._ask_batch_confirm,
-                        str(vp), x, y, w, h, result_holder, ev,
+                        str(vp), cur_x, cur_y, cur_w, cur_h, result_holder, ev,
                     )
                     ev.wait()
 
-                    decision = result_holder[0]
+                    decision, cx, cy, cw, ch = result_holder[0]
+                    plan.append((vp, decision, cx, cy, cw, ch))
+
                     if decision == "cancel":
-                        log("Batch cancelled.")
-                        break
-                    elif decision == "skip":
-                        log(f"Skipped: {vp.name}")
-                        continue
+                        log("Batch cancelled — no files encoded.")
+                        return
 
-                    def _prog(p, i=i, n=n):
+                    # Carry the (possibly edited) params forward to the next dialog
+                    cur_x, cur_y, cur_w, cur_h = cx, cy, cw, ch
+
+                # --- Phase 2: encode confirmed videos ---
+                to_encode = [(vp, cx, cy, cw, ch)
+                             for vp, dec, cx, cy, cw, ch in plan if dec == "crop"]
+                skipped   = [vp.name for vp, dec, *_ in plan if dec == "skip"]
+
+                if skipped:
+                    log(f"Skipping {len(skipped)} video(s): {', '.join(skipped)}")
+                if not to_encode:
+                    log("Nothing to encode.")
+                    return
+
+                log(f"Starting encoding: {len(to_encode)} video(s)…")
+                n_enc = len(to_encode)
+                for i, (vp, cx, cy, cw, ch) in enumerate(to_encode):
+                    def _prog(p, i=i, n=n_enc):
                         progress((i + p) / n)
-
-                    process_single(str(vp), x, y, w, h, outdir, project,
+                    process_single(str(vp), cx, cy, cw, ch, outdir, project,
                                    crf=crf, start_time=start_time, end_time=end_time,
                                    log_fn=log, progress_fn=_prog)
             else:
