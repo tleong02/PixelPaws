@@ -409,12 +409,13 @@ def run_batch_mode():
         if file.endswith(('.pickle', '.pkl')) and '_features' in file and '_corrected' not in file:
             features_files.append(os.path.join(directory, file))
     
-    # Check FeatureCache subdirectory
-    feature_cache = os.path.join(directory, 'FeatureCache')
-    if os.path.isdir(feature_cache):
-        for file in os.listdir(feature_cache):
-            if file.endswith(('.pickle', '.pkl')) and '_features' in file and '_corrected' not in file:
-                features_files.append(os.path.join(feature_cache, file))
+    # Check cache subdirectories (canonical first, then legacy)
+    for cache_name in ('features', 'FeatureCache'):
+        cache_subdir = os.path.join(directory, cache_name)
+        if os.path.isdir(cache_subdir):
+            for file in os.listdir(cache_subdir):
+                if file.endswith(('.pickle', '.pkl')) and '_features' in file and '_corrected' not in file:
+                    features_files.append(os.path.join(cache_subdir, file))
     
     if not features_files:
         messagebox.showwarning("No Files Found",

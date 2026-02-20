@@ -67,13 +67,23 @@ class PixelBrightnessExtractorOptimized:
         
         print(f"  Using optimized CPU with vectorization")
     
-    def extract_brightness_features(self, 
+    def extract_brightness_features(self,
                                     dlc_file: str,
                                     video_file: str,
                                     dt_vel: int = 2,
-                                    create_video: bool = False) -> pd.DataFrame:
+                                    create_video: bool = False,
+                                    optical_flow_extractor=None) -> pd.DataFrame:
         """
         Extract brightness features using optimized CPU processing.
+
+        Parameters
+        ----------
+        optical_flow_extractor : OpticalFlowExtractor | None
+            If provided (and already ``preload()``-ed with the DLC file),
+            optical-flow features are computed in the *same* video pass as
+            brightness, producing ``bpname_FlowMag/X/Y`` columns appended to
+            the returned DataFrame.  Pass ``None`` (default) for the original
+            brightness-only behaviour.
         """
         print(f"\n[CPU Extract] Processing {video_file}")
         start_time = time.time()
@@ -106,9 +116,10 @@ class PixelBrightnessExtractorOptimized:
         print(f"  Video: {num_frames} frames ({frame_width}x{frame_height}) @ {fps:.1f} fps")
         print(f"  Extracting with vectorized operations...")
         
-        # Extract base brightness features using vectorized approach
+        # Extract base brightness features (+ optional optical flow) in one pass
         brightness = self._extract_vectorized(
-            video_file, label, pix_threshold, frame_width, frame_height, num_frames
+            video_file, label, pix_threshold, frame_width, frame_height, num_frames,
+            optical_flow_extractor=optical_flow_extractor,
         )
         
         # Calculate absolute first derivative (temporal changes)
@@ -128,7 +139,8 @@ class PixelBrightnessExtractorOptimized:
         return X
     
     def _extract_vectorized(self, video_file, label, pix_threshold,
-                           frame_width, frame_height, num_frames):
+                           frame_width, frame_height, num_frames,
+                           optical_flow_extractor=None):
         """
         Vectorized extraction - pre-allocate arrays and minimize Python loops
         """
@@ -222,21 +234,30 @@ class PixelBrightnessExtractorOptimized:
         
         brightness_features = []
         cap = cv2.VideoCapture(video_file)
-        
+
+        if optical_flow_extractor is not None:
+            print("  Co-extracting optical flow in the same video pass...")
+
         if use_progress:
-            pbar = tqdm(total=num_frames, desc="  🐁 Analyzing", 
+            _desc = "  🐁 Analyzing + Flow" if optical_flow_extractor is not None else "  🐁 Analyzing"
+            pbar = tqdm(total=num_frames, desc=_desc,
                        unit="frames", ncols=100, smoothing=0.1,
                        bar_format=bar_format)
-        
+
+        prev_gray_u8 = None  # kept for optical flow (uint8, pre-threshold)
+
         # Process frames
         for i_frame in range(num_frames):
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # Vectorized grayscale conversion (OpenCV is already optimized)
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            
+
+            # uint8 grayscale — used as-is for Lucas-Kanade
+            gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # float32 copy for brightness (with threshold applied)
+            frame_gray = gray_u8.astype(np.float32)
+
             # Vectorized threshold application
             mask = frame_gray < pix_threshold
             frame_gray[mask] = 1.0
@@ -277,8 +298,18 @@ class PixelBrightnessExtractorOptimized:
                     ratio = brightness_values[i] / max(brightness_values[j], 1e-10)
                     bp_data[f'Log10(Pix_{bp1}/Pix_{bp2})'] = np.log10(ratio)
             
+            # Optical flow — same frame, no extra video read
+            if optical_flow_extractor is not None and prev_gray_u8 is not None:
+                flow = optical_flow_extractor.compute_flow_for_frame(
+                    i_frame, prev_gray_u8, gray_u8)
+                for bp, vals in flow.items():
+                    bp_data[f'{bp}_FlowMag'] = vals['mag']
+                    bp_data[f'{bp}_FlowX']   = vals['x']
+                    bp_data[f'{bp}_FlowY']   = vals['y']
+
             brightness_features.append(bp_data)
-            
+            prev_gray_u8 = gray_u8
+
             if use_progress:
                 # Animate the mouse running across the screen
                 progress_pct = (i_frame + 1) / num_frames

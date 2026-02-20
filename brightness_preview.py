@@ -367,22 +367,15 @@ class BrightnessPreview:
                 vbase = vbase.split(sfx)[0]
                 break
         
-        # Check FeatureCache first
+        # Check cache subdirectories (canonical first, then legacy names)
         patterns = []
-        fcache = os.path.join(vdir, 'FeatureCache')
-        if os.path.isdir(fcache):
-            patterns.extend([
-                os.path.join(fcache, f"{vbase}_features*.pickle"),
-                os.path.join(fcache, f"{vbase}_features*.pkl")
-            ])
-        
-        # Check PredictionCache
-        pcache = os.path.join(vdir, 'PredictionCache')
-        if os.path.isdir(pcache):
-            patterns.extend([
-                os.path.join(pcache, f"{vbase}_features*.pickle"),
-                os.path.join(pcache, f"{vbase}_features*.pkl")
-            ])
+        for cache_name in ('features', 'FeatureCache', 'PredictionCache'):
+            cdir = os.path.join(vdir, cache_name)
+            if os.path.isdir(cdir):
+                patterns.extend([
+                    os.path.join(cdir, f"{vbase}_features*.pickle"),
+                    os.path.join(cdir, f"{vbase}_features*.pkl"),
+                ])
         
         # Then same dir
         patterns.extend([

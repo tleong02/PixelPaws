@@ -20,6 +20,9 @@ import pandas as pd
 from typing import List, Tuple, Optional
 import itertools
 
+# Increment this when the feature set changes so cached files are invalidated
+POSE_FEATURE_VERSION = 2
+
 
 class PoseFeatureExtractor:
     """
@@ -258,23 +261,174 @@ class PoseFeatureExtractor:
                              for col in bp_prob.columns]
         return bp_inFrame
     
-    def extract_all_features(self, 
+    def calculate_paw_height(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame,
+                             window: int = 500) -> pd.DataFrame:
+        """
+        Estimate height of each body part above the floor.
+
+        Image y-axis increases downward, so the floor corresponds to the
+        rolling maximum of y.  Height > 0 when a paw is lifted.
+
+        Naming convention: bpname_Height
+        """
+        result_cols = []
+        for col in bp_ycord.columns:
+            bp_name = col.replace('_y', '')
+            floor = bp_ycord[col].rolling(window, min_periods=1).max()
+            height = (floor - bp_ycord[col]).clip(lower=0)
+            height.name = f'{bp_name}_Height'
+            result_cols.append(height)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_acceleration(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame,
+                               t: int = 1) -> pd.DataFrame:
+        """
+        Calculate magnitude of acceleration for each body part.
+
+        Acceleration = second difference of position / t.
+        Naming convention: bpname_Accel{t}
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(t)
+            vy = bp_ycord.iloc[:, i].diff(t)
+            ax = vx.diff(t)
+            ay = vy.diff(t)
+            accel = np.sqrt(ax ** 2 + ay ** 2) / t
+            accel.name = f'{bp_name}_Accel{t}'
+            result_cols.append(accel)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_convex_hull_area(self, bp_xcord: pd.DataFrame,
+                                   bp_ycord: pd.DataFrame) -> pd.DataFrame:
+        """
+        Per-frame area of the convex hull formed by all tracked body parts.
+
+        Returns a single column 'hull_area'.  Frames with fewer than 3 valid
+        points receive area = 0.
+        """
+        try:
+            from scipy.spatial import ConvexHull
+        except ImportError:
+            return pd.DataFrame()
+
+        n_frames = len(bp_xcord)
+        areas = np.zeros(n_frames)
+        for i in range(n_frames):
+            xs = bp_xcord.iloc[i].values.astype(float)
+            ys = bp_ycord.iloc[i].values.astype(float)
+            mask = ~(np.isnan(xs) | np.isnan(ys))
+            pts = np.column_stack([xs[mask], ys[mask]])
+            if pts.shape[0] >= 3:
+                try:
+                    hull = ConvexHull(pts)
+                    areas[i] = hull.volume  # In 2-D, .volume is the area
+                except Exception:
+                    areas[i] = 0
+        return pd.DataFrame({'hull_area': areas})
+
+    def calculate_body_elongation(self, bp_xcord: pd.DataFrame,
+                                  bp_ycord: pd.DataFrame) -> pd.DataFrame:
+        """
+        Per-frame aspect ratio (width / height) of the bounding box of all
+        tracked body parts.
+
+        Returns a single column 'body_elongation'.  Degenerate frames (zero
+        height) get elongation = 1.
+        """
+        w = bp_xcord.max(axis=1) - bp_xcord.min(axis=1)
+        h = bp_ycord.max(axis=1) - bp_ycord.min(axis=1)
+        elongation = (w / h.replace(0, np.nan)).fillna(1)
+        elongation.name = 'body_elongation'
+        return elongation.to_frame()
+
+    def calculate_bilateral_asymmetry(self, bp_xcord: pd.DataFrame,
+                                      bp_ycord: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Per-frame distance asymmetry between paired left/right body parts.
+
+        Auto-detects pairs by common prefix conventions:
+          hl/hr, fl/fr, left/right, l/r
+
+        Returns two columns per pair: {left}-{right}_AsymX and _AsymY.
+        Returns None if no pairs are detected.
+        """
+        bp_names = [col.replace('_x', '') for col in bp_xcord.columns]
+        bp_name_set = set(bp_names)
+
+        # Ordered from most-specific to least-specific to avoid false matches
+        LEFT_RIGHT_PATTERNS = [
+            ('left', 'right'),
+            ('Left', 'Right'),
+            ('hl', 'hr'),
+            ('fl', 'fr'),
+            ('l', 'r'),
+        ]
+
+        pairs = []
+        seen: set = set()
+        for bp in bp_names:
+            if bp in seen:
+                continue
+            for left_pat, right_pat in LEFT_RIGHT_PATTERNS:
+                if bp.startswith(left_pat):
+                    candidate = right_pat + bp[len(left_pat):]
+                    if candidate in bp_name_set and candidate not in seen:
+                        pairs.append((bp, candidate))
+                        seen.add(bp)
+                        seen.add(candidate)
+                        break
+                elif bp.startswith(right_pat):
+                    candidate = left_pat + bp[len(right_pat):]
+                    if candidate in bp_name_set and candidate not in seen:
+                        pairs.append((candidate, bp))  # store as (left, right)
+                        seen.add(bp)
+                        seen.add(candidate)
+                        break
+
+        if not pairs:
+            return None
+
+        result_dfs = []
+        for left_bp, right_bp in pairs:
+            left_x = bp_xcord[f'{left_bp}_x'].values
+            left_y = bp_ycord[f'{left_bp}_y'].values
+            right_x = bp_xcord[f'{right_bp}_x'].values
+            right_y = bp_ycord[f'{right_bp}_y'].values
+            col_prefix = f'{left_bp}-{right_bp}'
+            result_dfs.append(pd.DataFrame({
+                f'{col_prefix}_AsymX': np.abs(left_x - right_x),
+                f'{col_prefix}_AsymY': np.abs(left_y - right_y),
+            }))
+
+        return pd.concat(result_dfs, axis=1).reset_index(drop=True)
+
+    def extract_all_features(self,
                            dlc_file: str,
                            include_angles: bool = True,
                            include_velocities: bool = True,
                            include_distance_velocities: bool = True,
-                           include_in_frame: bool = True) -> pd.DataFrame:
+                           include_in_frame: bool = True,
+                           include_new_pose: bool = True) -> pd.DataFrame:
         """
         Extract all pose features from DLC file.
         Combines all feature types like BAREfoot's feature extraction pipeline.
-        
+
         Args:
             dlc_file: Path to DLC H5 or CSV file
             include_angles: Include angle features
             include_velocities: Include velocity features
             include_distance_velocities: Include distance velocity features
             include_in_frame: Include in-frame probability features
-            
+            include_new_pose: Include the 5 new coordinate-based features
+                (paw height, acceleration, convex hull area, body elongation,
+                bilateral asymmetry).  Default True.
+
         Returns:
             DataFrame with all pose features
         """
@@ -338,7 +492,20 @@ class PoseFeatureExtractor:
             bp_in_frame = self.calculate_in_frame_probability(bp_prob, self.likelihood_threshold)
             if not bp_in_frame.empty:
                 feature_dfs.append(bp_in_frame)
-        
+
+        # Add new coordinate-based pose features (v2)
+        if include_new_pose:
+            for fn in [
+                self.calculate_paw_height,
+                self.calculate_acceleration,
+                self.calculate_convex_hull_area,
+                self.calculate_body_elongation,
+                self.calculate_bilateral_asymmetry,
+            ]:
+                result = fn(bp_xcord, bp_ycord)
+                if result is not None and not result.empty:
+                    feature_dfs.append(result)
+
         # Check if we have any features
         if not feature_dfs:
             raise ValueError("No features could be extracted. Check that your DLC file has valid body part data.")

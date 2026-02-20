@@ -109,13 +109,14 @@ except ImportError:
 
 # Import new PixelPaws modules
 try:
-    from pose_features import PoseFeatureExtractor
+    from pose_features import PoseFeatureExtractor, POSE_FEATURE_VERSION
     from brightness_features import PixelBrightnessExtractor
     from classifier_training import BehaviorClassifier
     PIXELPAWS_MODULES_AVAILABLE = True
     print("[OK] PixelPaws modules loaded successfully")
 except ImportError as e:
     PIXELPAWS_MODULES_AVAILABLE = False
+    POSE_FEATURE_VERSION = 1  # fallback if module unavailable
     print(f"Error: Could not import PixelPaws modules: {e}")
     print("Please ensure pose_features.py, brightness_features.py, and classifier_training.py are in the same directory")
 
@@ -341,10 +342,11 @@ def auto_detect_bodyparts_from_model(clf_data, verbose=True):
     return clf_data
 
 
-def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list, 
+def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
                              square_size, pix_threshold, bp_include_list=None,
                              scale_x=1, scale_y=1, dt_vel=2, min_prob=0.8, use_gpu=True,
-                             crop_offset_x=0, crop_offset_y=0, config_yaml_path=None):
+                             crop_offset_x=0, crop_offset_y=0, config_yaml_path=None,
+                             include_optical_flow=False, bp_optflow_list=None):
     """
     Extract features using new modular system (with fallback to original).
     
@@ -475,16 +477,32 @@ def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
         crop_offset_x=crop_offset_x,  # NEW: Pass crop offset
         crop_offset_y=crop_offset_y   # NEW: Pass crop offset
     )
+
+    # Build an optical flow extractor preloaded with DLC coords if requested.
+    # It will be passed into the brightness loop so both run in a single video pass.
+    of_extractor = None
+    if include_optical_flow and bp_optflow_list:
+        try:
+            from optical_flow_features import OpticalFlowExtractor
+            of_extractor = OpticalFlowExtractor(
+                bodyparts=bp_optflow_list,
+                min_prob=min_prob,
+            ).preload(pose_data_file)
+            print(f"  Optical flow will be co-extracted with brightness (single pass)")
+        except Exception as e:
+            print(f"  ⚠ Could not prepare optical flow extractor: {e}")
+
     X_brightness = brightness_extractor.extract_brightness_features(
         dlc_file=pose_data_file,
         video_file=video_file_path,
         dt_vel=dt_vel,
-        create_video=False
+        create_video=False,
+        optical_flow_extractor=of_extractor,
     )
     
     # 3. Combine features
     X = pd.concat([X_pose, X_brightness], axis=1)
-    
+
     print(f"  ✓ Extracted {X.shape[1]} features from {X.shape[0]} frames")
     return X
 
@@ -2498,6 +2516,20 @@ class PixelPawsGUI:
         self.pred_save_summary = None
         self.pred_generate_ethogram = None
         self.pred_results_text = None
+
+        # Last prediction results (populated by _predict_thread on success)
+        self._last_pred_y_pred        = None
+        self._last_pred_y_proba       = None
+        self._last_pred_fps           = None
+        self._last_pred_n_frames      = None
+        self._last_pred_video_path    = None
+        self._last_pred_behavior_name = None
+        self._last_pred_output_folder = None
+        self._last_pred_base_name     = None
+        self._last_pred_dlc_path      = None          # stored so export can reload DLC coords
+        self.lv_skeleton_dots         = tk.BooleanVar(value=True)
+        self.lv_frame_tint            = tk.BooleanVar(value=False)
+        self.lv_timeline_strip        = tk.BooleanVar(value=True)
         
         # Setup UI
         self.setup_ui()
@@ -2739,10 +2771,23 @@ class PixelPawsGUI:
         self.train_dlc_config = tk.StringVar()
         ttk.Entry(feature_frame, textvariable=self.train_dlc_config, width=30).grid(
             row=3, column=1, padx=5, pady=2, sticky='w')
-        ttk.Button(feature_frame, text="📁 Browse", 
+        ttk.Button(feature_frame, text="📁 Browse",
                   command=self.browse_train_dlc_config).grid(row=3, column=2, sticky='w', padx=2)
-        tk.Label(feature_frame, text="For DLC crop offset in brightness extraction", 
+        tk.Label(feature_frame, text="For DLC crop offset in brightness extraction",
                  fg='gray', bg=self.theme.colors['frame_bg']).grid(row=4, column=1, columnspan=2, sticky='w')
+
+        # Optical Flow Features
+        self.train_include_optical_flow = tk.BooleanVar(value=False)
+        ttk.Checkbutton(feature_frame,
+                        text="Include Optical Flow Features  (slower — reads video frames)",
+                        variable=self.train_include_optical_flow).grid(
+            row=5, column=1, columnspan=2, sticky='w', pady=2)
+        ttk.Label(feature_frame, text="Optical Flow Body Parts:").grid(row=6, column=0, sticky='w', pady=2)
+        self.train_bp_optflow = tk.StringVar(value="hrpaw,hlpaw,snout")
+        ttk.Entry(feature_frame, textvariable=self.train_bp_optflow, width=30).grid(
+            row=6, column=1, padx=5, pady=2, sticky='w')
+        tk.Label(feature_frame, text="Body parts for optical flow (comma-separated)",
+                 fg='gray', bg=self.theme.colors['frame_bg']).grid(row=6, column=2, sticky='w')
         
         # === XGBOOST PARAMETERS ===
         xgb_frame = ttk.LabelFrame(scrollable_frame, text="XGBoost Model Parameters", padding=10)
@@ -2828,10 +2873,23 @@ class PixelPawsGUI:
         
         # Generate plots
         self.train_generate_plots = tk.BooleanVar(value=True)
-        ttk.Checkbutton(params_frame, text="Generate performance and SHAP plots", 
+        ttk.Checkbutton(params_frame, text="Generate performance and SHAP plots",
                        variable=self.train_generate_plots).grid(row=7, column=1, sticky='w', pady=2)
         tk.Label(params_frame, text="Creates threshold curve and feature importance figures", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=7, column=2, sticky='w')
-        
+
+        # SHAP prune + retrain
+        self.train_shap_prune = tk.BooleanVar(value=False)
+        ttk.Checkbutton(params_frame, text="SHAP prune + retrain (2nd pass with top features only)",
+                       variable=self.train_shap_prune).grid(row=8, column=1, sticky='w', pady=2)
+        tk.Label(params_frame, text="Train on all features first, then retrain on top SHAP features — reduces noise", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=8, column=2, sticky='w')
+
+        ttk.Label(params_frame, text="Top Features (SHAP):").grid(row=9, column=0, sticky='w', pady=2)
+        self.train_shap_top_n = tk.IntVar(value=40)
+        tk.Spinbox(params_frame, from_=10, to=200, increment=5,
+                   textvariable=self.train_shap_top_n, width=10).grid(
+            row=9, column=1, sticky='w', padx=5, pady=2)
+        tk.Label(params_frame, text="Number of features to keep after SHAP pruning (10–200)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=9, column=2, sticky='w')
+
         # === QUICK ACTIONS ===
         action_frame = ttk.LabelFrame(scrollable_frame, text="Actions", padding=10)
         action_frame.pack(fill='x', padx=5, pady=5)
@@ -2928,10 +2986,15 @@ class PixelPawsGUI:
         
         ttk.Label(video_frame, text="Video File:").grid(row=0, column=0, sticky='w', pady=2)
         self.pred_video_path = tk.StringVar()
-        ttk.Entry(video_frame, textvariable=self.pred_video_path, width=50).grid(
-            row=0, column=1, padx=5, pady=2)
-        ttk.Button(video_frame, text="📁 Browse", 
-                  command=self.browse_pred_video).grid(row=0, column=2, pady=2)
+        self.pred_video_options = {}
+        self.pred_video_combo = ttk.Combobox(
+            video_frame, textvariable=self.pred_video_path, width=46)
+        self.pred_video_combo.grid(row=0, column=1, padx=5, pady=2)
+        self.pred_video_combo.bind('<<ComboboxSelected>>', self._on_pred_video_selected)
+        ttk.Button(video_frame, text="🔄", width=3,
+                   command=self.refresh_pred_videos).grid(row=0, column=2, pady=2)
+        ttk.Button(video_frame, text="📁", width=3,
+                   command=self.browse_pred_video).grid(row=0, column=3, pady=2)
         
         ttk.Label(video_frame, text="DLC Pose File:").grid(row=1, column=0, sticky='w', pady=2)
         self.pred_dlc_path = tk.StringVar()
@@ -2982,24 +3045,35 @@ class PixelPawsGUI:
                        variable=self.pred_save_csv).grid(row=0, column=0, sticky='w', pady=2)
         
         self.pred_save_video = tk.BooleanVar(value=False)
-        ttk.Checkbutton(output_frame, text="Create labeled video (slower)", 
+        ttk.Checkbutton(output_frame, text="Create labeled video (slower)",
                        variable=self.pred_save_video).grid(row=1, column=0, sticky='w', pady=2)
-        
+
+        self.pred_clip_start = tk.StringVar(value="")
+        self.pred_clip_end   = tk.StringVar(value="")
+        clip_row = ttk.Frame(output_frame)
+        clip_row.grid(row=2, column=0, columnspan=3, sticky='w', padx=(25, 0), pady=1)
+        ttk.Label(clip_row, text="Clip:  From").pack(side='left')
+        ttk.Entry(clip_row, textvariable=self.pred_clip_start, width=8).pack(side='left', padx=3)
+        ttk.Label(clip_row, text="To").pack(side='left', padx=(4, 0))
+        ttk.Entry(clip_row, textvariable=self.pred_clip_end, width=8).pack(side='left', padx=3)
+        ttk.Label(clip_row, text="(frame number, seconds as 1.5, or H:MM:SS — blank = full video)",
+                  foreground='gray').pack(side='left', padx=5)
+
         self.pred_save_summary = tk.BooleanVar(value=True)
-        ttk.Checkbutton(output_frame, text="Save behavior summary statistics", 
-                       variable=self.pred_save_summary).grid(row=2, column=0, sticky='w', pady=2)
-        
+        ttk.Checkbutton(output_frame, text="Save behavior summary statistics",
+                       variable=self.pred_save_summary).grid(row=3, column=0, sticky='w', pady=2)
+
         self.pred_generate_ethogram = tk.BooleanVar(value=False)
-        ttk.Checkbutton(output_frame, text="Generate ethogram plots", 
-                       variable=self.pred_generate_ethogram).grid(row=3, column=0, sticky='w', pady=2)
-        
-        ttk.Label(output_frame, text="Output Folder:").grid(row=4, column=0, sticky='w', pady=5)
+        ttk.Checkbutton(output_frame, text="Generate ethogram plots",
+                       variable=self.pred_generate_ethogram).grid(row=4, column=0, sticky='w', pady=2)
+
+        ttk.Label(output_frame, text="Output Folder:").grid(row=5, column=0, sticky='w', pady=5)
         self.pred_output_folder = tk.StringVar()
         ttk.Entry(output_frame, textvariable=self.pred_output_folder, width=50).grid(
-            row=4, column=1, padx=5, pady=2)
-        ttk.Button(output_frame, text="📁 Browse", 
-                  command=self.browse_pred_output).grid(row=4, column=2, pady=2)
-        tk.Label(output_frame, text="(Leave empty to use video folder)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=5, column=1, sticky='w')
+            row=5, column=1, padx=5, pady=2)
+        ttk.Button(output_frame, text="📁 Browse",
+                  command=self.browse_pred_output).grid(row=5, column=2, pady=2)
+        tk.Label(output_frame, text="(Leave empty to use video folder)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=6, column=1, sticky='w')
         
         # === ACTIONS ===
         action_frame = ttk.Frame(scrollable_frame)
@@ -3011,10 +3085,24 @@ class PixelPawsGUI:
                   command=self.preview_with_predictions).pack(side='left', padx=5)
         ttk.Button(action_frame, text="🎯 Optimize Parameters", 
                   command=self.optimize_parameters).pack(side='left', padx=5)
-        ttk.Button(action_frame, text="▶ RUN PREDICTION", 
-                  command=self.run_single_prediction, 
+        ttk.Button(action_frame, text="▶ RUN PREDICTION",
+                  command=self.run_single_prediction,
                   style='Accent.TButton').pack(side='left', padx=5)
-        
+        self.pred_export_video_btn = ttk.Button(
+            action_frame, text="🎬 Export Labeled Video",
+            command=self.export_labeled_video, state='disabled')
+        self.pred_export_video_btn.pack(side='left', padx=5)
+
+        # === EXPORT VIDEO OVERLAYS ===
+        overlay_opts = ttk.LabelFrame(scrollable_frame, text="Export Video Overlays", padding=4)
+        overlay_opts.pack(fill='x', padx=5, pady=(0, 4))
+        ttk.Checkbutton(overlay_opts, text="Skeleton dots (DLC body parts)",
+                        variable=self.lv_skeleton_dots).pack(side='left', padx=8)
+        ttk.Checkbutton(overlay_opts, text="Behavior frame tint",
+                        variable=self.lv_frame_tint).pack(side='left', padx=8)
+        ttk.Checkbutton(overlay_opts, text="Timeline strip",
+                        variable=self.lv_timeline_strip).pack(side='left', padx=8)
+
         # === RESULTS DISPLAY ===
         results_frame = ttk.LabelFrame(scrollable_frame, text="Results", padding=5)
         results_frame.pack(fill='both', expand=True, padx=5, pady=5)
@@ -3182,10 +3270,12 @@ class PixelPawsGUI:
             ("🌟 Brightness\nPreview", self.show_brightness_preview),
             ("🔧 Correct Crop\nOffset (Single)", self.correct_crop_offset_single),
             ("🔧 Correct Crop\nOffset (Batch)", self.correct_crop_offset_batch),
+            ("✂️ Crop Video\nfor DLC", self.crop_video_for_dlc),
             ("📊 Generate\nEthogram", self.generate_ethogram),
             ("📈 Training\nVisualization", self.show_training_viz),
             ("🔄 BORIS to\nPixelPaws", self.convert_boris_to_pixelpaws),
             ("🎯 Optimize\nParameters", self.optimize_parameters),
+            ("⚙️ Feature\nExtraction", self.open_feature_extraction),
             ("🎨 Theme\nSwitcher", self.toggle_theme),
         ]
         
@@ -3519,6 +3609,7 @@ class PixelPawsGUI:
 
         # Refresh classifier dropdowns
         self.refresh_pred_classifiers()
+        self.refresh_pred_videos()
 
         # Write back (merge) so any newly set fields are persisted immediately
         self.save_project_config(folder)
@@ -4149,16 +4240,21 @@ class PixelPawsGUI:
                 self.log_train(f"  • {s['session_name']}")
             
             # Build feature config
+            # NOTE: filter empty strings (if x.strip()) so a trailing comma in
+            # the UI doesn't change the hash versus the Feature Extraction tool.
             cfg = {
                 'bp_include_list': None,
-                'bp_pixbrt_list': [x.strip() for x in self.train_bp_pixbrt.get().split(',')],
-                'square_size': [int(x.strip()) for x in self.train_square_sizes.get().split(',')],
+                'bp_pixbrt_list': [x.strip() for x in self.train_bp_pixbrt.get().split(',') if x.strip()],
+                'square_size': [int(x.strip()) for x in self.train_square_sizes.get().split(',') if x.strip()],
                 'pix_threshold': self.train_pix_threshold.get(),
                 'use_gpu': self.train_use_gpu.get(),
+                'include_optical_flow': self.train_include_optical_flow.get(),
+                'bp_optflow_list': [x.strip() for x in self.train_bp_optflow.get().split(',') if x.strip()]
+                    if self.train_include_optical_flow.get() else [],
             }
             
             # Setup feature caching
-            feature_cache_root = os.path.join(project_folder, 'FeatureCache')
+            feature_cache_root = os.path.join(project_folder, 'features')
             os.makedirs(feature_cache_root, exist_ok=True)
             
             # ── Feature extraction ─────────────────────────────────────
@@ -4393,7 +4489,52 @@ class PixelPawsGUI:
             
             final_model.fit(X, y)
             self.log_train("  ✓ Final model trained on all data")
-            
+
+            # ── SHAP prune + retrain (optional second pass) ────────────
+            selected_feature_cols = None  # None → use all (model.feature_names_in_)
+            pre_prune_model_ref = None   # holds the full-feature model when SHAP pruning runs
+
+            if self.train_shap_prune.get():
+                top_n = self.train_shap_top_n.get()
+                self.log_train(f"\nSHAP pruning: keeping top {top_n} features...")
+                try:
+                    import shap as _shap
+                    n_sample = min(3000, len(X))
+                    sample_df = X.sample(n_sample, random_state=42)
+
+                    explainer  = _shap.TreeExplainer(final_model)
+                    shap_vals  = explainer.shap_values(sample_df)
+
+                    # shap_values() returns a 2-D array for XGBoost binary
+                    # (or a list for some older SHAP builds — handle both)
+                    if isinstance(shap_vals, list):
+                        sv = shap_vals[1]   # positive-class values
+                    else:
+                        sv = shap_vals
+
+                    mean_abs = np.abs(sv).mean(axis=0)
+                    importance = pd.Series(mean_abs, index=final_model.feature_names_in_)
+                    top_n_actual = min(top_n, len(importance))
+                    top_cols = importance.nlargest(top_n_actual).index.tolist()
+
+                    self.log_train(
+                        f"  Pruned: {len(importance)} → {len(top_cols)} features")
+
+                    # Retrain on pruned feature set (same hyperparams)
+                    X_pruned = X[top_cols]
+                    pruned_model = xgb.XGBClassifier(**final_model.get_params())
+                    pruned_model.fit(X_pruned, y)
+
+                    pre_prune_model_ref  = final_model   # save for comparison plots
+                    final_model          = pruned_model
+                    selected_feature_cols = top_cols
+                    self.log_train("  ✓ Prune + retrain complete.")
+
+                except Exception as _shap_err:
+                    self.log_train(
+                        f"  ⚠️  SHAP pruning failed ({_shap_err}), "
+                        f"using full-feature model instead.")
+
             # ── Save classifier ────────────────────────────────────────
             self.log_train("\n" + "=" * 60)
             self.log_train("SAVING CLASSIFIER")
@@ -4406,6 +4547,8 @@ class PixelPawsGUI:
                 # Core model
                 'clf_model':        final_model,
                 'Behavior_type':    behavior_name,
+                # SHAP-pruned feature subset (None if pruning was not used)
+                'selected_feature_cols': selected_feature_cols,
                 # OOF-optimised post-processing params (used by default)
                 'best_thresh':      best_params['thresh'],
                 'min_bout':         best_params['min_bout'],
@@ -4416,9 +4559,11 @@ class PixelPawsGUI:
                 'ui_min_after_bout':self.train_min_after_bout.get(),
                 'ui_max_gap':       self.train_max_gap.get(),
                 # Feature extraction config
-                'bp_pixbrt_list':   cfg['bp_pixbrt_list'],
-                'square_size':      cfg['square_size'],
-                'pix_threshold':    cfg['pix_threshold'],
+                'bp_pixbrt_list':       cfg['bp_pixbrt_list'],
+                'square_size':          cfg['square_size'],
+                'pix_threshold':        cfg['pix_threshold'],
+                'include_optical_flow': cfg.get('include_optical_flow', False),
+                'bp_optflow_list':      cfg.get('bp_optflow_list', []),
                 # Training provenance
                 'training_sessions':  [s['session_name'] for s in sessions],
                 'cv_f1_scores':       fold_f1_scores,
@@ -4436,7 +4581,18 @@ class PixelPawsGUI:
                 pickle.dump(classifier_data, f)
             
             self.log_train(f"\n  ✓ Classifier saved: {classifier_path}")
-            
+
+            # ── Also save the full-feature (pre-prune) model when pruning was active ──
+            if pre_prune_model_ref is not None:
+                pre_prune_data = dict(classifier_data)   # shallow copy — same metadata
+                pre_prune_data['clf_model']             = pre_prune_model_ref
+                pre_prune_data['selected_feature_cols'] = None   # uses all features
+                pre_prune_path = os.path.join(
+                    classifier_folder, f'PixelPaws_{behavior_name}_AllFeatures.pkl')
+                with open(pre_prune_path, 'wb') as f:
+                    pickle.dump(pre_prune_data, f)
+                self.log_train(f"  ✓ Full-feature classifier saved: {pre_prune_path}")
+
             # Training data backup
             train_set_path = os.path.join(
                 classifier_folder, f'{behavior_name}_train_set.pkl')
@@ -4449,7 +4605,8 @@ class PixelPawsGUI:
                 self.log_train("\nGenerating plots...")
                 self.generate_performance_plots(
                     final_model, X, y, classifier_folder, behavior_name,
-                    oof_proba=oof_proba, oof_best_params=best_params)
+                    oof_proba=oof_proba, oof_best_params=best_params,
+                    pre_prune_model=pre_prune_model_ref)
                 self.log_train("  ✓ Plots saved")
             
             self.log_train("\n" + "=" * 60)
@@ -4606,8 +4763,9 @@ class PixelPawsGUI:
                 search_locs = [
                     video_dir,
                     os.path.dirname(video_dir),
-                    os.path.join(os.path.dirname(video_dir), 'FeatureCache'),
-                    os.path.join(project_folder, 'FeatureCache'),
+                    os.path.join(os.path.dirname(video_dir), 'FeatureCache'),  # legacy
+                    os.path.join(project_folder, 'FeatureCache'),              # legacy
+                    os.path.join(project_folder, 'features'),                  # canonical
                 ]
                 cache_path = None
                 for loc in search_locs:
@@ -4739,6 +4897,8 @@ class PixelPawsGUI:
                 'early_stopping_rounds': self.train_early_stopping_rounds.get(),
                 'use_gpu': self.train_use_gpu.get(),
                 'generate_plots': self.train_generate_plots.get(),
+                'shap_prune': self.train_shap_prune.get(),
+                'shap_top_n': self.train_shap_top_n.get(),
             }
             
             with open(config_path, 'w') as f:
@@ -4815,6 +4975,10 @@ class PixelPawsGUI:
                 self.train_use_gpu.set(config['use_gpu'])
             if 'generate_plots' in config:
                 self.train_generate_plots.set(config['generate_plots'])
+            if 'shap_prune' in config:
+                self.train_shap_prune.set(config['shap_prune'])
+            if 'shap_top_n' in config:
+                self.train_shap_top_n.set(config['shap_top_n'])
             
             messagebox.showinfo("Loaded", f"Configuration loaded from:\n{config_path}")
             
@@ -4822,28 +4986,80 @@ class PixelPawsGUI:
             messagebox.showerror("Error", f"Could not load configuration:\n{str(e)}")
     
     
+    @staticmethod
+    def _feature_hash_key(cfg):
+        """Build a stable, type-normalized hash key for feature cache files.
+
+        Uses explicit type coercion so the key is identical regardless of whether
+        tk.BooleanVar.get() returns Python bool or int (platform-dependent on Windows).
+        """
+        import hashlib
+        key_dict = {
+            'bp_include_list':      cfg.get('bp_include_list'),
+            'bp_pixbrt_list':       list(cfg.get('bp_pixbrt_list', [])),
+            'square_size':          [int(x) for x in cfg.get('square_size', [])],
+            'pix_threshold':        round(float(cfg.get('pix_threshold', 0.3)), 6),
+            'pose_feature_version': int(POSE_FEATURE_VERSION),
+            'include_optical_flow': bool(cfg.get('include_optical_flow', False)),
+            'bp_optflow_list':      list(cfg.get('bp_optflow_list', [])),
+        }
+        return hashlib.md5(repr(key_dict).encode('utf-8')).hexdigest()[:8]
+
     def extract_features_for_session(self, session, cfg, cache_root, behavior_name):
         """
         Extract features for a single session with smart caching.
-        
+
         Features are cached independently of behavior labels, so the same
         feature extraction can be reused for training multiple behaviors.
         """
-        import hashlib
-        
-        # Create behavior-agnostic cache key (only based on feature extraction config)
-        feature_cfg = {
-            'bp_include_list': cfg['bp_include_list'],
-            'bp_pixbrt_list': cfg['bp_pixbrt_list'],
-            'square_size': cfg['square_size'],
-            'pix_threshold': cfg['pix_threshold'],
-        }
-        key = repr(feature_cfg).encode('utf-8')
-        cfg_hash = hashlib.md5(key).hexdigest()[:8]
-        
+        cfg_hash = PixelPawsGUI._feature_hash_key(cfg)
+
         # Feature cache file (behavior-independent)
-        feature_cache_file = os.path.join(cache_root, f"{session['session_name']}_features_{cfg_hash}.pkl")
-        
+        cache_filename = f"{session['session_name']}_features_{cfg_hash}.pkl"
+        feature_cache_file = os.path.join(cache_root, cache_filename)
+        self.log_train(f"  [Cache] Hash: {cfg_hash}  File: {cache_filename}")
+
+        # If not in the canonical location, search alternative directories.
+        # This lets training pick up features pre-extracted by the Feature
+        # Extraction tool (single-file or batch), the Predict tab, or any
+        # other part of PixelPaws — regardless of where they were written.
+        if not os.path.isfile(feature_cache_file):
+            video_dir = os.path.dirname(session.get('video_path', ''))
+            alt_dirs = [
+                video_dir,
+                os.path.join(video_dir, 'features'),
+                os.path.join(video_dir, 'FeatureCache'),
+                os.path.join(video_dir, 'PredictionCache'),
+                os.path.join(os.path.dirname(video_dir), 'features'),
+                os.path.join(os.path.dirname(video_dir), 'FeatureCache'),
+            ]
+            for alt_dir in alt_dirs:
+                alt_path = os.path.join(alt_dir, cache_filename)
+                if os.path.isfile(alt_path):
+                    self.log_train(f"  [Cache] Found in: {alt_dir}")
+                    feature_cache_file = alt_path
+                    break
+            else:
+                # Not found anywhere — glob to detect hash mismatches
+                all_search_dirs = [cache_root] + alt_dirs
+                mismatches = []
+                for d in all_search_dirs:
+                    if not os.path.isdir(d):
+                        continue
+                    for f in glob.glob(os.path.join(d, f"{session['session_name']}_features_*.pkl")):
+                        mismatches.append(f)
+                if mismatches:
+                    self.log_train(
+                        f"  [Cache] \u26a0 Feature file(s) found with DIFFERENT hash "
+                        f"(config mismatch or stale cache):")
+                    for m in mismatches:
+                        self.log_train(f"    \u2192 {m}")
+                    self.log_train(
+                        f"  [Cache] Expected hash {cfg_hash}. "
+                        f"Check that Feature Extraction settings match training settings.")
+                else:
+                    self.log_train(f"  [Cache] No cached features found \u2014 will extract.")
+
         # Extract or load features (behavior-independent)
         if os.path.isfile(feature_cache_file):
             self.log_train(f"  [Cache] Loading features for {session['session_name']}")
@@ -4865,6 +5081,8 @@ class PixelPawsGUI:
                 pix_threshold=cfg['pix_threshold'],
                 use_gpu=cfg.get('use_gpu', True),  # Use GPU setting from config (default True)
                 config_yaml_path=config_yaml,  # Pass config for crop detection
+                include_optical_flow=cfg.get('include_optical_flow', False),
+                bp_optflow_list=cfg.get('bp_optflow_list', []) or None,
             )
             X_full = X_full.reset_index(drop=True)
             
@@ -5039,7 +5257,8 @@ class PixelPawsGUI:
         return best_thresh, best_f1
     
     def generate_performance_plots(self, model, X, y, output_folder, behavior_name,
-                                    oof_proba=None, oof_best_params=None):
+                                    oof_proba=None, oof_best_params=None,
+                                    pre_prune_model=None):
         """Generate performance visualization plots.
 
         If oof_proba is provided, a second (honest) OOF threshold curve is
@@ -5059,13 +5278,24 @@ class PixelPawsGUI:
         thresholds = np.arange(0.05, 0.96, 0.01)
 
         # ── In-sample (training) curve ────────────────────────────────
-        y_proba_train = predict_with_xgboost(model, X_array)
+        y_proba_train = predict_with_xgboost(model, X)
         train_f1s, train_precs, train_recs = [], [], []
         for t in thresholds:
             yp = (y_proba_train >= t).astype(int)
             train_f1s.append(f1_score(y, yp, zero_division=0))
             train_precs.append(precision_score(y, yp, zero_division=0))
             train_recs.append(recall_score(y, yp, zero_division=0))
+
+        # ── Pre-prune in-sample curve (only when SHAP pruning was active) ────
+        pre_f1s = pre_precs = pre_recs = None
+        if pre_prune_model is not None:
+            y_proba_pre = predict_with_xgboost(pre_prune_model, X)
+            pre_f1s, pre_precs, pre_recs = [], [], []
+            for t in thresholds:
+                yp = (y_proba_pre >= t).astype(int)
+                pre_f1s.append(f1_score(y, yp, zero_division=0))
+                pre_precs.append(precision_score(y, yp, zero_division=0))
+                pre_recs.append(recall_score(y, yp, zero_division=0))
 
         # ── OOF curve (honest) ────────────────────────────────────────
         oof_f1s = None
@@ -5076,15 +5306,30 @@ class PixelPawsGUI:
                 oof_f1s.append(f1_score(y, yp, zero_division=0))
 
         # ── Plot ──────────────────────────────────────────────────────
+        n_pruned = len(model.feature_names_in_) if hasattr(model, 'feature_names_in_') else ''
+        n_full   = (len(pre_prune_model.feature_names_in_)
+                    if pre_prune_model is not None and hasattr(pre_prune_model, 'feature_names_in_')
+                    else '')
+        post_lbl = f' ({n_pruned} feat)' if pre_prune_model is not None and n_pruned else ''
+
         fig, ax = plt.subplots(figsize=(11, 6))
 
-        # Training curves (dashed — optimistically biased)
+        # Pre-prune dotted lines (all features, lightest)
+        if pre_f1s is not None:
+            ax.plot(thresholds, pre_f1s,   ':', color='steelblue',  linewidth=1.2, alpha=0.45,
+                    label=f'F1 pre-prune ({n_full} feat)')
+            ax.plot(thresholds, pre_precs, ':', color='darkorange', linewidth=1.2, alpha=0.45,
+                    label=f'Precision pre-prune ({n_full} feat)')
+            ax.plot(thresholds, pre_recs,  ':', color='seagreen',   linewidth=1.2, alpha=0.45,
+                    label=f'Recall pre-prune ({n_full} feat)')
+
+        # Post-prune / only model — dashed in-sample
         ax.plot(thresholds, train_f1s,   '--', color='steelblue',
-                label='F1 (in-sample)',   linewidth=1.5, alpha=0.6)
+                label=f'F1 in-sample{post_lbl}',        linewidth=1.5, alpha=0.6)
         ax.plot(thresholds, train_precs, '--', color='darkorange',
-                label='Precision (in-sample)', linewidth=1.5, alpha=0.6)
+                label=f'Precision in-sample{post_lbl}', linewidth=1.5, alpha=0.6)
         ax.plot(thresholds, train_recs,  '--', color='seagreen',
-                label='Recall (in-sample)', linewidth=1.5, alpha=0.6)
+                label=f'Recall in-sample{post_lbl}',    linewidth=1.5, alpha=0.6)
 
         # OOF curves (solid — honest)
         if oof_f1s is not None:
@@ -5101,10 +5346,12 @@ class PixelPawsGUI:
 
         ax.set_xlabel('Threshold', fontsize=12)
         ax.set_ylabel('Score',     fontsize=12)
+        prune_note = (f'\n(dotted = all {n_full} feat; dashed = top {n_pruned} feat)'
+                      if pre_prune_model is not None else '')
         ax.set_title(
             f'Threshold Curve — {behavior_name}\n'
-            f'(dashed = in-sample / overfit; solid = honest OOF)',
-            fontsize=13)
+            f'(dashed = in-sample / overfit; solid = honest OOF){prune_note}',
+            fontsize=12)
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
         ax.set_ylim([0, 1.02])
@@ -5119,30 +5366,75 @@ class PixelPawsGUI:
         # ── SHAP importance ───────────────────────────────────────────
         try:
             import shap
-            if len(X_array) > 5000:
-                sample_idx = np.random.choice(len(X_array), 5000, replace=False)
-                X_sample = X_array[sample_idx]
+
+            # ── Pre-prune SHAP (all features) — only when SHAP pruning was active ──
+            if pre_prune_model is not None:
+                X_pre_arr = X.values if hasattr(X, 'values') else X
+                if len(X_pre_arr) > 5000:
+                    idx_pre = np.random.choice(len(X_pre_arr), 5000, replace=False)
+                    X_pre_sample = X_pre_arr[idx_pre]
+                else:
+                    X_pre_sample = X_pre_arr
+
+                expl_pre = shap.TreeExplainer(pre_prune_model)
+                sv_pre   = expl_pre.shap_values(X_pre_sample)
+
+                if feature_names is not None:
+                    shap.summary_plot(sv_pre,
+                                      pd.DataFrame(X_pre_sample, columns=feature_names),
+                                      show=False, max_display=n_pruned if n_pruned else 40)
+                else:
+                    shap.summary_plot(sv_pre, X_pre_sample, show=False,
+                                      max_display=n_pruned if n_pruned else 40)
+
+                plt.title(f'Feature Importance (all {n_full} features) — {behavior_name}',
+                          fontsize=14)
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(output_folder,
+                                 f'PixelPaws_{behavior_name}_SHAP_AllFeatures.png'),
+                    dpi=300, bbox_inches='tight')
+                plt.close()
+
+            # ── Pruned (or only) model SHAP ────────────────────────────────────
+            if hasattr(model, 'feature_names_in_'):
+                X_for_shap = X[model.feature_names_in_]
+                shap_feat_names = list(model.feature_names_in_)
             else:
-                X_sample = X_array
-            
+                X_for_shap = X if hasattr(X, 'columns') else pd.DataFrame(X_array)
+                shap_feat_names = feature_names
+            X_shap_arr = X_for_shap.values if hasattr(X_for_shap, 'values') else X_for_shap
+
+            if len(X_shap_arr) > 5000:
+                sample_idx = np.random.choice(len(X_shap_arr), 5000, replace=False)
+                X_sample = X_shap_arr[sample_idx]
+            else:
+                X_sample = X_shap_arr
+
             explainer   = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_sample)
-            
-            if feature_names is not None:
-                X_sample_df = pd.DataFrame(X_sample, columns=feature_names)
+
+            if shap_feat_names is not None:
+                X_sample_df = pd.DataFrame(X_sample, columns=shap_feat_names)
                 shap.summary_plot(shap_values, X_sample_df,
-                                  show=False, max_display=20)
+                                  show=False,
+                                  max_display=len(shap_feat_names) if shap_feat_names else 40)
             else:
                 shap.summary_plot(shap_values, X_sample,
-                                  show=False, max_display=20)
-            
-            plt.title(f'Feature Importance — {behavior_name}', fontsize=14)
+                                  show=False, max_display=40)
+
+            n_shap = len(shap_feat_names) if shap_feat_names else ''
+            shap_title = (f'Feature Importance (top {n_shap} pruned features) — {behavior_name}'
+                          if pre_prune_model is not None
+                          else f'Feature Importance — {behavior_name}')
+            plt.title(shap_title, fontsize=14)
             plt.tight_layout()
             plt.savefig(
                 os.path.join(output_folder,
                              f'PixelPaws_{behavior_name}_SHAP_Importance.png'),
                 dpi=300, bbox_inches='tight')
             plt.close()
+
         except (ImportError, Exception) as e:
             self.log_train(f"    SHAP plot skipped: {str(e)}")
     
@@ -5611,7 +5903,27 @@ class PixelPawsGUI:
         except Exception as e:
             messagebox.showerror("Launch Error",
                                f"Failed to launch batch correction:\n{str(e)}")
-    
+
+    def crop_video_for_dlc(self):
+        """Launch the crop-for-DLC standalone tool."""
+        script_path = os.path.join(os.path.dirname(__file__), 'crop_for_dlc.py')
+        if not os.path.isfile(script_path):
+            messagebox.showerror("Not Found",
+                                 f"crop_for_dlc.py not found at:\n{script_path}")
+            return
+        try:
+            import subprocess
+            project = self.current_project_folder.get()
+            cmd = [sys.executable, script_path]
+            if project:
+                cmd += ['--project', project]
+            subprocess.Popen(cmd)
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Crop Video for DLC tool launched")
+        except Exception as e:
+            messagebox.showerror("Launch Error",
+                                 f"Failed to launch crop tool:\n{str(e)}")
+
     def _add_image_tab(self, notebook, image_path, tab_name):
         """Add an image as a tab in the notebook"""
         frame = ttk.Frame(notebook)
@@ -6436,8 +6748,354 @@ Median: {feature_data.median():.6f}
         else:
             self.train_viz_window.window.lift()
     
+    # === FEATURE EXTRACTION TOOL ===
+
+    def open_feature_extraction(self):
+        """Open the standalone Feature Extraction tool window."""
+        win = tk.Toplevel(self.root)
+        win.title("Feature Extraction")
+        win.geometry("720x820")
+        win.resizable(True, True)
+        win.transient(self.root)
+
+        # ── Header ────────────────────────────────────────────────────────
+        ttk.Label(win, text="Feature Extraction",
+                  font=('Arial', 14, 'bold')).pack(pady=(12, 2))
+        ttk.Label(win,
+                  text="Extract pose + brightness (+ optional optical flow) features.",
+                  foreground='gray').pack()
+
+        # ── Mode selector ─────────────────────────────────────────────────
+        mode_frame = ttk.Frame(win)
+        mode_frame.pack(fill='x', padx=12, pady=(8, 0))
+        fe_mode = tk.StringVar(value='batch')
+        ttk.Radiobutton(mode_frame, text="Batch / Project Folder",
+                        variable=fe_mode, value='batch',
+                        command=lambda: _switch_mode()).pack(side='left', padx=(0, 20))
+        ttk.Radiobutton(mode_frame, text="Single Video",
+                        variable=fe_mode, value='single',
+                        command=lambda: _switch_mode()).pack(side='left')
+
+        # ── Source panel (swapped by mode) ────────────────────────────────
+        source_outer = ttk.Frame(win)
+        source_outer.pack(fill='x', padx=12, pady=4)
+
+        # -- Batch panel --
+        batch_panel = ttk.LabelFrame(source_outer, text="Batch Source", padding=10)
+        batch_panel.columnconfigure(1, weight=1)
+
+        ttk.Label(batch_panel, text="Project Folder:").grid(
+            row=0, column=0, sticky='w', pady=3)
+        fe_project = tk.StringVar(
+            value=self.train_project_folder.get() if self.train_project_folder.get() else "")
+        ttk.Entry(batch_panel, textvariable=fe_project, width=48).grid(
+            row=0, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Button(batch_panel, text="Browse",
+                   command=lambda: fe_project.set(
+                       filedialog.askdirectory(title="Select Project Folder")
+                       or fe_project.get())
+                   ).grid(row=0, column=2, padx=2)
+
+        ttk.Label(batch_panel,
+                  text="Scans videos/ subfolder for DLC .h5 + matching video pairs.",
+                  foreground='gray').grid(row=1, column=0, columnspan=3, sticky='w', pady=(0, 2))
+
+        # -- Single panel --
+        single_panel = ttk.LabelFrame(source_outer, text="Single Video Source", padding=10)
+        single_panel.columnconfigure(1, weight=1)
+
+        ttk.Label(single_panel, text="DLC File (.h5/.csv):").grid(
+            row=0, column=0, sticky='w', pady=3)
+        fe_dlc_single = tk.StringVar()
+        ttk.Entry(single_panel, textvariable=fe_dlc_single, width=48).grid(
+            row=0, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Button(single_panel, text="Browse",
+                   command=lambda: fe_dlc_single.set(
+                       filedialog.askopenfilename(
+                           title="Select DLC tracking file",
+                           filetypes=[("DLC files", "*.h5 *.csv"), ("All files", "*.*")])
+                       or fe_dlc_single.get())
+                   ).grid(row=0, column=2, padx=2)
+
+        ttk.Label(single_panel, text="Video File:").grid(
+            row=1, column=0, sticky='w', pady=3)
+        fe_video_single = tk.StringVar()
+        ttk.Entry(single_panel, textvariable=fe_video_single, width=48).grid(
+            row=1, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Button(single_panel, text="Browse",
+                   command=lambda: fe_video_single.set(
+                       filedialog.askopenfilename(
+                           title="Select video file",
+                           filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"),
+                                      ("All files", "*.*")])
+                       or fe_video_single.get())
+                   ).grid(row=1, column=2, padx=2)
+
+        ttk.Label(single_panel, text="Output Folder:").grid(
+            row=2, column=0, sticky='w', pady=3)
+        fe_out_single = tk.StringVar()
+        ttk.Entry(single_panel, textvariable=fe_out_single, width=48).grid(
+            row=2, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Button(single_panel, text="Browse",
+                   command=lambda: fe_out_single.set(
+                       filedialog.askdirectory(title="Select output folder")
+                       or fe_out_single.get())
+                   ).grid(row=2, column=2, padx=2)
+        ttk.Label(single_panel,
+                  text="Leave blank to save alongside the video file.",
+                  foreground='gray').grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 2))
+
+        def _switch_mode():
+            if fe_mode.get() == 'batch':
+                single_panel.pack_forget()
+                batch_panel.pack(fill='x')
+            else:
+                batch_panel.pack_forget()
+                single_panel.pack(fill='x')
+
+        # Start in batch mode
+        batch_panel.pack(fill='x')
+
+        # ── Feature settings ──────────────────────────────────────────────
+        settings = ttk.LabelFrame(win, text="Feature Settings", padding=10)
+        settings.pack(fill='x', padx=12, pady=4)
+        settings.columnconfigure(1, weight=1)
+
+        ttk.Label(settings, text="Brightness Body Parts:").grid(
+            row=0, column=0, sticky='w', pady=3)
+        fe_bp_pixbrt = tk.StringVar(
+            value=self.train_bp_pixbrt.get() if hasattr(self, 'train_bp_pixbrt') else "hrpaw,hlpaw,snout")
+        ttk.Entry(settings, textvariable=fe_bp_pixbrt, width=40).grid(
+            row=0, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Label(settings, text="comma-separated",
+                  foreground='gray').grid(row=0, column=2, sticky='w')
+
+        ttk.Label(settings, text="Square Sizes:").grid(
+            row=1, column=0, sticky='w', pady=3)
+        fe_square = tk.StringVar(
+            value=self.train_square_sizes.get() if hasattr(self, 'train_square_sizes') else "40,40,40")
+        ttk.Entry(settings, textvariable=fe_square, width=20).grid(
+            row=1, column=1, padx=5, pady=3, sticky='w')
+
+        ttk.Label(settings, text="Pixel Threshold:").grid(
+            row=2, column=0, sticky='w', pady=3)
+        fe_threshold = tk.DoubleVar(
+            value=self.train_pix_threshold.get() if hasattr(self, 'train_pix_threshold') else 0.3)
+        ttk.Entry(settings, textvariable=fe_threshold, width=10).grid(
+            row=2, column=1, padx=5, pady=3, sticky='w')
+
+        fe_use_gpu = tk.BooleanVar(
+            value=self.train_use_gpu.get() if hasattr(self, 'train_use_gpu') else True)
+        ttk.Checkbutton(settings, text="Use GPU acceleration",
+                        variable=fe_use_gpu).grid(row=3, column=1, sticky='w', pady=3)
+
+        fe_optflow = tk.BooleanVar(
+            value=self.train_include_optical_flow.get()
+            if hasattr(self, 'train_include_optical_flow') else False)
+        ttk.Checkbutton(settings,
+                        text="Include Optical Flow  (slower — reads video frames)",
+                        variable=fe_optflow).grid(row=4, column=1, sticky='w', pady=3)
+
+        ttk.Label(settings, text="Optical Flow Parts:").grid(
+            row=5, column=0, sticky='w', pady=3)
+        fe_bp_optflow = tk.StringVar(
+            value=self.train_bp_optflow.get() if hasattr(self, 'train_bp_optflow') else "hrpaw,hlpaw,snout")
+        ttk.Entry(settings, textvariable=fe_bp_optflow, width=40).grid(
+            row=5, column=1, padx=5, pady=3, sticky='ew')
+
+        ttk.Label(settings, text="DLC Config (optional):").grid(
+            row=6, column=0, sticky='w', pady=3)
+        fe_dlc_config = tk.StringVar(
+            value=self.train_dlc_config.get() if hasattr(self, 'train_dlc_config') else "")
+        ttk.Entry(settings, textvariable=fe_dlc_config, width=40).grid(
+            row=6, column=1, padx=5, pady=3, sticky='ew')
+        ttk.Button(settings, text="Browse",
+                   command=lambda: fe_dlc_config.set(
+                       filedialog.askopenfilename(
+                           title="Select DLC config.yaml",
+                           filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")])
+                       or fe_dlc_config.get())
+                   ).grid(row=6, column=2, padx=2)
+
+        # ── Progress log ──────────────────────────────────────────────────
+        log_frame = ttk.LabelFrame(win, text="Progress", padding=6)
+        log_frame.pack(fill='both', expand=True, padx=12, pady=4)
+
+        log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap='word',
+                                             font=('Courier', 9))
+        log_text.pack(fill='both', expand=True)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill='x', padx=12, pady=8)
+
+        run_btn = ttk.Button(btn_frame, text="▶  Run Extraction", style='Accent.TButton')
+        run_btn.pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side='right', padx=4)
+
+        def log(msg):
+            log_text.insert(tk.END, msg + "\n")
+            log_text.see(tk.END)
+            win.update_idletasks()
+
+        def _build_cfg():
+            return {
+                'bp_pixbrt_list': [x.strip() for x in fe_bp_pixbrt.get().split(',') if x.strip()],
+                'square_size':    [int(x.strip()) for x in fe_square.get().split(',') if x.strip()],
+                'pix_threshold':  fe_threshold.get(),
+                'use_gpu':        fe_use_gpu.get(),
+                'include_optical_flow': fe_optflow.get(),
+                'bp_optflow_list': [x.strip() for x in fe_bp_optflow.get().split(',') if x.strip()]
+                                   if fe_optflow.get() else [],
+                'dlc_config':     fe_dlc_config.get().strip() or None,
+            }
+
+        def start():
+            mode = fe_mode.get()
+            cfg = _build_cfg()
+
+            if mode == 'single':
+                dlc = fe_dlc_single.get().strip()
+                vid = fe_video_single.get().strip()
+                if not dlc or not vid:
+                    messagebox.showwarning("Missing files",
+                                           "Please select both a DLC file and a video file.",
+                                           parent=win)
+                    return
+                out = fe_out_single.get().strip() or os.path.join(
+                    os.path.dirname(vid), 'features')
+                sessions = [{
+                    'session_name': os.path.splitext(os.path.basename(vid))[0],
+                    'pose_path':    dlc,
+                    'video_path':   vid,
+                }]
+                cache_root = out
+            else:
+                project = fe_project.get().strip()
+                if not project:
+                    messagebox.showwarning("No folder",
+                                           "Please select a project folder.", parent=win)
+                    return
+                sessions = None   # thread will scan
+                cache_root = os.path.join(project, 'features')
+
+            run_btn.config(state='disabled')
+            log_text.delete('1.0', tk.END)
+            threading.Thread(
+                target=self._run_feature_extraction_thread,
+                args=(sessions, cache_root,
+                      fe_project.get().strip() if mode == 'batch' else None,
+                      cfg, log, lambda: run_btn.config(state='normal')),
+                daemon=True
+            ).start()
+
+        run_btn.config(command=start)
+
+    def _run_feature_extraction_thread(self, sessions, cache_root,
+                                        project_folder, cfg, log_fn, done_fn):
+        """Background worker for the Feature Extraction tool.
+
+        sessions     : list of dicts with session_name/pose_path/video_path,
+                       or None → scan project_folder for pairs.
+        cache_root   : directory where .pkl files are written.
+        project_folder: only used when sessions is None (batch scan).
+        """
+        def log(msg):
+            self.root.after(0, lambda m=msg: log_fn(m))
+
+        try:
+            # ── Discover sessions if not provided (batch mode) ─────────────
+            if sessions is None:
+                log(f"Project: {project_folder}")
+                log("Scanning for sessions...\n")
+
+                # Try the shared training session finder first
+                found = self.find_training_sessions()
+                if found:
+                    sessions = found
+                else:
+                    # Fall back: scan videos/ subfolder for .h5 + video pairs
+                    video_dir = os.path.join(project_folder, 'videos')
+                    if not os.path.isdir(video_dir):
+                        video_dir = project_folder
+                    sessions = []
+                    for h5 in glob.glob(os.path.join(video_dir, '*.h5')):
+                        base = os.path.splitext(os.path.basename(h5))[0]
+                        stem = base.split('DLC')[0] if 'DLC' in base else base
+                        for ext in ('.mp4', '.avi', '.mov', '.mkv'):
+                            vid = os.path.join(video_dir, stem + ext)
+                            if os.path.isfile(vid):
+                                sessions.append({
+                                    'session_name': stem,
+                                    'pose_path':    h5,
+                                    'video_path':   vid,
+                                })
+                                break
+
+                if not sessions:
+                    log("No video+DLC session pairs found.")
+                    self.root.after(0, done_fn)
+                    return
+
+            log(f"Found {len(sessions)} session(s):")
+            for s in sessions:
+                log(f"  • {s['session_name']}")
+            log("")
+
+            # ── Build cache key & hash ─────────────────────────────────────
+            os.makedirs(cache_root, exist_ok=True)
+
+            cfg_hash = PixelPawsGUI._feature_hash_key(cfg)
+
+            # ── Extract ────────────────────────────────────────────────────
+            total = len(sessions)
+            skipped = 0
+            errors  = 0
+            for idx, session in enumerate(sessions, 1):
+                name = session['session_name']
+                log(f"[{idx}/{total}] {name}")
+
+                cache_file = os.path.join(cache_root, f"{name}_features_{cfg_hash}.pkl")
+
+                if os.path.isfile(cache_file):
+                    log("  ✓ Already cached — skipping")
+                    skipped += 1
+                    continue
+
+                try:
+                    X = PixelPaws_ExtractFeatures(
+                        pose_data_file=session['pose_path'],
+                        video_file_path=session['video_path'],
+                        bp_include_list=None,
+                        bp_pixbrt_list=cfg['bp_pixbrt_list'],
+                        square_size=cfg['square_size'],
+                        pix_threshold=cfg['pix_threshold'],
+                        use_gpu=cfg['use_gpu'],
+                        config_yaml_path=cfg.get('dlc_config'),
+                        include_optical_flow=cfg['include_optical_flow'],
+                        bp_optflow_list=cfg['bp_optflow_list'] or None,
+                    )
+                    X = X.reset_index(drop=True)
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(X, f)
+                    log(f"  ✓ {X.shape[0]} frames × {X.shape[1]} features")
+                    log(f"     → {cache_file}")
+                except Exception as e:
+                    log(f"  ✗ Error: {e}")
+                    errors += 1
+
+            log(f"\nDone.  {total - skipped - errors} extracted, "
+                f"{skipped} skipped (cached), {errors} errors.")
+
+        except Exception as e:
+            import traceback
+            log(f"\nUnexpected error: {e}")
+            log(traceback.format_exc())
+
+        self.root.after(0, done_fn)
+
     # === THEME METHODS ===
-    
+
     def toggle_theme(self):
         """Toggle between light and dark mode"""
         new_mode = self.theme.toggle()
@@ -6519,18 +7177,21 @@ Median: {feature_data.median():.6f}
                     
                     # Create cache key based on configuration (match preview hash)
                     import hashlib
-                    
+
                     cfg_key = {
                         'bp_include_list': clf_data.get('bp_include_list'),
                         'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
                         'square_size': clf_data.get('square_size', [40]),
                         'pix_threshold': clf_data.get('pix_threshold', 0.3),
+                        'pose_feature_version': POSE_FEATURE_VERSION,
+                        'include_optical_flow': clf_data.get('include_optical_flow', False),
+                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                     }
                     cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
-                    
+
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
-                    
+
                     # Check both possible cache locations
                     cache_locations = [
                         os.path.join(video_dir, 'PredictionCache', f"{video_name}_features_{cfg_hash}.pkl"),  # From preview
@@ -6580,8 +7241,10 @@ Median: {feature_data.median():.6f}
                             pix_threshold=clf_data.get('pix_threshold', 0.3),
                             use_gpu=True,  # GPU enabled (auto-fallback)
                             config_yaml_path=config_yaml,  # Auto-detect crop from config
+                            include_optical_flow=clf_data.get('include_optical_flow', False),
+                            bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
                         )
-                        
+
                         # Save to cache
                         with open(cache_file, 'wb') as f:
                             pickle.dump(X, f)
@@ -6940,30 +7603,33 @@ Median: {feature_data.median():.6f}
                     
                     # Create cache key (match preview hash)
                     import hashlib
-                    
+
                     cfg_key = {
                         'bp_include_list': clf_data.get('bp_include_list'),
                         'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
                         'square_size': clf_data.get('square_size', [40]),
                         'pix_threshold': clf_data.get('pix_threshold', 0.3),
+                        'pose_feature_version': POSE_FEATURE_VERSION,
+                        'include_optical_flow': clf_data.get('include_optical_flow', False),
+                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                     }
                     cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
-                    
+
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
-                    
+
                     # Check both possible cache locations
                     cache_locations = [
                         os.path.join(video_dir, 'PredictionCache', f"{video_name}_features_{cfg_hash}.pkl"),  # From preview
                         os.path.join(video_dir, 'FeatureCache', f"{video_name}_features_{cfg_hash}.pkl"),     # From optimizer
                     ]
-                    
+
                     cache_file = None
                     for loc in cache_locations:
                         if os.path.isfile(loc):
                             cache_file = loc
                             break
-                    
+
                     # Try to load from cache
                     if cache_file:
                         results_text.insert(tk.END, f"  ✓ Loaded from cache\n")
@@ -6973,11 +7639,11 @@ Median: {feature_data.median():.6f}
                         # Extract features and save to FeatureCache
                         results_text.insert(tk.END, f"  Extracting features...\n")
                         optimizer_window.update()
-                        
+
                         cache_dir = os.path.join(video_dir, 'FeatureCache')
                         os.makedirs(cache_dir, exist_ok=True)
                         cache_file = os.path.join(cache_dir, f"{video_name}_features_{cfg_hash}.pkl")
-                        
+
                         # Try to find config.yaml for crop detection
                         config_yaml = None
                         config_search_paths = [
@@ -6988,7 +7654,7 @@ Median: {feature_data.median():.6f}
                             if os.path.isfile(cfg_path):
                                 config_yaml = cfg_path
                                 break
-                        
+
                         X = PixelPaws_ExtractFeatures(
                             pose_data_file=file_set['dlc'],
                             video_file_path=file_set['video'],
@@ -6998,8 +7664,10 @@ Median: {feature_data.median():.6f}
                             pix_threshold=clf_data.get('pix_threshold', 0.3),
                             use_gpu=True,  # GPU enabled (auto-fallback)
                             config_yaml_path=config_yaml,  # Pass config for crop detection
+                            include_optical_flow=clf_data.get('include_optical_flow', False),
+                            bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
                         )
-                        
+
                         # Save to cache
                         with open(cache_file, 'wb') as f:
                             pickle.dump(X, f)
@@ -7843,6 +8511,88 @@ Left/Right  - Previous/Next frame
         if name in self.pred_classifier_options:
             self.pred_classifier_path.set(self.pred_classifier_options[name])
 
+    def refresh_pred_videos(self):
+        """Populate the predict-tab video dropdown from project videos/ folder."""
+        videos_dir = os.path.join(self.current_project_folder.get(), 'videos')
+        self.pred_video_options = {}
+        if os.path.isdir(videos_dir):
+            exts = ('.mp4', '.avi', '.mov', '.mkv', '.wmv')
+            for f in sorted(os.listdir(videos_dir)):
+                if f.lower().endswith(exts):
+                    self.pred_video_options[f] = os.path.join(videos_dir, f)
+        if hasattr(self, 'pred_video_combo'):
+            self.pred_video_combo['values'] = list(self.pred_video_options.keys())
+
+    def _on_pred_video_selected(self, event=None):
+        """Set full video path and auto-find DLC/features when dropdown selection changes."""
+        name = self.pred_video_combo.get()
+        if name in self.pred_video_options:
+            self.pred_video_path.set(self.pred_video_options[name])
+        self._auto_find_pred_files()
+
+    def _auto_find_pred_files(self):
+        """Silently populate DLC path and features cache for the currently selected video."""
+        video_path = self.pred_video_path.get()
+        if not video_path or not os.path.isfile(video_path):
+            return
+
+        video_folder   = os.path.dirname(video_path)
+        video_base     = os.path.splitext(os.path.basename(video_path))[0]
+        project_folder = self.current_project_folder.get()
+
+        # --- DLC pose file ---
+        if not self.pred_dlc_path.get():
+            dlc_files = glob.glob(os.path.join(video_folder, f"{video_base}DLC*.h5"))
+            if dlc_files:
+                filtered = [f for f in dlc_files if 'filtered' in f.lower()]
+                self.pred_dlc_path.set((filtered or dlc_files)[0])
+
+        # --- Features cache ---
+        if not self.pred_features_path.get():
+            search_locs = [
+                os.path.join(project_folder, 'features'),        # canonical
+                os.path.join(project_folder, 'FeatureCache'),    # legacy project-level
+                os.path.join(video_folder, 'FeatureCache'),      # legacy per-video
+                os.path.join(video_folder, 'PredictionCache'),   # from predict/preview
+                video_folder,                                     # root video folder
+            ]
+            for loc in search_locs:
+                matches = glob.glob(os.path.join(loc, f"{video_base}_features*.pkl"))
+                if matches:
+                    self.pred_features_path.set(matches[0])
+                    break
+
+    def _parse_time_to_frames(self, time_str, fps):
+        """Convert a clip boundary string to a frame index.
+
+        Accepted formats
+        ----------------
+        123       plain integer  → treated as a frame number (returned as-is)
+        1.5       decimal        → seconds, multiplied by fps
+        1:30      MM:SS          → seconds, multiplied by fps
+        1:30:00   H:MM:SS        → seconds, multiplied by fps
+        ''        blank          → returns None (caller uses full-video default)
+        """
+        s = time_str.strip()
+        if not s:
+            return None
+        parts = s.split(':')
+        try:
+            if len(parts) == 3:
+                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                return int(seconds * fps)
+            elif len(parts) == 2:
+                seconds = int(parts[0]) * 60 + float(parts[1])
+                return int(seconds * fps)
+            else:
+                # No colon — distinguish frames from seconds by the presence of a decimal point
+                if '.' in s:
+                    return int(float(s) * fps)   # e.g. "1.5" → 1.5 s
+                else:
+                    return int(s)                 # e.g. "300" → frame 300
+        except ValueError:
+            return None
+
     def browse_pred_classifier(self):
         """Browse for classifier file"""
         filepath = filedialog.askopenfilename(
@@ -7882,10 +8632,11 @@ Left/Right  - Previous/Next frame
         """Browse for video file"""
         filepath = filedialog.askopenfilename(
             title="Select Video File",
-            filetypes=[("Video files", "*.mp4 *.avi"), ("All files", "*.*")]
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All files", "*.*")]
         )
         if filepath:
             self.pred_video_path.set(filepath)
+            self._auto_find_pred_files()
     
     def browse_pred_dlc(self):
         """Browse for DLC file"""
@@ -8206,9 +8957,12 @@ Left/Right  - Previous/Next frame
                         'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
                         'square_size': clf_data.get('square_size', [40]),
                         'pix_threshold': clf_data.get('pix_threshold', 0.3),
+                        'pose_feature_version': POSE_FEATURE_VERSION,
+                        'include_optical_flow': clf_data.get('include_optical_flow', False),
+                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                     }
                     cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
-                    
+
                     video_name_base = os.path.splitext(os.path.basename(video_path))[0]
                     
                     # Check for user-provided features file first
@@ -8276,6 +9030,8 @@ Left/Right  - Previous/Next frame
                                 pix_threshold=clf_data.get('pix_threshold', 0.3),
                                 use_gpu=True,  # GPU enabled (auto-fallback)
                                 config_yaml_path=config_yaml,  # Pass config for crop detection
+                                include_optical_flow=clf_data.get('include_optical_flow', False),
+                                bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
                             )
                             
                             with open(cache_file, 'wb') as f:
@@ -8444,7 +9200,156 @@ Left/Right  - Previous/Next frame
             return
         
         threading.Thread(target=self._predict_thread, daemon=True).start()
-    
+
+    def export_labeled_video(self):
+        """Start the labeled-video export thread (on-demand after prediction)."""
+        if self._last_pred_y_pred is None:
+            messagebox.showwarning("No Prediction", "Run a prediction first.")
+            return
+        import threading as _threading
+        _threading.Thread(target=self._export_labeled_video_thread, daemon=True).start()
+
+    def _export_labeled_video_thread(self):
+        """Write an annotated MP4 using the results from the last prediction run."""
+        try:
+            import cv2
+            import numpy as np
+            y_pred        = self._last_pred_y_pred
+            y_proba       = self._last_pred_y_proba
+            fps           = self._last_pred_fps
+            n_frames      = self._last_pred_n_frames
+            video_path    = self._last_pred_video_path
+            behavior_name = self._last_pred_behavior_name
+            output_folder = self._last_pred_output_folder
+            base_name     = self._last_pred_base_name
+
+            # Read overlay checkbox values
+            do_skeleton = self.lv_skeleton_dots.get()
+            do_tint     = self.lv_frame_tint.get()
+            do_timeline = self.lv_timeline_strip.get()
+
+            self.pred_results_text.insert(tk.END, "\nCreating labeled video...\n")
+
+            clip_start = self._parse_time_to_frames(self.pred_clip_start.get(), fps)
+            clip_end   = self._parse_time_to_frames(self.pred_clip_end.get(),   fps)
+            clip_start = max(0, clip_start if clip_start is not None else 0)
+            clip_end   = min(n_frames, clip_end if clip_end is not None else n_frames)
+            clip_end   = max(clip_start + 1, clip_end)
+
+            labeled_path = os.path.join(output_folder, f"{base_name}_labeled.mp4")
+
+            cap_lv = cv2.VideoCapture(video_path)
+            lv_w   = int(cap_lv.get(cv2.CAP_PROP_FRAME_WIDTH))
+            lv_h   = int(cap_lv.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(labeled_path, fourcc, fps, (lv_w, lv_h))
+
+            # Load DLC body-part coordinates for skeleton overlay
+            bp_xy = {}   # bodypart -> (x_arr, y_arr, prob_arr) each shape (n_frames,)
+            if do_skeleton and self._last_pred_dlc_path and os.path.exists(self._last_pred_dlc_path):
+                try:
+                    import pandas as _pd
+                    _dlc = _pd.read_hdf(self._last_pred_dlc_path)
+                    # DLC H5 has 3-level MultiIndex: (scorer, bodypart, coord)
+                    _dlc.columns = _pd.MultiIndex.from_tuples(
+                        [(_c[1], _c[2]) for _c in _dlc.columns])
+                    for _bp in _dlc.columns.get_level_values(0).unique():
+                        bp_xy[_bp] = (
+                            _dlc[_bp]['x'].values.astype(float),
+                            _dlc[_bp]['y'].values.astype(float),
+                            _dlc[_bp]['likelihood'].values.astype(float),
+                        )
+                except Exception:
+                    bp_xy = {}   # graceful degradation — skeleton silently skipped
+
+            # Pre-render timeline strip image (constant across frames, cursor varies)
+            total_clip = clip_end - clip_start
+            timeline_img = None
+            if do_timeline and total_clip > 0 and lv_h >= 20:
+                timeline_img = np.zeros((14, lv_w, 3), dtype=np.uint8)
+                for _x in range(lv_w):
+                    _idx = clip_start + int(_x * total_clip / lv_w)
+                    _idx = min(_idx, clip_end - 1)
+                    timeline_img[:, _x] = (0, 0, 180) if y_pred[_idx] == 1 else (0, 140, 0)
+                # Dim slightly so it doesn't overpower
+                cv2.addWeighted(np.full((14, lv_w, 3), 20, dtype=np.uint8), 0.3,
+                                timeline_img, 0.7, 0, timeline_img)
+
+            cap_lv.set(cv2.CAP_PROP_POS_FRAMES, clip_start)
+            for fi in range(clip_start, clip_end):
+                ret, frame = cap_lv.read()
+                if not ret:
+                    break
+
+                prob  = float(y_proba[fi]) if fi < len(y_proba) else 0.0
+                pred  = int(y_pred[fi])    if fi < len(y_pred)  else 0
+                color = (0, 0, 220) if pred == 1 else (0, 200, 0)
+
+                # 1. Frame tint (pred==1 only, applied before HUD so HUD stays crisp)
+                if do_tint and pred == 1:
+                    _red = np.full_like(frame, (0, 0, 80))
+                    cv2.addWeighted(_red, 0.22, frame, 0.78, 0, frame)
+
+                # 2. HUD background + text + confidence bar
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (lv_w, 80), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+                ts   = fi / fps
+                tstr = f"{int(ts // 3600):01d}:{int((ts % 3600) // 60):02d}:{ts % 60:05.2f}"
+                cv2.putText(frame, f"Frame {fi}  [{tstr}]",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+                cv2.putText(frame,
+                            f"{behavior_name}: {'YES' if pred else 'NO'}   p = {prob:.3f}",
+                            (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+
+                bar_w = int(lv_w * prob)
+                cv2.rectangle(frame, (0, 71), (bar_w, 79), color, -1)
+                cv2.rectangle(frame, (0, 71), (lv_w - 1, 79), (80, 80, 80), 1)
+
+                # 3. Skeleton dots
+                if bp_xy:
+                    for _bp, (_xs, _ys, _ps) in bp_xy.items():
+                        if fi < len(_xs):
+                            _conf = float(_ps[fi])
+                            if _conf > 0.3:
+                                _x, _y = int(_xs[fi]), int(_ys[fi])
+                                _r = max(3, int(7 * _conf))
+                                cv2.circle(frame, (_x, _y), _r, color, -1)
+                                cv2.circle(frame, (_x, _y), _r + 1, (255, 255, 255), 1)
+
+                # 4. Red halo border (pred==1 only)
+                if pred == 1:
+                    cv2.rectangle(frame, (0, 0), (lv_w - 1, lv_h - 1), (0, 0, 220), 18)
+                    cv2.rectangle(frame, (9, 9), (lv_w - 10, lv_h - 10), (40, 40, 180), 6)
+
+                # 5. Timeline strip (drawn last — sits on top at bottom edge)
+                if timeline_img is not None:
+                    _cursor_x = int((fi - clip_start) * lv_w / max(total_clip - 1, 1))
+                    _cursor_x = min(_cursor_x, lv_w - 1)
+                    _tl = timeline_img.copy()
+                    cv2.line(_tl, (_cursor_x, 0), (_cursor_x, 13), (255, 255, 255), 2)
+                    frame[lv_h - 14:lv_h, :] = _tl
+
+                writer.write(frame)
+
+                done = fi - clip_start + 1
+                if done % 500 == 0 or done == total_clip:
+                    self.pred_results_text.insert(
+                        tk.END, f"  Writing frame {done} / {total_clip}\n")
+                    self.pred_results_text.see(tk.END)
+
+            cap_lv.release()
+            writer.release()
+            self.pred_results_text.insert(tk.END, f"✓ Labeled video: {labeled_path}\n")
+            messagebox.showinfo("Done", f"Labeled video saved:\n{labeled_path}")
+
+        except Exception as e:
+            import traceback
+            self.pred_results_text.insert(
+                tk.END, f"\n✗ Export failed: {traceback.format_exc()}\n")
+            messagebox.showerror("Error", f"Export failed:\n{str(e)}")
+
     def _predict_thread(self):
         """Prediction thread with feature caching and crop handling"""
         try:
@@ -8573,12 +9478,15 @@ Left/Right  - Previous/Next frame
                     'square_size': clf_data.get('square_size', [40]),
                     'pix_threshold': clf_data.get('pix_threshold', 0.3),
                     'crop_offset': (crop_x_offset, crop_y_offset),
+                    'pose_feature_version': POSE_FEATURE_VERSION,
+                    'include_optical_flow': clf_data.get('include_optical_flow', False),
+                    'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                 }
                 cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
-                
-                cache_file = os.path.join(cache_dir, 
+
+                cache_file = os.path.join(cache_dir,
                     f"{os.path.splitext(video_name)[0]}_features_{cfg_hash}.pkl")
-                
+
                 # Try to load cached features
                 if os.path.isfile(cache_file):
                     self.pred_results_text.insert(tk.END, "Loading cached features...\n")
@@ -8589,11 +9497,11 @@ Left/Right  - Previous/Next frame
                     # Extract features
                     self.pred_results_text.insert(tk.END, "Extracting features...\n")
                     self.pred_results_text.insert(tk.END, "  (This may take several minutes for long videos)\n")
-                    
+
                     if crop_x_offset != 0 or crop_y_offset != 0:
-                        self.pred_results_text.insert(tk.END, 
+                        self.pred_results_text.insert(tk.END,
                             f"  Applying crop offset: x+{crop_x_offset}, y+{crop_y_offset}\n")
-                    
+
                     X = PixelPaws_ExtractFeatures(
                         pose_data_file=dlc_path,
                         video_file_path=video_path,
@@ -8605,6 +9513,8 @@ Left/Right  - Previous/Next frame
                         crop_offset_x=crop_x_offset,  # Pass detected crop offset
                         crop_offset_y=crop_y_offset,
                         config_yaml_path=dlc_config_path if dlc_config_path else None,  # Pass config for auto-detection
+                        include_optical_flow=clf_data.get('include_optical_flow', False),
+                        bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
                     )
                     
                     # Save to cache
@@ -8710,9 +9620,21 @@ Left/Right  - Previous/Next frame
                 
                 self.pred_results_text.insert(tk.END, f"✓ Summary: {summary_path}\n")
             
+            # Stash results for the separate labeled-video export
+            self._last_pred_y_pred        = y_pred
+            self._last_pred_y_proba       = y_proba
+            self._last_pred_fps           = fps
+            self._last_pred_n_frames      = n_frames
+            self._last_pred_video_path    = video_path
+            self._last_pred_behavior_name = behavior_name
+            self._last_pred_output_folder = output_folder
+            self._last_pred_base_name     = base_name
+            self._last_pred_dlc_path      = dlc_path   # for skeleton overlay in export
+            self.pred_export_video_btn.config(state='normal')
+
             if self.pred_generate_ethogram.get():
                 self.pred_results_text.insert(tk.END, "✓ Ethogram plots: (feature in development)\n")
-            
+
             self.pred_results_text.insert(tk.END, "\n✓ Prediction complete!\n")
             
             messagebox.showinfo("Complete", "Prediction completed successfully!")
@@ -9346,6 +10268,9 @@ Left/Right  - Previous/Next frame
                             'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
                             'square_size': clf_data.get('square_size', [40]),
                             'pix_threshold': clf_data.get('pix_threshold', 0.3),
+                            'pose_feature_version': POSE_FEATURE_VERSION,
+                            'include_optical_flow': clf_data.get('include_optical_flow', False),
+                            'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                         }
                         clf_hash = hashlib.md5(repr(clf_cfg_key).encode()).hexdigest()[:8]
                         cache_locations.extend([
@@ -9433,8 +10358,10 @@ Left/Right  - Previous/Next frame
                                 pix_threshold=clf_data.get('pix_threshold', 0.3),
                                 use_gpu=True,
                                 config_yaml_path=config_yaml,  # Pass config for crop detection
+                                include_optical_flow=clf_data.get('include_optical_flow', False),
+                                bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
                             )
-                            
+
                             # Save with classifier-specific hash
                             cache_dir = os.path.join(video_dir, 'FeatureCache')
                             os.makedirs(cache_dir, exist_ok=True)
@@ -9692,11 +10619,9 @@ Left/Right  - Previous/Next frame
             if has_subfolders:
                 video_folder = os.path.join(folder, 'Videos')
                 target_folder = os.path.join(folder, 'Targets')
-                feature_cache_folder = os.path.join(folder, 'FeatureCache')
-                if not os.path.exists(feature_cache_folder):
-                    feature_cache_folder = os.path.join(folder, 'PredictionCache')
             else:
-                video_folder = target_folder = feature_cache_folder = folder
+                video_folder = target_folder = folder
+            feature_cache_folder = os.path.join(folder, 'features')
             
             # Find DLC files
             dlc_files = glob.glob(os.path.join(video_folder, '*.h5'))
@@ -10116,7 +11041,10 @@ Left/Right  - Previous/Next frame
                             'bp_include_list': clf_data.get('bp_include_list'),
                             'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
                             'square_size': clf_data.get('square_size', [40]),
-                            'pix_threshold': clf_data.get('pix_threshold', 0.3)
+                            'pix_threshold': clf_data.get('pix_threshold', 0.3),
+                            'pose_feature_version': POSE_FEATURE_VERSION,
+                            'include_optical_flow': clf_data.get('include_optical_flow', False),
+                            'bp_optflow_list': clf_data.get('bp_optflow_list', []),
                         }
                         self.al_log_message(f"  Using feature config from classifier:")
                         self.al_log_message(f"    bp_pixbrt_list: {feature_config['bp_pixbrt_list']}")
@@ -10132,7 +11060,10 @@ Left/Right  - Previous/Next frame
                     'bp_include_list': None,
                     'bp_pixbrt_list': ['hrpaw', 'hlpaw', 'snout'],  # Common body parts
                     'square_size': [40, 40, 40],
-                    'pix_threshold': 0.3
+                    'pix_threshold': 0.3,
+                    'pose_feature_version': POSE_FEATURE_VERSION,
+                    'include_optical_flow': False,
+                    'bp_optflow_list': [],
                 }
                 self.al_log_message(f"  Using default brightness config:")
                 self.al_log_message(f"    bp_pixbrt_list: {feature_config['bp_pixbrt_list']}")
@@ -10162,6 +11093,8 @@ Left/Right  - Previous/Next frame
                 pix_threshold=feature_config['pix_threshold'],
                 use_gpu=True,
                 config_yaml_path=config_yaml,  # Pass config for crop detection
+                include_optical_flow=feature_config.get('include_optical_flow', False),
+                bp_optflow_list=feature_config.get('bp_optflow_list', []) or None,
             )
             
             # Save to cache
@@ -10535,7 +11468,11 @@ Left/Right  - Previous/Next frame
                 if response:
                     self.al_log_message("Extracting features...")
                     base_name = os.path.splitext(os.path.basename(video_path))[0]
-                    cache_folder = os.path.join(os.path.dirname(labels_csv), 'FeatureCache')
+                    _pf = self.current_project_folder.get() if hasattr(self, 'current_project_folder') else ''
+                    if _pf and os.path.isdir(_pf):
+                        cache_folder = os.path.join(_pf, 'features')
+                    else:
+                        cache_folder = os.path.join(os.path.dirname(labels_csv), 'features')
                     
                     features_cache = self._extract_features_for_session(
                         base_name, video_path, dlc_path, cache_folder

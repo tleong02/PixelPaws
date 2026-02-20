@@ -701,7 +701,10 @@ class EvaluationTab(ttk.Frame):
 
                 # ── Features: load cache or extract ──────────────────────
                 X = None
-                cache_dir = os.path.join(os.path.dirname(video_path), 'PredictionCache')
+                if pf and os.path.isdir(pf):
+                    cache_dir = os.path.join(pf, 'features')
+                else:
+                    cache_dir = os.path.join(os.path.dirname(video_path), 'features')
                 os.makedirs(cache_dir, exist_ok=True)
 
                 cfg_key = {

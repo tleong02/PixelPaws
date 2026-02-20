@@ -1265,7 +1265,11 @@ def run_cross_video_active_learning(sessions: list,
         print(f"\nLoading features: {session['session_name']}")
         with open(cache_path, 'rb') as f:
             features = pickle.load(f)
-        if isinstance(features, pd.DataFrame):
+
+        # Select only the features the model was trained on (handles SHAP-pruned models)
+        if hasattr(model, 'feature_names_in_') and isinstance(features, pd.DataFrame):
+            features = features[list(model.feature_names_in_)].values
+        elif isinstance(features, pd.DataFrame):
             features = features.values
 
         proba       = model.predict_proba(features)[:, 1]
