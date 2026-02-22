@@ -654,9 +654,9 @@ class EvaluationTab(ttk.Frame):
             pf = project_folder.get() if project_folder else ''
             if pf and os.path.isdir(pf):
                 output_folder = os.path.join(pf, 'evaluations')
-                os.makedirs(output_folder, exist_ok=True)
             else:
                 output_folder = self.eval_test_folder.get()
+            os.makedirs(output_folder, exist_ok=True)
 
             for idx, session in enumerate(sessions, 1):
                 video_path  = session['video']

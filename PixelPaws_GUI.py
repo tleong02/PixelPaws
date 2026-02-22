@@ -7663,11 +7663,26 @@ Median: {feature_data.median():.6f}
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
 
-                    # Check both possible cache locations
-                    cache_locations = [
-                        os.path.join(video_dir, 'PredictionCache', f"{video_name}_features_{cfg_hash}.pkl"),  # From preview
-                        os.path.join(video_dir, 'FeatureCache', f"{video_name}_features_{cfg_hash}.pkl"),     # From optimizer
+                    # Check cache locations: project/features/ first, then video-local fallbacks
+                    _proj_folder = self.current_project_folder.get()
+                    _cache_fname = f"{video_name}_features_{cfg_hash}.pkl"
+                    cache_locations = []
+                    if _proj_folder and os.path.isdir(_proj_folder):
+                        cache_locations.append(os.path.join(_proj_folder, 'features', _cache_fname))
+                    cache_locations += [
+                        os.path.join(video_dir, 'PredictionCache', _cache_fname),
+                        os.path.join(video_dir, 'FeatureCache', _cache_fname),
                     ]
+                    _ancestor = video_dir
+                    while True:
+                        _parent = os.path.dirname(_ancestor)
+                        if _parent == _ancestor:
+                            break
+                        _ancestor = _parent
+                        cache_locations.append(os.path.join(_ancestor, 'features', _cache_fname))
+                        cache_locations.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
+                        if _proj_folder and os.path.normpath(_ancestor) == os.path.normpath(_proj_folder):
+                            break
 
                     cache_file = None
                     for loc in cache_locations:
@@ -7681,13 +7696,16 @@ Median: {feature_data.median():.6f}
                         with open(cache_file, 'rb') as f:
                             X = pickle.load(f)
                     else:
-                        # Extract features and save to FeatureCache
+                        # Extract features and save to project/features/ when available
                         results_text.insert(tk.END, f"  Extracting features...\n")
                         optimizer_window.update()
 
-                        cache_dir = os.path.join(video_dir, 'FeatureCache')
+                        if _proj_folder and os.path.isdir(_proj_folder):
+                            cache_dir = os.path.join(_proj_folder, 'features')
+                        else:
+                            cache_dir = os.path.join(video_dir, 'FeatureCache')
                         os.makedirs(cache_dir, exist_ok=True)
-                        cache_file = os.path.join(cache_dir, f"{video_name}_features_{cfg_hash}.pkl")
+                        cache_file = os.path.join(cache_dir, _cache_fname)
 
                         # Try to find config.yaml for crop detection
                         config_yaml = None
@@ -9300,6 +9318,7 @@ Left/Right  - Previous/Next frame
             clip_end   = max(clip_start + 1, clip_end)
 
             labeled_path = os.path.join(output_folder, f"{base_name}_labeled.mp4")
+            os.makedirs(output_folder, exist_ok=True)
 
             cap_lv = cv2.VideoCapture(video_path)
             lv_w   = int(cap_lv.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -9800,9 +9819,14 @@ Left/Right  - Previous/Next frame
                     feature_cache_dir = os.path.join(video_dir, 'FeatureCache')
                     prediction_cache_dir = os.path.join(video_dir, 'PredictionCache')
                     
-                    smart_cache_locations = [
-                        os.path.join(feature_cache_dir, f"{video_base}_features_smart_{smart_hash}.pkl"),
-                        os.path.join(prediction_cache_dir, f"{video_base}_features_smart_{smart_hash}.pkl"),
+                    _proj_folder = self.current_project_folder.get()
+                    _smart_fname = f"{video_base}_features_smart_{smart_hash}.pkl"
+                    smart_cache_locations = []
+                    if _proj_folder and os.path.isdir(_proj_folder):
+                        smart_cache_locations.append(os.path.join(_proj_folder, 'features', _smart_fname))
+                    smart_cache_locations += [
+                        os.path.join(feature_cache_dir, _smart_fname),
+                        os.path.join(prediction_cache_dir, _smart_fname),
                     ]
                     
                     cache_file = None
@@ -10285,7 +10309,11 @@ Left/Right  - Previous/Next frame
                         behavior_name = clf_data.get('Behavior_type', 'Behavior')
                         
                         # Results subfolder named after behavior
-                        results_folder = os.path.join(video_dir, "Results", behavior_name)
+                        _proj_folder = self.current_project_folder.get()
+                        if _proj_folder and os.path.isdir(_proj_folder):
+                            results_folder = os.path.join(_proj_folder, 'results', behavior_name)
+                        else:
+                            results_folder = os.path.join(video_dir, 'Results', behavior_name)
                         os.makedirs(results_folder, exist_ok=True)
                         
                         # Determine parameters to use
@@ -10426,7 +10454,11 @@ Left/Right  - Previous/Next frame
                             )
 
                             # Save with classifier-specific hash
-                            cache_dir = os.path.join(video_dir, 'FeatureCache')
+                            _proj_folder = self.current_project_folder.get()
+                            if _proj_folder and os.path.isdir(_proj_folder):
+                                cache_dir = os.path.join(_proj_folder, 'features')
+                            else:
+                                cache_dir = os.path.join(video_dir, 'FeatureCache')
                             os.makedirs(cache_dir, exist_ok=True)
                             cache_file = os.path.join(cache_dir, f"{video_base}_features_{clf_hash}.pkl")
                             with open(cache_file, 'wb') as f:
@@ -10452,7 +10484,11 @@ Left/Right  - Previous/Next frame
                             )
                             
                             # Save with smart hash
-                            cache_dir = os.path.join(video_dir, 'FeatureCache')
+                            _proj_folder = self.current_project_folder.get()
+                            if _proj_folder and os.path.isdir(_proj_folder):
+                                cache_dir = os.path.join(_proj_folder, 'features')
+                            else:
+                                cache_dir = os.path.join(video_dir, 'FeatureCache')
                             os.makedirs(cache_dir, exist_ok=True)
                             cache_file = os.path.join(cache_dir, f"{video_base}_features_smart_{smart_hash}.pkl")
                             with open(cache_file, 'wb') as f:

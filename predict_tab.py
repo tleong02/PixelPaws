@@ -388,8 +388,12 @@ class PredictTab:
             
             # Load classifier
             self.results_text.insert(tk.END, "Loading classifier...\n")
-            with open(clf_path, 'rb') as f:
-                clf_data = pickle.load(f)
+            try:
+                with open(clf_path, 'rb') as f:
+                    clf_data = pickle.load(f)
+            except Exception as e:
+                self.results_text.insert(tk.END, f"✗ Failed to load classifier: {e}\n")
+                return
             
             # Clean body parts
             clf_data['bp_include_list'] = clean_bodyparts_list(clf_data.get('bp_include_list', []))
@@ -557,6 +561,7 @@ class PredictTab:
     def _save_outputs(self, video_path, video_dir, behavior_name, y_pred, y_proba, fps):
         """Save prediction outputs"""
         output_dir = self.pred_output_folder.get() or video_dir
+        os.makedirs(output_dir, exist_ok=True)
         video_base = os.path.splitext(os.path.basename(video_path))[0]
         
         self.results_text.insert(tk.END, f"\nSaving outputs to: {output_dir}\n")
