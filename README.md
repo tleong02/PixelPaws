@@ -185,18 +185,41 @@ The trained classifier is saved as a `.pkl` file to `classifiers/`. The filename
 
 ### Predict Tab
 
-The Predict tab runs a trained classifier on a single video.
+The Predict tab runs a trained classifier on a single video and reports behavior statistics for that session.
 
-1. Select the **video file** (the original, not the cropped version — PixelPaws uses the path stored in the project config to find the H5 automatically, or you can specify it manually).
-2. Select the **classifier** from the dropdown (populated from `classifiers/`).
-3. Choose output options:
-   - *Prediction CSV* — one row per frame with the predicted probability and binary label.
-   - *Annotated video* — video with behavior label overlaid on each frame.
-   - *Ethogram* — image showing behavior presence as a color raster across time.
-   - *Statistics summary* — total time, bout count, mean bout duration, etc.
-4. Click **Run Prediction**.
+#### Inputs
 
-Output files are saved to `results/` with the session name as a prefix.
+| Field | Required | Notes |
+|---|---|---|
+| Classifier | Yes | Select a `.pkl` file from `classifiers/`. Click **View Classifier Info** to confirm the behavior name, threshold, and feature settings stored inside. |
+| Video file | Yes | The original (uncropped) video. |
+| DLC pose file | Yes | The `.h5` file produced by DeepLabCut for this video. Click **🔍 Auto-Find DLC File** to locate it automatically based on the video filename. |
+| Features file | No | A pre-extracted `.pkl` cache from `features/`. If provided, feature extraction is skipped entirely, saving several minutes. |
+| DLC config | No | The `config.yaml` from your DeepLabCut project. If provided and cropping was enabled in DLC, the crop offsets are read and applied to brightness feature extraction so pixel coordinates stay correct. Click **🔍 Auto-Find Config** to search for it automatically. |
+| Human labels | No | A per-frame label CSV in PixelPaws format. Providing it records the path alongside the prediction for your own reference; for a full quantitative comparison (precision, recall, F1, SHAP) use the **Evaluate tab** instead. |
+| Output folder | No | Defaults to the video's folder if left blank. |
+
+#### What it does
+
+1. Loads the classifier and reads its stored behavior name, threshold, body-part lists, bout-filtering parameters, and feature settings.
+2. Extracts pose + brightness features if no cached file is provided (this is the slow step — expect 2–10 minutes depending on video length and whether GPU is available).
+3. Runs the XGBoost model on every frame to produce a per-frame probability score.
+4. Applies the trained threshold to produce binary frame labels (0 = absent, 1 = present).
+5. Applies **bout filtering**: removes detections shorter than the minimum bout duration and fills gaps shorter than the maximum inter-bout interval. These parameters are stored in the classifier file, not set manually here.
+6. Displays a summary in the results panel: total frames, frames with behavior detected, total behavior time in seconds and minutes.
+
+#### Output options
+
+| Option | Output file | Contents |
+|---|---|---|
+| Save frame-by-frame predictions (CSV) | `<video>_predictions.csv` | One row per frame: `frame`, `prediction` (0/1), `probability` (raw score). This file is what the **Analyze tab** consumes for batch statistics. |
+| Create labeled video | `<video>_labeled.mp4` | Video with the behavior label overlaid on each frame. Slower to generate. |
+| Save behavior summary statistics | `<video>_summary.txt` | Total time, bout count, mean/max bout duration, percentage of session. |
+| Generate ethogram plots | `<video>_ethogram.png` | Color raster showing behavior presence across the full session timeline. |
+
+#### Comparing against human labels
+
+The Predict tab includes an optional **Human Labels** field where you can point to a ground-truth label CSV for the session. This path is stored with the prediction for reference but the Predict tab itself does not compute agreement metrics. For a full evaluation — confusion matrix, precision, recall, F1 at the trained threshold, precision-recall curve, and SHAP feature importance — use the **Evaluate tab**, which is designed specifically for that purpose.
 
 ### Evaluate Tab
 
