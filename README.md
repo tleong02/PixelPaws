@@ -9,17 +9,18 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 1. [Installation](#installation)
 2. [Project Setup Wizard](#project-setup-wizard)
 3. [Preparing Your Data](#preparing-your-data)
-4. [Crop for DLC Tool](#crop-for-dlc-tool)
-5. [Tab-by-Tab Guide](#tab-by-tab-guide)
+4. [Labeling with BORIS](#labeling-with-boris)
+5. [Crop for DLC Tool](#crop-for-dlc-tool)
+6. [Tab-by-Tab Guide](#tab-by-tab-guide)
    - [Train](#train-tab)
    - [Predict](#predict-tab)
    - [Evaluate](#evaluate-tab)
    - [Analyze](#analyze-tab)
    - [Active Learning](#active-learning-tab)
    - [Tools](#tools-tab)
-6. [Project Folder Layout](#project-folder-layout)
-7. [Requirements](#requirements)
-8. [Attribution & License](#attribution--license)
+7. [Project Folder Layout](#project-folder-layout)
+8. [Requirements](#requirements)
+9. [Attribution & License](#attribution--license)
 
 ---
 
@@ -86,6 +87,54 @@ Label files can be created with any tool that produces this format — BORIS exp
 ### Feature caching
 
 The first time PixelPaws processes a video it extracts all pose and brightness features and saves them to `features/` as a `.pkl` file keyed to the video. Subsequent runs skip extraction and load from cache, which makes retraining with different hyperparameters fast. Delete a cache file to force re-extraction (e.g., after changing body-part or ROI settings).
+
+---
+
+## Labeling with BORIS
+
+[BORIS (Behavioral Observation Research Interactive Software)](https://www.boris.unito.it/) is a free, widely-used tool for scoring animal behavior from video. PixelPaws accepts BORIS exports directly through its built-in converter.
+
+### Labeling workflow in BORIS
+
+1. Open your video in BORIS and create an ethogram with the behavior(s) you want to train (e.g., `Flinch`, `Lick`).
+2. Score each session using **START/STOP** events (for continuous behaviors) or **POINT** events (for instantaneous ones). Both are supported.
+3. When finished, export the observation via **File → Export events → Save as CSV** (or TSV). Make sure the export includes at minimum the following columns:
+   - **Behavior** — the behavior name
+   - **Behavior type** — `START`, `STOP`, or `POINT`
+   - **Time** — timestamp in seconds
+   - **FPS** *(optional)* — if included, the converter reads it automatically; otherwise you enter it manually
+
+### Converting BORIS labels to PixelPaws format
+
+PixelPaws needs labels as a per-frame CSV (one row per video frame, one column per behavior, values 0 or 1). The BORIS converter handles this translation.
+
+**Via the Tools tab or Tools menu → BORIS to PixelPaws:**
+
+1. Click **Browse** and select your BORIS export file (CSV or TSV).
+2. Click **🔍 Auto-Detect** to scan the file and pick the behavior you want to convert from a list, or type the behavior name directly.
+3. Enter the video **FPS** (frames per second). If your BORIS export has an FPS column, leave the field blank and it will be read automatically.
+4. Choose an **output directory** (defaults to the same folder as the BORIS file).
+5. Click **🔄 Convert**.
+
+The converter produces a file named `<boris_filename>_labels.csv` with a single column named after the behavior:
+
+```
+Flinch
+0
+0
+1
+1
+1
+0
+```
+
+Place this file in `behavior_labels/` inside your project folder (or in the same folder as the video — PixelPaws checks both). The session will then appear automatically in the Train and Evaluate session lists.
+
+### Tips
+
+- **One behavior per conversion run.** Run the converter once per behavior name. If you scored multiple behaviors in the same BORIS file, run it once for each and then merge the output CSVs column-by-column before training a multi-behavior session.
+- **Frame alignment.** The converter multiplies each timestamp by FPS and rounds to the nearest frame. Using the exact FPS your camera recorded at (e.g., 60.0, not 59.94) avoids drift over long recordings.
+- **Dense vs. sparse labels.** BORIS exports cover the full video duration with 0s between scored bouts — this is ideal for training. If you only have labels for a subset of frames (e.g., from Active Learning), the `SmartLabelManager` handles mixing the two automatically during training.
 
 ---
 
