@@ -4,6 +4,8 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 
 ---
 
+> 📷 **Building the filming enclosure?** See [hardware.md](hardware.md) for the full bill of materials, 3D-printed enclosure files, wiring notes, and camera/lens specs.
+
 ## Table of Contents
 
 1. [Installation](#installation)
