@@ -5046,9 +5046,19 @@ class PixelPawsGUI:
                 os.path.join(video_dir, 'features'),
                 os.path.join(video_dir, 'FeatureCache'),
                 os.path.join(video_dir, 'PredictionCache'),
-                os.path.join(os.path.dirname(video_dir), 'features'),
-                os.path.join(os.path.dirname(video_dir), 'FeatureCache'),
             ]
+            # Walk ancestor directories up to the project root so deeply nested
+            # video folders can still find their cached features.
+            _ancestor = video_dir
+            while True:
+                _parent = os.path.dirname(_ancestor)
+                if _parent == _ancestor:
+                    break
+                _ancestor = _parent
+                alt_dirs.append(os.path.join(_ancestor, 'features'))
+                alt_dirs.append(os.path.join(_ancestor, 'FeatureCache'))
+                if os.path.normpath(_ancestor) == os.path.normpath(cache_root):
+                    break
             for alt_dir in alt_dirs:
                 alt_path = os.path.join(alt_dir, cache_filename)
                 if os.path.isfile(alt_path):
@@ -7208,31 +7218,50 @@ Median: {feature_data.median():.6f}
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
 
-                    # Check both possible cache locations
-                    cache_locations = [
-                        os.path.join(video_dir, 'PredictionCache', f"{video_name}_features_{cfg_hash}.pkl"),  # From preview
-                        os.path.join(video_dir, 'FeatureCache', f"{video_name}_features_{cfg_hash}.pkl"),     # From optimizer
+                    # Build cache lookup list: project features/ first, then legacy video-local dirs
+                    _proj_folder = self.current_project_folder.get()
+                    _cache_fname = f"{video_name}_features_{cfg_hash}.pkl"
+                    cache_locations = []
+                    if _proj_folder and os.path.isdir(_proj_folder):
+                        cache_locations.append(os.path.join(_proj_folder, 'features', _cache_fname))
+                    cache_locations += [
+                        os.path.join(video_dir, 'PredictionCache', _cache_fname),
+                        os.path.join(video_dir, 'FeatureCache', _cache_fname),
                     ]
-                    
+                    # Walk ancestor directories up to project root to handle nested video folders
+                    _ancestor = video_dir
+                    while True:
+                        _parent = os.path.dirname(_ancestor)
+                        if _parent == _ancestor:
+                            break
+                        _ancestor = _parent
+                        cache_locations.append(os.path.join(_ancestor, 'features', _cache_fname))
+                        cache_locations.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
+                        if _proj_folder and os.path.normpath(_ancestor) == os.path.normpath(_proj_folder):
+                            break
+
                     cache_file = None
                     for loc in cache_locations:
                         if os.path.isfile(loc):
                             cache_file = loc
                             break
-                    
+
                     # Try to load from cache
                     if cache_file:
                         results_text.insert(tk.END, f"  ✓ Loaded from cache\n")
                         with open(cache_file, 'rb') as f:
                             X = pickle.load(f)
                     else:
-                        # Extract features and save to FeatureCache
+                        # Extract features and save to project features/ (or video-local FeatureCache)
                         results_text.insert(tk.END, f"  Extracting features...\n")
                         progress.update()
-                        
-                        cache_dir = os.path.join(video_dir, 'FeatureCache')
+
+                        if _proj_folder and os.path.isdir(_proj_folder):
+                            cache_dir = os.path.join(_proj_folder, 'features')
+                        else:
+                            cache_dir = os.path.join(video_dir, 'FeatureCache')
                         os.makedirs(cache_dir, exist_ok=True)
-                        cache_file = os.path.join(cache_dir, f"{video_name}_features_{cfg_hash}.pkl")
+                        cache_file = os.path.join(cache_dir, _cache_fname)
                         
                         # Try to find config.yaml for crop detection
                         config_yaml = self.train_dlc_config.get() if self.train_dlc_config.get() else None
@@ -9001,20 +9030,35 @@ Left/Right  - Previous/Next frame
                             print(f"⚠️ Could not load features file: {e}")
                             features_loaded = False
                     
-                    # If not loaded from file, check cache locations
+                    # If not loaded from file, build cache lookup list
                     if not features_loaded:
-                        # Check both possible cache locations
-                        cache_locations = [
-                            os.path.join(video_dir, 'PredictionCache', f"{video_name_base}_features_{cfg_hash}.pkl"),
-                            os.path.join(video_dir, 'FeatureCache', f"{video_name_base}_features_{cfg_hash}.pkl"),
+                        _proj_folder = self.current_project_folder.get()
+                        _cache_fname = f"{video_name_base}_features_{cfg_hash}.pkl"
+                        cache_locations = []
+                        if _proj_folder and os.path.isdir(_proj_folder):
+                            cache_locations.append(os.path.join(_proj_folder, 'features', _cache_fname))
+                        cache_locations += [
+                            os.path.join(video_dir, 'PredictionCache', _cache_fname),
+                            os.path.join(video_dir, 'FeatureCache', _cache_fname),
                         ]
-                        
+                        # Walk ancestor directories up to project root to handle nested video folders
+                        _ancestor = video_dir
+                        while True:
+                            _parent = os.path.dirname(_ancestor)
+                            if _parent == _ancestor:
+                                break
+                            _ancestor = _parent
+                            cache_locations.append(os.path.join(_ancestor, 'features', _cache_fname))
+                            cache_locations.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
+                            if _proj_folder and os.path.normpath(_ancestor) == os.path.normpath(_proj_folder):
+                                break
+
                         cache_file = None
                         for loc in cache_locations:
                             if os.path.isfile(loc):
                                 cache_file = loc
                                 break
-                    
+
                     # Load or extract features if not already loaded
                     if not features_loaded:
                         # Load or extract features
@@ -9028,11 +9072,14 @@ Left/Right  - Previous/Next frame
                             # No cache found - extract features
                             progress_label.config(text="Extracting features (this may take a while)...")
                             self.root.update()
-                            
-                            # Create PredictionCache directory for saving
-                            cache_dir = os.path.join(video_dir, 'PredictionCache')
+
+                            # Save to project features/ folder when project is set
+                            if _proj_folder and os.path.isdir(_proj_folder):
+                                cache_dir = os.path.join(_proj_folder, 'features')
+                            else:
+                                cache_dir = os.path.join(video_dir, 'PredictionCache')
                             os.makedirs(cache_dir, exist_ok=True)
-                            cache_file = os.path.join(cache_dir, f"{video_name_base}_features_{cfg_hash}.pkl")
+                            cache_file = os.path.join(cache_dir, _cache_fname)
                             
                             # Get config path from Predict tab (if user selected one)
                             config_yaml = self.pred_dlc_config_path.get() if self.pred_dlc_config_path.get() else None

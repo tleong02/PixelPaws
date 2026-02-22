@@ -701,10 +701,11 @@ class EvaluationTab(ttk.Frame):
 
                 # ── Features: load cache or extract ──────────────────────
                 X = None
+                video_dir = os.path.dirname(video_path)
                 if pf and os.path.isdir(pf):
                     cache_dir = os.path.join(pf, 'features')
                 else:
-                    cache_dir = os.path.join(os.path.dirname(video_path), 'features')
+                    cache_dir = os.path.join(video_dir, 'features')
                 os.makedirs(cache_dir, exist_ok=True)
 
                 cfg_key = {
@@ -715,8 +716,31 @@ class EvaluationTab(ttk.Frame):
                     'crop_offset':     (crop_x, crop_y),
                 }
                 cfg_hash   = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
-                cache_file = os.path.join(cache_dir,
-                                          f'{base_name}_features_{cfg_hash}.pkl')
+                _cache_fname = f'{base_name}_features_{cfg_hash}.pkl'
+                cache_file = os.path.join(cache_dir, _cache_fname)
+
+                # If not in canonical location, search fallback dirs (legacy + ancestor walk)
+                if not os.path.isfile(cache_file):
+                    _fallback_locs = [
+                        os.path.join(video_dir, 'PredictionCache', _cache_fname),
+                        os.path.join(video_dir, 'FeatureCache', _cache_fname),
+                        os.path.join(video_dir, _cache_fname),
+                    ]
+                    _ancestor = video_dir
+                    while True:
+                        _parent = os.path.dirname(_ancestor)
+                        if _parent == _ancestor:
+                            break
+                        _ancestor = _parent
+                        _fallback_locs.append(os.path.join(_ancestor, 'features', _cache_fname))
+                        _fallback_locs.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
+                        if pf and os.path.normpath(_ancestor) == os.path.normpath(pf):
+                            break
+                    for _loc in _fallback_locs:
+                        if os.path.isfile(_loc):
+                            cache_file = _loc
+                            self._log(f'  [Cache] Found in fallback: {_loc}')
+                            break
 
                 if os.path.isfile(cache_file):
                     self._log('  Loading cached features…')
@@ -729,6 +753,8 @@ class EvaluationTab(ttk.Frame):
                     except Exception as e:
                         self._log(f'  ⚠️  Cache load failed ({e}), re-extracting…')
                         X = None
+                        # Reset to canonical save path
+                        cache_file = os.path.join(cache_dir, _cache_fname)
 
                 if X is None:
                     self._log('  Extracting features (this may take a while)…')
