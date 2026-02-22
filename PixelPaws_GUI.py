@@ -2539,63 +2539,33 @@ class PixelPawsGUI:
     
     def set_app_icon(self):
         """Set custom application icon"""
+        # Embedded paw-print PNG (48x48, sienna brown on transparent background)
+        _PAW_PNG_B64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAl0lEQVR42u2XwRGAIAwEachmrNBO"
+            "9eWH4WEkcITszeTHwC2gOUpBCCGEnHSdx/1Wzxip8bosY5Yzb6nQ5mUQAADQadYbojXfcrs8/XT+"
+            "7lxr4ekQs+5vaIChpwCA+gpZPuLUAF/WGdbIvIFl8SJMhPbu1qHNyyGI0kqI0ABLxmYAAACA32ju"
+            "ZkYWSptGt3gPKJ6gCKFN9AD9qLMK6/deWQAAAABJRU5ErkJggg=="
+        )
         try:
-            # Try to load icon file from common locations
-            icon_paths = [
-                "pixelpaws_icon.ico",  # Same directory
-                "icon.ico",
-                os.path.join(os.path.dirname(__file__), "pixelpaws_icon.ico"),
-                os.path.join(os.path.dirname(__file__), "icon.ico"),
-            ]
-            
-            for icon_path in icon_paths:
+            # Try .ico file first (best quality on Windows)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            for icon_path in [
+                os.path.join(script_dir, "pixelpaws_icon.ico"),
+                "pixelpaws_icon.ico",
+            ]:
                 if os.path.exists(icon_path):
                     self.root.iconbitmap(icon_path)
-                    print(f"✓ Loaded icon: {icon_path}")
                     return
-            
-            # If no .ico file found, create a simple icon from PhotoImage
-            # This creates a small colored square as fallback
-            try:
-                from PIL import Image, ImageDraw, ImageFont, ImageTk
-                
-                # Create a 32x32 icon with "BF" text
-                size = 64
-                img = Image.new('RGBA', (size, size), (70, 130, 180, 255))  # Steel blue
-                draw = ImageDraw.Draw(img)
-                
-                # Draw "BF" text
-                try:
-                    font = ImageFont.truetype("arial.ttf", int(size * 0.5))
-                except:
-                    font = ImageFont.load_default()
-                
-                text = "BF"
-                # Get text bounding box
-                bbox = draw.textbbox((0, 0), text, font=font)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-                
-                # Center text
-                x = (size - text_width) // 2
-                y = (size - text_height) // 2 - 2
-                
-                draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
-                
-                # Convert to PhotoImage
-                photo = ImageTk.PhotoImage(img)
-                self.root.iconphoto(True, photo)
-                
-                # Keep reference to prevent garbage collection
-                self.root._icon_photo = photo
-                
-            except ImportError:
-                # PIL not available, use default icon
-                pass
-                
+
+            # Fallback: embedded PNG via tkinter PhotoImage (no PIL required)
+            import base64
+            png_data = base64.b64decode(_PAW_PNG_B64)
+            photo = tk.PhotoImage(data=base64.b64encode(png_data).decode())
+            self.root.iconphoto(True, photo)
+            self.root._icon_photo = photo  # prevent GC
+
         except Exception as e:
             print(f"Could not set icon: {e}")
-            # Continue without custom icon
         
     def setup_ui(self):
         """Create the main UI layout"""

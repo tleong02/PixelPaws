@@ -16,6 +16,7 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
    - [Evaluate](#evaluate-tab)
    - [Analyze](#analyze-tab)
    - [Active Learning](#active-learning-tab)
+   - [Tools](#tools-tab)
 6. [Project Folder Layout](#project-folder-layout)
 7. [Requirements](#requirements)
 8. [Attribution & License](#attribution--license)
@@ -202,6 +203,27 @@ Active Learning minimizes the number of frames you need to hand-label by having 
 5. Repeat until performance plateaus — typically 3–5 iterations reduces labeling effort by 50–80% compared to labeling a random sample.
 
 The active learning label files are saved in `behavior_labels/` and are compatible with the standard training pipeline.
+
+### Tools Tab
+
+The Tools tab provides quick access to a set of utilities that complement the main pipeline:
+
+| Tool | Description |
+|---|---|
+| **Video Preview** | Play a video alongside its prediction CSV — predictions are overlaid on each frame so you can visually verify classifier output. |
+| **Auto-Label Assistant** | Steps through frames at a configurable interval and prompts you to label each one; outputs a label CSV in the PixelPaws format. |
+| **Data Quality Checker** | Scans all label CSVs in the project for common issues: class imbalance, missing frames, duplicate rows, and sessions with very few positive examples. |
+| **Brightness Diagnostics** | Plots mean brightness for each body-part ROI over time for a selected video; useful for detecting lighting artefacts or ROI misalignment. |
+| **Feature File Inspector** | Opens a cached feature `.pkl` and shows column names, shapes, and summary statistics — helpful for debugging feature extraction. |
+| **Brightness Preview** | Shows a single video frame with the brightness ROI rectangles drawn around each selected body part so you can confirm they are positioned correctly. |
+| **Correct Crop Offset (Single / Batch)** | If videos were cropped before DLC and the crop offsets changed between sessions, these tools remap the stored offsets in prediction CSVs so that coordinates stay consistent. |
+| **Crop Video for DLC** | Spatially crops a video (or batch of videos) to a user-defined rectangle and saves the result for DLC analysis. Crop offsets are written to the project config. See [Crop for DLC Tool](#crop-for-dlc-tool) above. |
+| **Generate Ethogram** | Creates an ethogram image (color raster of behavior presence over time) from any prediction CSV; can be saved as PNG. |
+| **Training Visualization** | Re-opens the training visualization window for the most recently trained classifier (cross-validation scores, precision-recall curve, SHAP summary). |
+| **BORIS to PixelPaws** | Converts a BORIS event-log export (CSV) into the frame-indexed label CSV format that PixelPaws expects, using the video frame rate to map timestamps to frame numbers. |
+| **Optimize Parameters** | Grid-searches bout-filtering parameters (minimum bout duration, minimum inter-bout interval) to maximize agreement with hand labels on a selected session. |
+| **Feature Extraction** | Runs feature extraction manually on a selected video + H5 pair and saves the result to `features/`; useful for pre-caching before a training run. |
+| **Theme Switcher** | Toggles between light and dark UI themes. |
 
 ---
 
