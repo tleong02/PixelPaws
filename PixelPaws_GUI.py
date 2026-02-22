@@ -2538,45 +2538,45 @@ class PixelPawsGUI:
         self.root.after(100, self._show_startup_wizard)
     
     def set_app_icon(self):
-        """Set custom application icon"""
-        # Embedded paw-print emoji PNG (64x64, rendered from Segoe UI Emoji)
+        """Set paw print app icon."""
+        # 64x64 PNG rendered from Segoe UI Emoji 🐾
         _PAW_PNG_B64 = (
-            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACx"
-            "jwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAN6SURBVHhe7ZnhjRQxDIW3ABqgARqgASqgAjqg"
-            "A1qgBWqgCbqgmSPfjyc9PTmZ2eHY86I86Wl340zOdmzHmbttbGxsbGxsbGxcx7vBL4PfB38Mfh18"
-            "PwiQfR6sZP8FMO5lQoyuxuG3wafHp8HKuLPEQU8LQjsNYlcJ8d82lrKfNgY/Dj4lMvRxiMMNTRm1"
-            "QDK+PxU+DGZuV/ms9Khk7Lo/D1mzfXGcFTxCOyEjV7KK/I2WWClNzmeYK0pWshlb1gXP6V+DhDjg"
-            "k98aQ/k0sJJVa2g+f6sVyE0pB6kDjpSf4dEareqBhz87VcF38Ihn1miVBu4AWMHltMU8IxLief5X"
-            "cHkrBwBXLo82Kj3j7GAWPIfXhlyD35LBdpCRIsYyprA9Ml5wJ+QaYnV0vjkwLhUVzxovrI5B1moL"
-            "jPQ2VgrfY7xQOYE0uLLWQ+EKXzVeSCe0K3yJowvQFfjpgENawyt1VvGr4IjUmrTNreG79VqVmijS"
-            "mrA1PGePHIBhpEy2vAnkT+MAOjwpugrXNGp1xXWntrsEJTJcq6JFJfc5Is5LZFFt+y7AQei70kQC"
-            "BZHx7BGSzGUezKaqaoAokJqvq7OAo2eyf448v2dEyTS0Io7x6y/PMVbNI5Jmsoc6As+nEiK5LINJ"
-            "m7zoOHGm9xN+LF7hQ9NIlV6hCGdVH4ewe5rH93zpkTUGklaziJvJWr1MuQd+ykB3Js7x0F/JXqtJ"
-            "exjYMZQ+MkKnxkomkoaMeXq1RCoukiYJHbErWRKnztLyzTFTGlb/MVK+r2QztowED3lINOAUdpjf"
-            "GEV6oLzGxJks1/D5rZDtcobpleMw18j0agUP/9kdwJU/4pk1WtUCd0DVBgNXnspPVPAcn/x2+Zk1"
-            "WjmA/HXlMMzhPcFMcfLfW+3VGrAdCFtXkEJF8fKKfrRr6YRqDchYO2QUJM+GbDohiYw5LYGRlfL3"
-            "5uvMCURZW+MByqXS9xovVE4gylojz+qrxgs4wRuslrnv8LdI1SXnCtyps/6gDfwkyGPsKrzHgK3h"
-            "DjjzSgvjjoqaO4Ca0Bre0a0uLNQGz+1VrfAeoLo5tkKGK/mbwFifI1Ypk0W1Wq8dsiNk11AcA7Pn"
-            "T7LbpA7zs/trH/5CdX7PmPf8Ff/2SH0ocEJGgtNfbfG5chjrtG+AZlDYYwQkrGd5rLDXXJ6r6sLG"
-            "xsbGRo3b7Q+9FZJcCQswzgAAAABJRU5ErkJggg=="
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1B"
+            "AACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAPSSURBVHhe7ZiBjdVADESvABqgARqg"
+            "ASqgAjqgA1qgBWqgCbqgmSNPwtJoZG82P8mPI/2RRvoXb/bW3rHXm7cXXnjhhY34uPDbwu//"
+            "yW+eBdbst8aPhe8Fsa3ZPyy8LX4vzBzbwj8LbxkEpJw59AhRwq3AjrkTXxYGPi90O88Cmf1W"
+            "NYEipov/utChTq7ZISr4tLA1KtlXmLUr/y5UNbXBqOBVRWzWnvHnwjYYHWUQZTiQfdhJGYen"
+            "UcZs3qeD4pQtjByGv+QZOw0z5yo778dcjNF3YKWep8EXxUIdEYStzGTuwcvU81Ro7lOgMhAU"
+            "XfQsq6NPx1zeI2gA+J0hCwBjlW6Hlbx1DOq6FMhUF5QtWtOE8ZVjnk5Zf0AvoGN451JoNYf0"
+            "7ipdzuywZQ45fD6tKczL/Gpv0Rz5oiCypibE3zPOB7KgVv+jBVyWzi3OBzwITgJy+RGoIAjZ"
+            "Lj3ifKAKAjvfynnAgnyhe5wPZEFoeTP0BuXI6uxzt/w+oGd51RDtgRbUM+bfjVgcPGOHvEdo"
+            "B13cGc1J+wCoRGfu6hQynIIzRc07znbwG9/IqaxvGHV0fsK0aYAUfuGpGpVR05RdpZnD+4sj"
+            "jtdToCdBkIKIY9wJXMYZGcNY3sm+NBGMDASWd2AV+JH9ELhU14gzWfc4oqcKatD6EyQlGTuy"
+            "n9JQMemMUywgdmJGGTjhzs+8t8bT0omJs0DwLPusjTSzFMJxTgqXbZYej9IDeyhYeOTeLNZy"
+            "FZW5EwSJdwhuFsiRveWpMoLfDTIZ67GcKc6DUAW7FdhB7zdIkQyMHdkJis4DSc/LvzJXqApe"
+            "Jd8IwJo9I4E4tS5sxVq1z+RLWozs1ASdI2OLtMh2ioDgQASGHdPF+jsjOzbm4lTxfoH5L4fn"
+            "vBc8pBo25I5DOl7pdneQIPn7l6tAF0MwMqylSMXMOS+O2QnyVOhikGqGmXx2VsXRe4zqfz4N"
+            "uphKAdoVMoYcV7DTWhSDt1DAlhqwVrQ8x29RA2ZOgXg2A3eS361PAaCOZty60GynM16++4oq"
+            "CI/u0igIKKFVJwiyG+BeiWZBwPlWOx9wBex1PoCznvvtdh/oAlnwkfBCS0FsBZd/dv/fC02F"
+            "qkm6DL5D3ugcAZxuGwBtduBsd0agZvO5dQCABmCtAOK0Snotpz3F2tUA4KdAVQdcLcFR0HT3"
+            "4RkpthuZY7Sw7B7gOMsuPEocVedIJe8DWso/sPXa6+f7DGdrxmXwVKjIzs6oQtne+QDSHe2u"
+            "f8QgTTzPlQQ1UulWYMf4jo/DkMCM+nicRBExnt+3dPyFFy7D29s/u81UFjhJd+cAAAAASUVO"
+            "RK5CYII="
         )
         try:
-            # Try .ico file first (best quality on Windows)
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            for icon_path in [
-                os.path.join(script_dir, "pixelpaws_icon.ico"),
-                "pixelpaws_icon.ico",
-            ]:
-                if os.path.exists(icon_path):
-                    self.root.iconbitmap(icon_path)
-                    return
-
-            # Fallback: embedded PNG via tkinter PhotoImage (no PIL required)
-            import base64
-            png_data = base64.b64decode(_PAW_PNG_B64)
-            photo = tk.PhotoImage(data=base64.b64encode(png_data).decode())
+            # iconphoto is reliable across all platforms with Tk 8.6+ PNG support
+            photo = tk.PhotoImage(data=_PAW_PNG_B64)
             self.root.iconphoto(True, photo)
             self.root._icon_photo = photo  # prevent GC
+
+            # Also try iconbitmap for the Windows taskbar icon
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            ico_path = os.path.join(script_dir, "pixelpaws_icon.ico")
+            if os.path.exists(ico_path):
+                try:
+                    self.root.iconbitmap(ico_path)
+                except Exception:
+                    pass  # keep iconphoto icon if iconbitmap fails
 
         except Exception as e:
             print(f"Could not set icon: {e}")
