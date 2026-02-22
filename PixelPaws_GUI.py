@@ -2564,19 +2564,40 @@ class PixelPawsGUI:
             "RK5CYII="
         )
         try:
-            # iconphoto is reliable across all platforms with Tk 8.6+ PNG support
-            photo = tk.PhotoImage(data=_PAW_PNG_B64)
-            self.root.iconphoto(True, photo)
-            self.root._icon_photo = photo  # prevent GC
-
-            # Also try iconbitmap for the Windows taskbar icon
             script_dir = os.path.dirname(os.path.abspath(__file__))
             ico_path = os.path.join(script_dir, "pixelpaws_icon.ico")
+
+            # Windows: give the process its own App User Model ID so Windows
+            # shows it as a distinct taskbar entry instead of grouping it under
+            # python.exe, then load the ICO and send WM_SETICON directly.
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    'PixelPaws.BehaviorAnalysis.1'
+                )
+                if os.path.exists(ico_path):
+                    self.root.update_idletasks()  # ensure HWND exists
+                    hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                    if not hwnd:
+                        hwnd = self.root.winfo_id()
+                    hicon = ctypes.windll.user32.LoadImageW(
+                        None, ico_path, 1, 0, 0, 0x10  # IMAGE_ICON, LR_LOADFROMFILE
+                    )
+                    if hicon:
+                        ctypes.windll.user32.SendMessageW(hwnd, 0x80, 1, hicon)  # ICON_BIG
+                        ctypes.windll.user32.SendMessageW(hwnd, 0x80, 0, hicon)  # ICON_SMALL
+            except Exception:
+                pass
+
+            # Title bar icon via tkinter (works on all platforms)
             if os.path.exists(ico_path):
                 try:
                     self.root.iconbitmap(ico_path)
                 except Exception:
-                    pass  # keep iconphoto icon if iconbitmap fails
+                    pass
+            photo = tk.PhotoImage(data=_PAW_PNG_B64)
+            self.root.iconphoto(True, photo)
+            self.root._icon_photo = photo  # prevent GC
 
         except Exception as e:
             print(f"Could not set icon: {e}")
