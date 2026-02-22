@@ -17,7 +17,7 @@ This document describes all hardware components used in the PixelPaws filming en
 
 ## 🖨️ 3D Printed Enclosure
 
-The filming box consists of two 3D-printed parts. STL files are included in this repository under `/hardware/stl/`.
+The filming box consists of two 3D-printed parts. STL files are in [`hardware/stl/`](hardware/stl/).
 
 | File | Description |
 |------|-------------|
