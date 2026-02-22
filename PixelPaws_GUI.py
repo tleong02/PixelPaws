@@ -2539,12 +2539,26 @@ class PixelPawsGUI:
     
     def set_app_icon(self):
         """Set custom application icon"""
-        # Embedded paw-print PNG (48x48, sienna brown on transparent background)
+        # Embedded paw-print emoji PNG (64x64, rendered from Segoe UI Emoji)
         _PAW_PNG_B64 = (
-            "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAl0lEQVR42u2XwRGAIAwEachmrNBO"
-            "9eWH4WEkcITszeTHwC2gOUpBCCGEnHSdx/1Wzxip8bosY5Yzb6nQ5mUQAADQadYbojXfcrs8/XT+"
-            "7lxr4ekQs+5vaIChpwCA+gpZPuLUAF/WGdbIvIFl8SJMhPbu1qHNyyGI0kqI0ABLxmYAAACA32ju"
-            "ZkYWSptGt3gPKJ6gCKFN9AD9qLMK6/deWQAAAABJRU5ErkJggg=="
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACx"
+            "jwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAN6SURBVHhe7ZnhjRQxDIW3ABqgARqgASqgAjqg"
+            "A1qgBWqgCbqgmSPfjyc9PTmZ2eHY86I86Wl340zOdmzHmbttbGxsbGxsbGxcx7vBL4PfB38Mfh18"
+            "PwiQfR6sZP8FMO5lQoyuxuG3wafHp8HKuLPEQU8LQjsNYlcJ8d82lrKfNgY/Dj4lMvRxiMMNTRm1"
+            "QDK+PxU+DGZuV/ms9Khk7Lo/D1mzfXGcFTxCOyEjV7KK/I2WWClNzmeYK0pWshlb1gXP6V+DhDjg"
+            "k98aQ/k0sJJVa2g+f6sVyE0pB6kDjpSf4dEareqBhz87VcF38Ihn1miVBu4AWMHltMU8IxLief5X"
+            "cHkrBwBXLo82Kj3j7GAWPIfXhlyD35LBdpCRIsYyprA9Ml5wJ+QaYnV0vjkwLhUVzxovrI5B1moL"
+            "jPQ2VgrfY7xQOYE0uLLWQ+EKXzVeSCe0K3yJowvQFfjpgENawyt1VvGr4IjUmrTNreG79VqVmijS"
+            "mrA1PGePHIBhpEy2vAnkT+MAOjwpugrXNGp1xXWntrsEJTJcq6JFJfc5Is5LZFFt+y7AQei70kQC"
+            "BZHx7BGSzGUezKaqaoAokJqvq7OAo2eyf448v2dEyTS0Io7x6y/PMVbNI5Jmsoc6As+nEiK5LINJ"
+            "m7zoOHGm9xN+LF7hQ9NIlV6hCGdVH4ewe5rH93zpkTUGklaziJvJWr1MuQd+ykB3Js7x0F/JXqtJ"
+            "exjYMZQ+MkKnxkomkoaMeXq1RCoukiYJHbErWRKnztLyzTFTGlb/MVK+r2QztowED3lINOAUdpjf"
+            "GEV6oLzGxJks1/D5rZDtcobpleMw18j0agUP/9kdwJU/4pk1WtUCd0DVBgNXnspPVPAcn/x2+Zk1"
+            "WjmA/HXlMMzhPcFMcfLfW+3VGrAdCFtXkEJF8fKKfrRr6YRqDchYO2QUJM+GbDohiYw5LYGRlfL3"
+            "5uvMCURZW+MByqXS9xovVE4gylojz+qrxgs4wRuslrnv8LdI1SXnCtyps/6gDfwkyGPsKrzHgK3h"
+            "DjjzSgvjjoqaO4Ca0Bre0a0uLNQGz+1VrfAeoLo5tkKGK/mbwFifI1Ypk0W1Wq8dsiNk11AcA7Pn"
+            "T7LbpA7zs/trH/5CdX7PmPf8Ff/2SH0ocEJGgtNfbfG5chjrtG+AZlDYYwQkrGd5rLDXXJ6r6sLG"
+            "xsbGRo3b7Q+9FZJcCQswzgAAAABJRU5ErkJggg=="
         )
         try:
             # Try .ico file first (best quality on Windows)
