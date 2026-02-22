@@ -19,12 +19,35 @@ If the user closes the wizard without finishing::
 
 import os
 import json
+import pathlib
 import glob as _glob
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 _BP_DEFAULTS = ['hrpaw', 'hlpaw', 'snout']
+
+# ---------------------------------------------------------------------------
+# Recent projects persistence
+# ---------------------------------------------------------------------------
+_RECENT_FILE = pathlib.Path.home() / '.pixelpaws_recent.json'
+_MAX_RECENT  = 8
+
+def _load_recent() -> list:
+    """Return list of valid recent project folder paths."""
+    try:
+        paths = json.loads(_RECENT_FILE.read_text())
+        return [p for p in paths if os.path.isdir(p)]
+    except Exception:
+        return []
+
+def _save_recent(folder: str):
+    """Prepend folder to recent list and persist."""
+    recent = [folder] + [p for p in _load_recent() if p != folder]
+    try:
+        _RECENT_FILE.write_text(json.dumps(recent[:_MAX_RECENT], indent=2))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +67,10 @@ class ProjectSetupWizard(tk.Toplevel):
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Centre on screen
+        # Centre on screen — taller when recent projects exist
         self.update_idletasks()
-        w, h = 600, 530
+        w = 600
+        h = 620 if _load_recent() else 530
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
@@ -100,23 +124,77 @@ class ProjectSetupWizard(tk.Toplevel):
         self.btn_back.config(state='disabled')
         self.btn_next.config(state='disabled')
 
-        ttk.Label(self.content,
-                  text="Welcome to PixelPaws!\n\nCreate a new project or open an existing one.",
-                  font=('Arial', 10), justify='center').pack(pady=(10, 20))
+        recent = _load_recent()
 
-        btn_frame = ttk.Frame(self.content)
-        btn_frame.pack(expand=True)
+        if recent:
+            ttk.Label(self.content,
+                      text="Welcome to PixelPaws!",
+                      font=('Arial', 11, 'bold'), justify='center').pack(pady=(10, 6))
 
-        new_btn = ttk.Button(btn_frame, text="🆕  New Project",
-                             width=22, command=self._new_project)
-        new_btn.grid(row=0, column=0, padx=10, pady=8)
+            ttk.Label(self.content, text="Recent Projects:",
+                      font=('Arial', 10)).pack(anchor='w', pady=(4, 2))
 
-        open_btn = ttk.Button(btn_frame, text="📂  Open Existing",
-                              width=22, command=self._open_project)
-        open_btn.grid(row=1, column=0, padx=10, pady=8)
+            list_frame = ttk.Frame(self.content)
+            list_frame.pack(fill='both', expand=True)
+
+            self._recent_listbox = tk.Listbox(
+                list_frame, height=min(len(recent), 6),
+                selectmode='single', exportselection=False,
+                activestyle='dotbox', font=('Arial', 9))
+            sb = ttk.Scrollbar(list_frame, command=self._recent_listbox.yview)
+            self._recent_listbox.config(yscrollcommand=sb.set)
+            self._recent_listbox.pack(side='left', fill='both', expand=True)
+            sb.pack(side='right', fill='y')
+
+            self._recent_paths = recent
+            for p in recent:
+                name = os.path.basename(p)
+                self._recent_listbox.insert(tk.END, f"{name}   ({p})")
+            self._recent_listbox.selection_set(0)
+            self._recent_listbox.bind('<Double-1>', lambda _e: self._open_recent())
+
+            ttk.Button(self.content, text="Open Selected",
+                       command=self._open_recent, width=20).pack(pady=(6, 4))
+
+            ttk.Separator(self.content, orient='horizontal').pack(fill='x', pady=8)
+
+            btn_frame = ttk.Frame(self.content)
+            btn_frame.pack()
+            ttk.Button(btn_frame, text="🆕  New Project",
+                       width=22, command=self._new_project).grid(
+                           row=0, column=0, padx=8, pady=4)
+            ttk.Button(btn_frame, text="📂  Open Other…",
+                       width=22, command=self._open_project).grid(
+                           row=0, column=1, padx=8, pady=4)
+        else:
+            # No recent projects — original two-button layout
+            ttk.Label(self.content,
+                      text="Welcome to PixelPaws!\n\nCreate a new project or open an existing one.",
+                      font=('Arial', 10), justify='center').pack(pady=(10, 20))
+
+            btn_frame = ttk.Frame(self.content)
+            btn_frame.pack(expand=True)
+            ttk.Button(btn_frame, text="🆕  New Project",
+                       width=22, command=self._new_project).grid(
+                           row=0, column=0, padx=10, pady=8)
+            ttk.Button(btn_frame, text="📂  Open Existing",
+                       width=22, command=self._open_project).grid(
+                           row=1, column=0, padx=10, pady=8)
 
         self.step1_status = ttk.Label(self.content, text="", foreground='gray')
         self.step1_status.pack(pady=8)
+
+    def _open_recent(self):
+        """Open a project selected from the recent list."""
+        sel = self._recent_listbox.curselection()
+        if not sel:
+            return
+        folder = self._recent_paths[sel[0]]
+        if not os.path.isdir(folder):
+            messagebox.showwarning("Not Found",
+                                   f"Folder no longer exists:\n{folder}")
+            return
+        self._open_folder(folder)
 
     def _new_project(self):
         folder = filedialog.askdirectory(title="Select or Create Project Folder")
@@ -131,10 +209,16 @@ class ProjectSetupWizard(tk.Toplevel):
         self._show_step2()
 
     def _open_project(self):
+        """Browse for a project folder (or PixelPaws_project.json file)."""
         folder = filedialog.askdirectory(title="Select Existing Project Folder")
         if not folder:
             return
+        self._open_folder(folder)
+
+    def _open_folder(self, folder: str):
+        """Open an existing project folder; save to recent list."""
         folder = os.path.abspath(folder)
+        _save_recent(folder)
         config_path = os.path.join(folder, 'PixelPaws_project.json')
         if os.path.isfile(config_path):
             # Complete project — load and finish immediately
@@ -492,6 +576,7 @@ class ProjectSetupWizard(tk.Toplevel):
 
     def _finish(self):
         # Config was already saved when transitioning from step 2 → 3
+        _save_recent(self.project_folder)
         self.app.current_project_folder.set(self.project_folder)
         config_path = os.path.join(self.project_folder, 'PixelPaws_project.json')
         if os.path.isfile(config_path):

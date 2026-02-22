@@ -194,9 +194,8 @@ def extract_subject_id_from_filename(filename):
             if not (1900 <= int(part) <= 2100):
                 return part
     
-    # Method 3: Find any 4-digit number in the filename
-    match = re.search(r'(\d{4})', filename)
-    if match:
+    # Method 3: Find any standalone 4-digit number (not embedded in a longer digit string)
+    for match in re.finditer(r'(?<!\d)(\d{4})(?!\d)', filename):
         candidate = match.group(1)
         # Skip if it looks like a year
         if not (1900 <= int(candidate) <= 2100):
@@ -3574,6 +3573,11 @@ class PixelPawsGUI:
         if folder:
             self.train_project_folder.set(folder)
             self.current_project_folder.set(folder)
+            try:
+                from project_setup import _save_recent
+                _save_recent(folder)
+            except Exception:
+                pass
 
     def _show_startup_wizard(self):
         """Show the project setup wizard; keep main window hidden until complete."""
@@ -3610,6 +3614,13 @@ class PixelPawsGUI:
         # Refresh classifier dropdowns
         self.refresh_pred_classifiers()
         self.refresh_pred_videos()
+
+        # Sync analysis tab project folder and trigger background scan
+        if hasattr(self, 'analysis_tab') and self.analysis_tab is not None:
+            if hasattr(self.analysis_tab, 'analysis_project_var'):
+                self.analysis_tab.analysis_project_var.set(folder)
+                # Defer scan slightly so the tab finishes any pending layout
+                self.root.after(200, lambda: self.analysis_tab.scan_project_folder(folder))
 
         # Write back (merge) so any newly set fields are persisted immediately
         self.save_project_config(folder)

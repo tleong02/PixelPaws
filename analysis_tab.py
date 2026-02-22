@@ -375,7 +375,7 @@ class AnalysisTab(ttk.Frame):
         
         # Initially hidden
         self.toggle_phase_settings()
-    
+
     def toggle_phase_settings(self):
         """Show/hide phase analysis settings"""
         if self.enable_phase_analysis.get():
@@ -1831,7 +1831,7 @@ class AnalysisTab(ttk.Frame):
                 cmap = plt.get_cmap(gradient_cmap_var.get())
             except Exception:
                 return
-            non_veh = [t for t in treatments if t != veh]
+            non_veh = [t for t in treatments if t != veh and include_vars[t].get()]
             n = len(non_veh)
             if gradient_dir_var.get() == 'light_to_dark':
                 positions = np.linspace(0.35, 0.90, max(n, 1))
@@ -1840,12 +1840,28 @@ class AnalysisTab(ttk.Frame):
             grad_colors = {t: mcolors.to_hex(cmap(pos))
                            for t, pos in zip(non_veh, positions)}
             for t, gsw in grad_swatch_labels.items():
-                gsw.configure(bg='white' if t == veh else grad_colors.get(t, '#cccccc'))
+                if not include_vars[t].get():
+                    gsw.configure(bg='#d3d3d3')
+                elif t == veh:
+                    gsw.configure(bg='white')
+                else:
+                    gsw.configure(bg=grad_colors.get(t, '#cccccc'))
 
         gradient_cmap_var.trace_add('write', _refresh_grad_swatches)
         gradient_dir_var.trace_add('write', _refresh_grad_swatches)
         gradient_veh_var.trace_add('write', _refresh_grad_swatches)
         _refresh_grad_swatches()
+
+        def _on_include_change(t=None):
+            if t in swatch_labels:
+                if include_vars[t].get():
+                    _update_swatch(t)
+                else:
+                    swatch_labels[t].configure(bg='#d3d3d3')
+            _refresh_grad_swatches()
+
+        for t in treatments:
+            include_vars[t].trace_add('write', lambda *_, t=t: _on_include_change(t))
 
         ttk.Label(gradient_frame,
                   text='Treatments colored in the list order set above.',
@@ -2002,8 +2018,11 @@ class AnalysisTab(ttk.Frame):
             _b = behavior   # capture for lambdas
             graph_rebuild_fns = []
 
-            f = self.create_time_course_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_time_course_graph(None, b, _frame=_f)))
+            f = self.create_time_course_graph(graph_notebook, behavior, show_traces=False)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_time_course_graph(None, b, _frame=_f, show_traces=False)))
+
+            f = self.create_time_course_graph(graph_notebook, behavior, show_traces=True)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_time_course_graph(None, b, _frame=_f, show_traces=True)))
 
             f = self.create_total_time_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_total_time_graph(None, b, _frame=_f)))
@@ -2019,6 +2038,12 @@ class AnalysisTab(ttk.Frame):
             f = self.create_heatmap_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_heatmap_graph(None, b, _frame=_f)))
 
+            f = self.create_cumulative_graph(graph_notebook, behavior)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_graph(None, b, _frame=_f)))
+
+            f = self.create_latency_graph(graph_notebook, behavior)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_latency_graph(None, b, _frame=_f)))
+
             # Add statistics tab if enabled
             if hasattr(self, 'enable_stats_var') and self.enable_stats_var.get():
                 self.create_statistics_tab(graph_notebook, behavior, behavior_df,
@@ -2027,11 +2052,12 @@ class AnalysisTab(ttk.Frame):
             # Restore original dataframe
             self.filtered_results_df = original_df
     
-    def create_time_course_graph(self, notebook, behavior_name="", _frame=None):
+    def create_time_course_graph(self, notebook, behavior_name="", _frame=None, show_traces=False):
         """Create time course line plot with SEM error bars"""
+        tab_label = "Individual Traces" if show_traces else "Time Course"
         if _frame is None:
             frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Time Course")
+            notebook.add(frame, text=tab_label)
         else:
             frame = _frame
             for w in frame.winfo_children():
@@ -2058,18 +2084,29 @@ class AnalysisTab(ttk.Frame):
             treatments = self.treatment_order if hasattr(self, 'treatment_order') else grouped['Treatment'].unique()
             colors = self.treatment_colors if hasattr(self, 'treatment_colors') else {}
             
+            # Individual animal traces (drawn first so they sit behind mean lines)
+            if show_traces:
+                for treatment in treatments:
+                    color = colors.get(treatment, None)
+                    line_color = 'black' if color == 'white_black' else (color or '#888888')
+                    treat_df = df[df['Treatment'] == treatment]
+                    for _subj, _animal_df in treat_df.groupby('Subject'):
+                        _animal_df = _animal_df.sort_values('Bin_Start_Min')
+                        ax.plot(_animal_df['Bin_Start_Min'], _animal_df['Total_Time_s'],
+                                color=line_color, alpha=0.18, linewidth=0.8, zorder=1)
+
             for treatment in treatments:
                 data = grouped[grouped['Treatment'] == treatment]
                 color = colors.get(treatment, None)
-                
+
                 # Handle white with black outline
                 if color == 'white_black':
                     ax.errorbar(
-                        data['Bin_Start_Min'], 
+                        data['Bin_Start_Min'],
                         data['mean'],
                         yerr=data['error'],
-                        marker='o', 
-                        label=treatment, 
+                        marker='o',
+                        label=treatment,
                         linewidth=2.5,
                         capsize=5,
                         capthick=2,
@@ -2077,21 +2114,23 @@ class AnalysisTab(ttk.Frame):
                         markerfacecolor='white',
                         markeredgecolor='black',
                         markeredgewidth=2,
-                        markersize=8
+                        markersize=8,
+                        zorder=2
                     )
                 else:
                     ax.errorbar(
-                        data['Bin_Start_Min'], 
+                        data['Bin_Start_Min'],
                         data['mean'],
                         yerr=data['error'],
-                        marker='o', 
-                        label=treatment, 
+                        marker='o',
+                        label=treatment,
                         linewidth=2,
                         capsize=5,
                         capthick=2,
-                        color=color
+                        color=color,
+                        zorder=2
                     )
-            
+
             ax.set_xlabel('Time (minutes)', fontsize=12)
             ylabel = f'Time in Behavior (seconds) ± {error_type}'
             ax.set_ylabel(ylabel, fontsize=12)
@@ -2329,6 +2368,172 @@ class AnalysisTab(ttk.Frame):
                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                   command=lambda: self.export_timecourse_data(behavior_name)).pack(side='left', padx=5)
+        return frame
+
+    def create_cumulative_graph(self, notebook, behavior_name="", _frame=None):
+        """Create cumulative behavior time line plot"""
+        if _frame is None:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text="Cumulative")
+        else:
+            frame = _frame
+            for w in frame.winfo_children():
+                w.destroy()
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+
+        if 'Total_Time_s' in df.columns:
+            error_type = self.error_type if hasattr(self, 'error_type') else 'SEM'
+            treatments = self.treatment_order if hasattr(self, 'treatment_order') else df['Treatment'].unique()
+            colors = self.treatment_colors if hasattr(self, 'treatment_colors') else {}
+
+            # Cumulative sum per subject over time bins
+            cumdf = df.sort_values('Bin_Start_Min').copy()
+            cumdf['Cumulative_s'] = cumdf.groupby('Subject')['Total_Time_s'].cumsum()
+
+            if error_type == 'SD':
+                grouped = cumdf.groupby(['Treatment', 'Bin_Start_Min'])['Cumulative_s'].agg(['mean', 'std']).reset_index()
+                grouped.rename(columns={'std': 'error'}, inplace=True)
+            else:
+                grouped = cumdf.groupby(['Treatment', 'Bin_Start_Min'])['Cumulative_s'].agg(['mean', 'sem']).reset_index()
+                grouped.rename(columns={'sem': 'error'}, inplace=True)
+
+            for treatment in treatments:
+                data = grouped[grouped['Treatment'] == treatment]
+                color = colors.get(treatment, None)
+                if color == 'white_black':
+                    ax.errorbar(data['Bin_Start_Min'], data['mean'], yerr=data['error'],
+                                marker='o', label=treatment, linewidth=2.5, capsize=5, capthick=2,
+                                color='black', markerfacecolor='white', markeredgecolor='black',
+                                markeredgewidth=2, markersize=8)
+                else:
+                    ax.errorbar(data['Bin_Start_Min'], data['mean'], yerr=data['error'],
+                                marker='o', label=treatment, linewidth=2, capsize=5, capthick=2,
+                                color=color)
+
+            ax.set_xlabel('Time (minutes)', fontsize=12)
+            ax.set_ylabel(f'Cumulative Behavior Time (seconds) ± {error_type}', fontsize=12)
+            title = f'{behavior_name} - Cumulative Behavior Time' if behavior_name else 'Cumulative Behavior Time'
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            if hasattr(self, 'time_window'):
+                ax.set_xlim(-2, self.time_window + 2)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=5)
+        ttk.Button(button_frame, text="💾 Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="📊 Export Data",
+                   command=lambda: self.export_cumulative_data(behavior_name)).pack(side='left', padx=5)
+        return frame
+
+    def create_latency_graph(self, notebook, behavior_name="", _frame=None):
+        """Create latency to first bout bar + scatter plot"""
+        if _frame is None:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text="Latency")
+        else:
+            frame = _frame
+            for w in frame.winfo_children():
+                w.destroy()
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+
+        if 'Total_Time_s' in df.columns:
+            treatments = self.treatment_order if hasattr(self, 'treatment_order') else df['Treatment'].unique()
+            treatment_colors = self.treatment_colors if hasattr(self, 'treatment_colors') else {}
+            error_type = self.error_type if hasattr(self, 'error_type') else 'SEM'
+
+            # First bin with activity per subject
+            active = df[df['Total_Time_s'] > 0].copy()
+            if active.empty:
+                ax.text(0.5, 0.5, 'No bouts detected in any session',
+                        transform=ax.transAxes, ha='center', va='center', fontsize=14)
+            else:
+                first_bout = active.groupby('Subject')['Bin_Start_Min'].min().reset_index()
+                first_bout.columns = ['Subject', 'Latency_Min']
+                subject_treatment = df[['Subject', 'Treatment']].drop_duplicates()
+                first_bout = first_bout.merge(subject_treatment, on='Subject')
+
+                treatment_positions = {t: i for i, t in enumerate(treatments)}
+                x = np.arange(len(treatments))
+
+                for treatment in treatments:
+                    data = first_bout[first_bout['Treatment'] == treatment]
+                    if len(data) == 0:
+                        continue
+                    x_pos = treatment_positions[treatment]
+                    color = treatment_colors.get(treatment, 'gray')
+                    np.random.seed(42)
+                    jitter = np.random.normal(0, 0.05, len(data))
+                    if color == 'white_black':
+                        ax.scatter([x_pos] * len(data) + jitter, data['Latency_Min'],
+                                   alpha=0.8, s=80, facecolors='white', edgecolors='black',
+                                   linewidth=2, zorder=3)
+                    else:
+                        ax.scatter([x_pos] * len(data) + jitter, data['Latency_Min'],
+                                   alpha=0.6, s=80, color=color, edgecolors='black',
+                                   linewidth=1, zorder=3)
+
+                means = [first_bout[first_bout['Treatment'] == t]['Latency_Min'].mean()
+                         if len(first_bout[first_bout['Treatment'] == t]) > 0 else 0
+                         for t in treatments]
+                if error_type == 'SD':
+                    errors = [first_bout[first_bout['Treatment'] == t]['Latency_Min'].std()
+                              if len(first_bout[first_bout['Treatment'] == t]) > 1 else 0
+                              for t in treatments]
+                else:
+                    errors = [first_bout[first_bout['Treatment'] == t]['Latency_Min'].sem()
+                              if len(first_bout[first_bout['Treatment'] == t]) > 1 else 0
+                              for t in treatments]
+
+                bar_colors = []
+                bar_edgecolors = []
+                for t in treatments:
+                    c = treatment_colors.get(t, 'gray')
+                    if c == 'white_black':
+                        bar_colors.append('white')
+                        bar_edgecolors.append('black')
+                    else:
+                        bar_colors.append(c)
+                        bar_edgecolors.append('black')
+
+                ax.bar(x, means, yerr=errors, capsize=8, alpha=0.7,
+                       color=bar_colors, edgecolor=bar_edgecolors, linewidth=2, zorder=2)
+                ax.set_xticks(x)
+                ax.set_xticklabels(list(treatments), fontsize=11)
+
+                n_excluded = len(df['Subject'].unique()) - len(first_bout['Subject'].unique())
+                if n_excluded > 0:
+                    ax.text(0.02, 0.98, f'Note: {n_excluded} animal(s) with no bouts excluded',
+                            transform=ax.transAxes, va='top', fontsize=9, color='gray')
+
+            ax.set_ylabel(f'Latency to First Bout (minutes) ± {error_type}', fontsize=12)
+            title = f'{behavior_name} - Latency to First Bout' if behavior_name else 'Latency to First Bout'
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.grid(axis='y', alpha=0.3, zorder=1)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=5)
+        ttk.Button(button_frame, text="💾 Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="📊 Export Data",
+                   command=lambda: self.export_latency_data(behavior_name)).pack(side='left', padx=5)
         return frame
 
     def create_total_time_graph(self, notebook, behavior_name="", _frame=None):
@@ -3824,6 +4029,45 @@ class AnalysisTab(ttk.Frame):
             export_df.to_csv(filename, index=False)
             messagebox.showinfo("Success", f"Phase data exported to:\n{filename}")
     
+    def export_cumulative_data(self, behavior_name=""):
+        """Export cumulative behavior time data to CSV"""
+        from tkinter import filedialog
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"{behavior_name}_cumulative_data.csv" if behavior_name else "cumulative_data.csv"
+        )
+        if filename:
+            df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+            if 'Total_Time_s' in df.columns:
+                cumdf = df.sort_values('Bin_Start_Min').copy()
+                cumdf['Cumulative_s'] = cumdf.groupby('Subject')['Total_Time_s'].cumsum()
+                export_df = cumdf[['Subject', 'Treatment', 'Bin_Start_Min', 'Total_Time_s', 'Cumulative_s']].copy()
+                export_df = export_df.sort_values(['Treatment', 'Subject', 'Bin_Start_Min'])
+                export_df.to_csv(filename, index=False)
+                messagebox.showinfo("Success", f"Cumulative data exported to:\n{filename}")
+
+    def export_latency_data(self, behavior_name=""):
+        """Export latency to first bout data to CSV"""
+        from tkinter import filedialog
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"{behavior_name}_latency_data.csv" if behavior_name else "latency_data.csv"
+        )
+        if filename:
+            df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+            if 'Total_Time_s' in df.columns:
+                active = df[df['Total_Time_s'] > 0]
+                if not active.empty:
+                    first_bout = active.groupby('Subject')['Bin_Start_Min'].min().reset_index()
+                    first_bout.columns = ['Subject', 'Latency_Min']
+                    subject_treatment = df[['Subject', 'Treatment']].drop_duplicates()
+                    first_bout = first_bout.merge(subject_treatment, on='Subject')
+                    first_bout = first_bout.sort_values(['Treatment', 'Subject'])
+                    first_bout.to_csv(filename, index=False)
+                    messagebox.showinfo("Success", f"Latency data exported to:\n{filename}")
+
     def save_figure(self, fig):
         """Save matplotlib figure"""
         filepath = filedialog.asksaveasfilename(
