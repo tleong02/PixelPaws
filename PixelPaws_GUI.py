@@ -7274,8 +7274,14 @@ Median: {feature_data.median():.6f}
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill='x', padx=12, pady=8)
 
+        stop_event = threading.Event()
+
         run_btn = ttk.Button(btn_frame, text="▶  Run Extraction", style='Accent.TButton')
         run_btn.pack(side='left', padx=4)
+        stop_btn = ttk.Button(btn_frame, text="■  Stop",
+                              command=lambda: stop_event.set(),
+                              state='disabled')
+        stop_btn.pack(side='left', padx=4)
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side='right', padx=4)
 
         def log(msg):
@@ -7324,26 +7330,34 @@ Median: {feature_data.median():.6f}
                 sessions = None   # thread will scan
                 cache_root = os.path.join(project, 'features')
 
+            stop_event.clear()
             run_btn.config(state='disabled')
+            stop_btn.config(state='normal')
             log_text.delete('1.0', tk.END)
+
+            def _on_done():
+                run_btn.config(state='normal')
+                stop_btn.config(state='disabled')
+
             threading.Thread(
                 target=self._run_feature_extraction_thread,
                 args=(sessions, cache_root,
                       fe_project.get().strip() if mode == 'batch' else None,
-                      cfg, log, lambda: run_btn.config(state='normal')),
+                      cfg, log, stop_event, _on_done),
                 daemon=True
             ).start()
 
         run_btn.config(command=start)
 
     def _run_feature_extraction_thread(self, sessions, cache_root,
-                                        project_folder, cfg, log_fn, done_fn):
+                                        project_folder, cfg, log_fn, stop_event, done_fn):
         """Background worker for the Feature Extraction tool.
 
         sessions     : list of dicts with session_name/pose_path/video_path,
                        or None → scan project_folder for pairs.
         cache_root   : directory where .pkl files are written.
         project_folder: only used when sessions is None (batch scan).
+        stop_event   : threading.Event; set by the Stop button to abort.
         """
         def log(msg):
             self.root.after(0, lambda m=msg: log_fn(m))
@@ -7397,6 +7411,10 @@ Median: {feature_data.median():.6f}
             skipped = 0
             errors  = 0
             for idx, session in enumerate(sessions, 1):
+                if stop_event.is_set():
+                    log("\nStopped by user.")
+                    break
+
                 name = session['session_name']
                 log(f"[{idx}/{total}] {name}")
 
@@ -7420,6 +7438,9 @@ Median: {feature_data.median():.6f}
                         include_optical_flow=cfg['include_optical_flow'],
                         bp_optflow_list=cfg['bp_optflow_list'] or None,
                     )
+                    if stop_event.is_set():
+                        log("\nStopped by user.")
+                        break
                     X = X.reset_index(drop=True)
                     with open(cache_file, 'wb') as f:
                         pickle.dump(X, f)
@@ -7429,8 +7450,9 @@ Median: {feature_data.median():.6f}
                     log(f"  ✗ Error: {e}")
                     errors += 1
 
-            log(f"\nDone.  {total - skipped - errors} extracted, "
-                f"{skipped} skipped (cached), {errors} errors.")
+            if not stop_event.is_set():
+                log(f"\nDone.  {total - skipped - errors} extracted, "
+                    f"{skipped} skipped (cached), {errors} errors.")
 
         except Exception as e:
             import traceback
@@ -7520,19 +7542,10 @@ Median: {feature_data.median():.6f}
                         results_text.insert(tk.END, f"  ⚠ Skipping - labels file is empty\n")
                         continue
                     
-                    # Create cache key based on configuration (match preview hash)
-                    import hashlib
-
-                    cfg_key = {
-                        'bp_include_list': clf_data.get('bp_include_list'),
-                        'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
-                        'square_size': clf_data.get('square_size', [40]),
-                        'pix_threshold': clf_data.get('pix_threshold', 0.3),
-                        'pose_feature_version': POSE_FEATURE_VERSION,
-                        'include_optical_flow': clf_data.get('include_optical_flow', False),
-                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
-                    }
-                    cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
+                    # Use the same hash function as training (bp_include_list is always None
+                    # in training, so force it here to guarantee matching cache keys).
+                    cfg_hash = PixelPawsGUI._feature_hash_key(
+                        {**clf_data, 'bp_include_list': None})
 
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
@@ -7965,19 +7978,10 @@ Median: {feature_data.median():.6f}
                     
                     labels = labels_df[behavior_name].values
                     
-                    # Create cache key (match preview hash)
-                    import hashlib
-
-                    cfg_key = {
-                        'bp_include_list': clf_data.get('bp_include_list'),
-                        'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
-                        'square_size': clf_data.get('square_size', [40]),
-                        'pix_threshold': clf_data.get('pix_threshold', 0.3),
-                        'pose_feature_version': POSE_FEATURE_VERSION,
-                        'include_optical_flow': clf_data.get('include_optical_flow', False),
-                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
-                    }
-                    cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
+                    # Use the same hash function as training (bp_include_list is always None
+                    # in training, so force it here to guarantee matching cache keys).
+                    cfg_hash = PixelPawsGUI._feature_hash_key(
+                        {**clf_data, 'bp_include_list': None})
 
                     video_name = os.path.splitext(os.path.basename(file_set['video']))[0]
                     video_dir = os.path.dirname(file_set['video'])
@@ -9358,20 +9362,10 @@ Left/Right  - Previous/Next frame
                     cache_dir = os.path.join(video_dir, 'PredictionCache')
                     os.makedirs(cache_dir, exist_ok=True)
                     
-                    # Create cache key
-                    import hashlib
-                    video_name = os.path.basename(video_path)
-                    
-                    cfg_key = {
-                        'bp_include_list': clf_data.get('bp_include_list'),
-                        'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
-                        'square_size': clf_data.get('square_size', [40]),
-                        'pix_threshold': clf_data.get('pix_threshold', 0.3),
-                        'pose_feature_version': POSE_FEATURE_VERSION,
-                        'include_optical_flow': clf_data.get('include_optical_flow', False),
-                        'bp_optflow_list': clf_data.get('bp_optflow_list', []),
-                    }
-                    cfg_hash = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
+                    # Use the same hash function as training (bp_include_list is always None
+                    # in training, so force it here to guarantee matching cache keys).
+                    cfg_hash = PixelPawsGUI._feature_hash_key(
+                        {**clf_data, 'bp_include_list': None})
 
                     video_name_base = os.path.splitext(os.path.basename(video_path))[0]
                     
@@ -10907,17 +10901,9 @@ Left/Right  - Previous/Next frame
                             os.path.join(video_dir, 'PredictionCache', f"{video_base}_features_smart_{smart_hash}.pkl"),
                         ]
                         
-                        # Also check old classifier-specific cache as fallback
-                        clf_cfg_key = {
-                            'bp_include_list': clf_data.get('bp_include_list'),
-                            'bp_pixbrt_list': clf_data.get('bp_pixbrt_list', []),
-                            'square_size': clf_data.get('square_size', [40]),
-                            'pix_threshold': clf_data.get('pix_threshold', 0.3),
-                            'pose_feature_version': POSE_FEATURE_VERSION,
-                            'include_optical_flow': clf_data.get('include_optical_flow', False),
-                            'bp_optflow_list': clf_data.get('bp_optflow_list', []),
-                        }
-                        clf_hash = hashlib.md5(repr(clf_cfg_key).encode()).hexdigest()[:8]
+                        # Also check classifier-specific cache as fallback (must match training hash).
+                        clf_hash = PixelPawsGUI._feature_hash_key(
+                            {**clf_data, 'bp_include_list': None})
                         cache_locations.extend([
                             os.path.join(video_dir, 'PredictionCache', f"{video_base}_features_{clf_hash}.pkl"),
                             os.path.join(video_dir, 'FeatureCache', f"{video_base}_features_{clf_hash}.pkl"),
