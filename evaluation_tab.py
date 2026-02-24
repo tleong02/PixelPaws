@@ -141,6 +141,7 @@ def find_session_triplets(
     video_ext: str = '.mp4',
     prefer_filtered: bool = True,
     require_labels: bool = True,
+    recursive: bool = False,
 ) -> list:
     """
     Walk *folder* and return a list of matched (video, DLC, labels) session dicts.
@@ -188,7 +189,11 @@ def find_session_triplets(
 
     # ── Determine video / DLC search root ────────────────────────────────────
     videos_sub = os.path.join(folder, 'Videos')
-    if os.path.isdir(videos_sub):
+    _videos_sub_has_h5 = os.path.isdir(videos_sub) and bool(
+        glob.glob(os.path.join(videos_sub, '*.h5')) or
+        glob.glob(os.path.join(videos_sub, '**', '*.h5'), recursive=True)
+    )
+    if _videos_sub_has_h5:
         search_root = videos_sub
         project_root = folder
     else:
@@ -196,7 +201,14 @@ def find_session_triplets(
         project_root = os.path.dirname(folder)
 
     # ── Find all DLC .h5 files ────────────────────────────────────────────────
-    dlc_files = glob.glob(os.path.join(search_root, '*.h5'))
+    if recursive:
+        dlc_files = []
+        for dirpath, _, fnames in os.walk(search_root):
+            for fn in sorted(fnames):
+                if fn.lower().endswith('.h5'):
+                    dlc_files.append(os.path.join(dirpath, fn))
+    else:
+        dlc_files = glob.glob(os.path.join(search_root, '*.h5'))
     if not dlc_files:
         return []
 
@@ -214,13 +226,15 @@ def find_session_triplets(
                 base = base[: -len(_sfx)]
                 break
 
-        if base in seen_bases:
+        seen_key = (os.path.dirname(dlc_path), base) if recursive else base
+        if seen_key in seen_bases:
             continue  # deduplicate when multiple DLC files share a base
 
         # ── Resolve video ─────────────────────────────────────────────────────
+        video_search_dir = os.path.dirname(dlc_path) if recursive else search_root
         video_path = None
         for ext in [video_ext, video_ext.upper(), '.mp4', '.avi', '.MP4', '.AVI']:
-            candidate = os.path.join(search_root, base + ext)
+            candidate = os.path.join(video_search_dir, base + ext)
             if os.path.isfile(candidate):
                 video_path = candidate
                 break
@@ -231,7 +245,8 @@ def find_session_triplets(
 
         # ── Resolve DLC file (prefer filtered if requested) ───────────────────
         # There may be multiple DLC files for this base; pick the best one.
-        dlc_candidates = glob.glob(os.path.join(search_root, f'{base}DLC*.h5'))
+        dlc_dir = os.path.dirname(dlc_path) if recursive else search_root
+        dlc_candidates = glob.glob(os.path.join(dlc_dir, f'{base}DLC*.h5'))
         if not dlc_candidates:
             dlc_candidates = [dlc_path]
         filtered_dlc = [f for f in dlc_candidates if 'filtered' in f.lower()]
@@ -265,9 +280,14 @@ def find_session_triplets(
         if require_labels and labels_path is None:
             continue  # no labels and they're required → skip
 
-        seen_bases.add(base)
+        seen_bases.add(seen_key)
+        if recursive:
+            rel = os.path.relpath(os.path.dirname(dlc_path), search_root)
+            session_display = base if rel == '.' else f"{rel}/{base}".replace('\\', '/')
+        else:
+            session_display = base
         sessions.append({
-            'session_name': base,
+            'session_name': session_display,
             'video':        video_path,
             'dlc':          best_dlc,
             'labels':       labels_path,
@@ -708,14 +728,10 @@ class EvaluationTab(ttk.Frame):
                     cache_dir = os.path.join(video_dir, 'features')
                 os.makedirs(cache_dir, exist_ok=True)
 
-                cfg_key = {
-                    'bp_include_list': clf_data.get('bp_include_list'),
-                    'bp_pixbrt_list':  clf_data.get('bp_pixbrt_list', []),
-                    'square_size':     clf_data.get('square_size', [40]),
-                    'pix_threshold':   clf_data.get('pix_threshold', 0.3),
-                    'crop_offset':     (crop_x, crop_y),
-                }
-                cfg_hash   = hashlib.md5(repr(cfg_key).encode()).hexdigest()[:8]
+                # Use the same hash function as training (bp_include_list always None in training).
+                # crop_offset is NOT in the hash so zero-offset eval caches are shared with training.
+                cfg_hash = self.main_gui._feature_hash_key(
+                    {**clf_data, 'bp_include_list': None})
                 _cache_fname = f'{base_name}_features_{cfg_hash}.pkl'
                 cache_file = os.path.join(cache_dir, _cache_fname)
 

@@ -3385,6 +3385,7 @@ class PixelPawsGUI:
             ("🎯 Optimize\nParameters", self.optimize_parameters),
             ("⚙️ Feature\nExtraction", self.open_feature_extraction),
             ("🎨 Theme\nSwitcher", self.toggle_theme),
+            ("🦴 Skeleton\nVideo Renderer", self.open_skeleton_renderer),
         ]
         
         for i, (text, command) in enumerate(tools):
@@ -3394,6 +3395,723 @@ class PixelPawsGUI:
             btn.grid(row=row, column=col, padx=10, pady=10, sticky='nsew')
     
     
+    def open_skeleton_renderer(self):
+        """Open the Skeleton Video Renderer tool as a Toplevel form."""
+        import os, sys, threading, subprocess
+
+        _render_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'render_skeleton_video.py'
+        )
+
+        win = tk.Toplevel(self.root)
+        win.title("🦴 Skeleton Video Renderer")
+        win.geometry("860x840")
+        win.resizable(True, True)
+
+        # ── Tooltip helper ────────────────────────────────────────────────────
+        class ToolTip:
+            def __init__(self, widget, text):
+                self._tip = None
+                widget.bind('<Enter>', lambda e: self._show(widget, text))
+                widget.bind('<Leave>', lambda e: self._hide())
+            def _show(self, widget, text):
+                x = widget.winfo_rootx() + 20
+                y = widget.winfo_rooty() + widget.winfo_height() + 4
+                self._tip = tk.Toplevel(widget)
+                self._tip.wm_overrideredirect(True)
+                self._tip.wm_geometry(f'+{x}+{y}')
+                tk.Label(self._tip, text=text, background='#ffffcc',
+                         relief='solid', borderwidth=1,
+                         font=('Arial', 9), wraplength=320,
+                         justify='left').pack(ipadx=4, ipady=2)
+            def _hide(self):
+                if self._tip:
+                    self._tip.destroy()
+                    self._tip = None
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        proj = self.current_project_folder.get()
+        default_dir = os.path.join(proj, 'videos') if (
+            proj and os.path.isdir(os.path.join(proj, 'videos'))
+        ) else (proj or os.getcwd())
+
+        sessions = find_session_triplets(proj, require_labels=False, recursive=True) if proj else []
+
+        def _outputs_dir():
+            p = self.current_project_folder.get()
+            if p:
+                d = os.path.join(p, 'outputs')
+                os.makedirs(d, exist_ok=True)
+                return d
+            return None
+
+        def _default_out(h5_path):
+            stem = os.path.splitext(os.path.basename(h5_path))[0]
+            d = _outputs_dir()
+            return os.path.join(d, stem + '_skeleton.mp4') if d \
+                   else os.path.splitext(h5_path)[0] + '_skeleton.mp4'
+
+        def _browse(var, filetypes, title, save=False):
+            if save:
+                path = tk.filedialog.asksaveasfilename(
+                    title=title, initialdir=default_dir,
+                    defaultextension='.mp4', filetypes=filetypes, parent=win)
+            else:
+                path = tk.filedialog.askopenfilename(
+                    title=title, initialdir=default_dir,
+                    filetypes=filetypes, parent=win)
+            if path:
+                var.set(path)
+                if var is h5_var and not out_var.get():
+                    out_var.set(_default_out(path))
+
+        # ── Files frame ──────────────────────────────────────────────────────
+        files_frame = ttk.LabelFrame(win, text=" Files ", padding=8)
+        files_frame.pack(fill='x', padx=10, pady=(10, 4))
+
+        h5_var            = tk.StringVar()
+        vid_var           = tk.StringVar()
+        out_var           = tk.StringVar()
+        pred_file_var     = tk.StringVar()
+        bout_col_var      = tk.StringVar(value="auto")
+        extra_vid_dir_var = tk.StringVar()
+
+        # ── Video folder row (row 0) — optional extra scan root ──────────────
+        ttk.Label(files_frame, text="Video folder:", width=13, anchor='e').grid(
+            row=0, column=0, sticky='e', padx=(0, 4), pady=3)
+        ttk.Entry(files_frame, textvariable=extra_vid_dir_var, width=65).grid(
+            row=0, column=1, sticky='ew', pady=3)
+
+        def _browse_extra_dir():
+            d = tk.filedialog.askdirectory(title="Select extra video folder", parent=win)
+            if d:
+                extra_vid_dir_var.set(d)
+                _refresh_sessions()
+
+        ttk.Button(files_frame, text="Browse", command=_browse_extra_dir).grid(
+            row=0, column=2, padx=(4, 0), pady=3)
+
+        # ── Session row (row 1) ───────────────────────────────────────────────
+        ttk.Label(files_frame, text="Session:", width=13, anchor='e').grid(
+            row=1, column=0, sticky='e', padx=(0, 4), pady=3)
+
+        session_names = [s['session_name'] for s in sessions]
+        session_combo = ttk.Combobox(files_frame, width=45, state='readonly')
+        if session_names:
+            session_combo.config(values=session_names)
+            session_combo.current(0)
+        else:
+            session_combo.config(values=['— no sessions found —'])
+            session_combo.current(0)
+            session_combo.config(state='disabled')
+        session_combo.grid(row=1, column=1, sticky='ew', pady=3)
+
+        def _find_predictions_csv(session_base):
+            p = self.current_project_folder.get()
+            if not p:
+                return ''
+            import glob as _g
+
+            # 1. results/ subfolders — canonical location
+            hits = _g.glob(os.path.join(p, 'results', '**',
+                           f'{session_base}*_predictions.csv'), recursive=True)
+            if not hits:
+                hits = _g.glob(os.path.join(p, 'results', '**',
+                               f'*{session_base}*_predictions.csv'), recursive=True)
+
+            # 2. Same directory as the currently selected video file
+            if not hits:
+                vid = vid_var.get().strip()
+                if vid:
+                    vdir = os.path.dirname(vid)
+                    hits = _g.glob(os.path.join(vdir, f'{session_base}*_predictions.csv'))
+                    if not hits:
+                        hits = _g.glob(os.path.join(vdir, f'*{session_base}*_predictions.csv'))
+
+            # 3. Anywhere in project tree (broad fallback)
+            if not hits:
+                hits = _g.glob(os.path.join(p, '**',
+                               f'{session_base}*_predictions.csv'), recursive=True)
+            if not hits:
+                hits = _g.glob(os.path.join(p, '**',
+                               f'*{session_base}*_predictions.csv'), recursive=True)
+
+            return sorted(hits)[0] if hits else ''
+
+        def _on_session_select(event=None):
+            name = session_combo.get()
+            match = next((s for s in sessions if s['session_name'] == name), None)
+            if not match:
+                return
+            h5_var.set(match['dlc'])
+            vid_var.set(match['video'])
+            out_var.set(_default_out(match['dlc']))
+            pred_file_var.set(_find_predictions_csv(match['session_name']))
+
+        session_combo.bind('<<ComboboxSelected>>', _on_session_select)
+        if sessions:
+            _on_session_select()
+
+        def _refresh_sessions():
+            nonlocal sessions
+            proj2 = self.current_project_folder.get()
+            sessions = find_session_triplets(proj2, require_labels=False, recursive=True) if proj2 else []
+            extra = extra_vid_dir_var.get().strip()
+            if extra and os.path.isdir(extra):
+                extra_sessions = find_session_triplets(extra, require_labels=False, recursive=True)
+                seen = {s['session_name'] for s in sessions}
+                sessions += [s for s in extra_sessions if s['session_name'] not in seen]
+            names = [s['session_name'] for s in sessions]
+            if names:
+                session_combo.config(state='readonly', values=names)
+                session_combo.current(0)
+                _on_session_select()
+            else:
+                session_combo.config(state='disabled', values=['— no sessions found —'])
+                session_combo.current(0)
+
+        ttk.Button(files_frame, text="↺ Refresh", command=_refresh_sessions).grid(
+            row=1, column=2, padx=(4, 0), pady=3)
+
+        # ── File-picker rows (rows 2–4) ───────────────────────────────────────
+        for row_idx, (label, var, ftypes, save_flag) in enumerate([
+            ("Pose (.h5):",  h5_var,  [("HDF5 files", "*.h5"), ("All files", "*.*")], False),
+            ("Video file:",  vid_var, [("Video files", "*.mp4 *.avi *.mov"), ("All files", "*.*")], False),
+            ("Output .mp4:", out_var, [("MP4 files", "*.mp4"), ("All files", "*.*")], True),
+        ], start=2):
+            ttk.Label(files_frame, text=label, width=13, anchor='e').grid(
+                row=row_idx, column=0, sticky='e', padx=(0, 4), pady=3)
+            ttk.Entry(files_frame, textvariable=var, width=65).grid(
+                row=row_idx, column=1, sticky='ew', pady=3)
+            ttk.Button(
+                files_frame, text="Browse",
+                command=lambda v=var, f=ftypes, t=label, s=save_flag: _browse(v, f, t, s)
+            ).grid(row=row_idx, column=2, padx=(4, 0), pady=3)
+
+        # ── Row 5: Predictions file + column picker ───────────────────────────
+        ttk.Label(files_frame, text="Predictions:", width=13, anchor='e').grid(
+            row=5, column=0, sticky='e', padx=(0, 4), pady=3)
+        _pred_entry = ttk.Entry(files_frame, textvariable=pred_file_var, width=46)
+        _pred_entry.grid(row=5, column=1, sticky='ew', pady=3)
+        ToolTip(_pred_entry,
+                "PixelPaws predictions CSV. When set, one clip is rendered per "
+                "detected behavior bout — no need to enter Start/End manually.")
+        ttk.Button(files_frame, text="Browse",
+                   command=lambda: _browse(pred_file_var,
+                       [("CSV files", "*.csv"), ("All files", "*.*")],
+                       "Select predictions CSV")).grid(row=5, column=2, padx=(4, 0), pady=3)
+        bout_col_combo = ttk.Combobox(files_frame, textvariable=bout_col_var,
+                                      values=['auto'], state='readonly', width=16)
+        bout_col_combo.current(0)
+        bout_col_combo.grid(row=5, column=3, padx=(6, 0), pady=3, sticky='w')
+        ToolTip(bout_col_combo,
+                "Which column to use as the behavior label. 'auto' picks "
+                "'prediction' or the first non-frame/probability column.")
+
+        def _on_pred_file_change(*_):
+            path = pred_file_var.get().strip()
+            if path and os.path.isfile(path):
+                try:
+                    import pandas as _pd
+                    cols = ['auto'] + [c for c in _pd.read_csv(path, nrows=0).columns
+                                       if c not in ('frame', 'probability')]
+                    bout_col_combo.config(values=cols)
+                    if bout_col_var.get() not in cols:
+                        bout_col_var.set('auto')
+                except Exception:
+                    pass
+            else:
+                bout_col_combo.config(values=['auto'])
+                bout_col_var.set('auto')
+
+        pred_file_var.trace_add('write', _on_pred_file_change)
+
+        files_frame.columnconfigure(1, weight=1)
+
+        # ── Bout clip suggestions ─────────────────────────────────────────────
+        n_bouts_var = tk.IntVar(value=4)
+        sug_pad_var = tk.StringVar(value="120")
+
+        def _suggest_clips():
+            """Populate the suggestion listbox with N-bout sliding-window clips."""
+            pred_path = pred_file_var.get().strip()
+            _sug_lb.delete(0, tk.END)
+            if not pred_path or not os.path.isfile(pred_path):
+                _sug_lb.insert(tk.END, "— load a predictions CSV first —")
+                return
+            try:
+                import pandas as _pd
+                import numpy as _np
+                df = _pd.read_csv(pred_path)
+                # Resolve column — identical logic to load_bouts
+                col = bout_col_var.get().strip()
+                if col == 'auto' or col not in df.columns:
+                    cands = [c for c in df.columns if c not in ('frame', 'probability')]
+                    col = ('prediction' if 'prediction' in df.columns
+                           else (cands[0] if cands else None))
+                if col is None or col not in df.columns:
+                    _sug_lb.insert(tk.END, "— could not find prediction column —")
+                    return
+                # Build dense array (matches load_bouts exactly)
+                if 'frame' in df.columns:
+                    pred = dict(zip(df['frame'].astype(int), df[col].astype(int)))
+                else:
+                    pred = {i: int(v) for i, v in enumerate(df[col])}
+                if not pred:
+                    _sug_lb.insert(tk.END, "— empty predictions —")
+                    return
+                max_f = max(pred)
+                arr = _np.array([pred.get(i, 0) for i in range(max_f + 1)], dtype=_np.int8)
+                # Detect bouts (contiguous runs of non-zero)
+                bouts, in_bout, bout_start = [], False, 0
+                for i, v in enumerate(arr):
+                    if v and not in_bout:
+                        bout_start = i; in_bout = True
+                    elif not v and in_bout:
+                        bouts.append((bout_start, i)); in_bout = False
+                if in_bout:
+                    bouts.append((bout_start, max_f + 1))
+                if not bouts:
+                    _sug_lb.insert(tk.END, "— no positive bouts found —")
+                    return
+                try:
+                    pad = int(sug_pad_var.get().strip() or '0')
+                except ValueError:
+                    pad = 120
+                n = n_bouts_var.get()
+                if n >= len(bouts):
+                    ws = max(0, bouts[0][0] - pad)
+                    we = bouts[-1][1] + pad
+                    _sug_lb.insert(tk.END,
+                        f"All {len(bouts)} bout(s):  frames {ws} – {we}  ({we - ws} fr)")
+                else:
+                    for i in range(len(bouts) - n + 1):
+                        ws = max(0, bouts[i][0] - pad)
+                        we = bouts[i + n - 1][1] + pad
+                        _sug_lb.insert(tk.END,
+                            f"Bouts {i+1}–{i+n}:  frames {ws} – {we}  ({we - ws} fr)")
+                _sug_lb.selection_set(0)
+                _use_suggestion()
+            except Exception as exc:
+                _sug_lb.insert(tk.END, f"Error: {exc}")
+
+        def _use_suggestion(event=None):
+            sel = _sug_lb.curselection()
+            if not sel:
+                return
+            item = _sug_lb.get(sel[0])
+            import re as _re
+            m = _re.search(r'frames\s+(\d+)\s+[–\-]\s+(\d+)', item)
+            if m:
+                start_var.set(m.group(1))
+                end_var.set(m.group(2))
+
+        suggest_frame = ttk.LabelFrame(win, text=" Bout clip suggestions ", padding=8)
+        suggest_frame.pack(fill='x', padx=10, pady=4)
+
+        _sug_ctrl = ttk.Frame(suggest_frame)
+        _sug_ctrl.pack(fill='x')
+        ttk.Label(_sug_ctrl, text="Bouts per clip:").pack(side='left')
+        ttk.Spinbox(_sug_ctrl, from_=1, to=50, textvariable=n_bouts_var,
+                    width=4).pack(side='left', padx=(4, 12))
+        ttk.Label(_sug_ctrl, text="Padding (fr):").pack(side='left')
+        ttk.Entry(_sug_ctrl, textvariable=sug_pad_var,
+                  width=6).pack(side='left', padx=(4, 12))
+        ttk.Button(_sug_ctrl, text="Suggest",
+                   command=_suggest_clips).pack(side='left')
+
+        _sug_list_frame = ttk.Frame(suggest_frame)
+        _sug_list_frame.pack(fill='x', pady=(4, 0))
+        _sug_lb = tk.Listbox(_sug_list_frame, height=4, selectmode='single',
+                             activestyle='dotbox', font=('Courier', 9))
+        _sug_sb = ttk.Scrollbar(_sug_list_frame, command=_sug_lb.yview)
+        _sug_lb.configure(yscrollcommand=_sug_sb.set)
+        _sug_sb.pack(side='right', fill='y')
+        _sug_lb.pack(side='left', fill='x', expand=True)
+        _sug_lb.insert(tk.END, "— click Suggest after loading a predictions CSV —")
+        _sug_lb.bind('<<ListboxSelect>>', _use_suggestion)
+
+        # ── Parameters frame ─────────────────────────────────────────────────
+        params_frame = ttk.LabelFrame(win, text=" Parameters ", padding=8)
+        params_frame.pack(fill='x', padx=10, pady=4)
+
+        decay_var           = tk.StringVar(value="0.82")
+        glow_var            = tk.StringVar(value="0.2")
+        glow_sigma_var      = tk.StringVar(value="2.0")
+        lk_var              = tk.StringVar(value="0.3")
+        sz_var              = tk.StringVar(value="30")
+        hindpaw_sz_var      = tk.StringVar(value="50")
+        thr_var             = tk.StringVar(value="0.58")
+        trail_interval_var  = tk.StringVar(value="10")
+        trail_fade_var      = tk.StringVar(value="0.993")
+        grey_paws_var       = tk.BooleanVar(value=False)
+        export_orig_var     = tk.BooleanVar(value=False)
+        glow_enabled_var    = tk.BooleanVar(value=True)
+        trail_enabled_var   = tk.BooleanVar(value=True)
+        skel_enabled_var    = tk.BooleanVar(value=True)
+        label_bouts_var     = tk.BooleanVar(value=True)
+        colorway_var        = tk.StringVar(value="default")
+        crop_var            = tk.StringVar(value="")
+
+        # Per-paw custom colours — stored as 'B,G,R' strings (populated from colorway on change)
+        _PAW_ORDER = ('hrpaw', 'hlpaw', 'frpaw', 'flpaw')
+        _PAW_LABEL = {'hrpaw': 'HR', 'hlpaw': 'HL', 'frpaw': 'FR', 'flpaw': 'FL'}
+        _PAW_TIPS  = {'hrpaw': 'Right hind paw', 'hlpaw': 'Left hind paw',
+                      'frpaw': 'Right front paw', 'flpaw': 'Left front paw'}
+        # BGR colours mirrored from render_skeleton_video.py COLORWAYS
+        _GUI_PAW_COLORS = {
+            'default': {'hrpaw':(220,210,0),'hlpaw':(200,0,200),'frpaw':(0,155,255),'flpaw':(160,210,0)},
+            'redblue': {'hrpaw':(0,80,240),'hlpaw':(200,60,0),'frpaw':(20,140,255),'flpaw':(220,100,20)},
+            'neon':    {'hrpaw':(0,255,255),'hlpaw':(255,0,255),'frpaw':(255,255,0),'flpaw':(0,255,128)},
+            'pastel':  {'hrpaw':(140,180,210),'hlpaw':(180,130,200),'frpaw':(210,190,130),'flpaw':(130,195,155)},
+            'mono':    {'hrpaw':(220,220,220),'hlpaw':(165,165,165),'frpaw':(200,200,200),'flpaw':(145,145,145)},
+        }
+        paw_custom_bgr = {bp: list(_GUI_PAW_COLORS['default'][bp]) for bp in _PAW_ORDER}
+
+        def _bgr_to_hex(b, g, r):
+            return f'#{r:02x}{g:02x}{b:02x}'
+
+        _TIPS = {
+            "Trail Decay:":         "How quickly the live skeleton trail fades each frame (0 = instant, 1 = never fade).",
+            "Glow Strength:":       "Intensity of the bloom/glow blended around each paw stamp.",
+            "Glow Sigma:":          "Spread of the glow — smaller = crisper tight halo, larger = wide soft bloom.",
+            "Bright Threshold:":    "Minimum pixel brightness to include in a paw stamp. Higher = only the brightest pad pixels survive → crisper, less noise.",
+            "Forepaw size:":        "Half-width (pixels) of the ROI box stamped for front paws (flpaw, frpaw).",
+            "Hindpaw size:":        "Half-width (pixels) of the ROI box stamped for hind paws (hlpaw, hrpaw). Hindpaws are larger so a bigger box is appropriate.",
+            "Trail Interval (fr):": "Frames between each hindpaw footprint stamp. 10 fr ≈ every 0.4 s at 25 fps.",
+            "Trail Fade:":          "Per-frame decay of hindpaw trail stamps. 0.993 ≈ fades out over ~25–30 s.",
+            "Min Likelihood:":      "DLC pose confidence threshold. Body-part positions below this value are hidden.",
+        }
+
+        param_rows = [
+            [("Trail Decay:",         decay_var,          8), ("Glow Strength:",      glow_var,       8)],
+            [("Glow Sigma:",          glow_sigma_var,     8), ("Bright Threshold:",   thr_var,        8)],
+            [("Forepaw size:",        sz_var,             8), ("Hindpaw size:",        hindpaw_sz_var, 8)],
+            [("Trail Interval (fr):", trail_interval_var, 8), ("Trail Fade:",          trail_fade_var, 8)],
+            [("Min Likelihood:",      lk_var,             8)],
+        ]
+        for r, cols in enumerate(param_rows):
+            for c, (lbl, var, w) in enumerate(cols):
+                lbl_widget = ttk.Label(params_frame, text=lbl, anchor='e')
+                lbl_widget.grid(row=r, column=c*2, sticky='e', padx=(8, 4), pady=3)
+                ent = ttk.Entry(params_frame, textvariable=var, width=w)
+                ent.grid(row=r, column=c*2+1, sticky='w', pady=3)
+                if lbl in _TIPS:
+                    ToolTip(lbl_widget, _TIPS[lbl])
+                    ToolTip(ent, _TIPS[lbl])
+
+        # ── Row 5: Feature toggles ────────────────────────────────────────────
+        _tog_frame = ttk.Frame(params_frame)
+        _tog_frame.grid(row=5, column=0, columnspan=5, sticky='w', padx=(8,0), pady=(6,2))
+        _glow_cb = ttk.Checkbutton(_tog_frame, text="Glow", variable=glow_enabled_var)
+        _glow_cb.pack(side='left', padx=(0, 12))
+        ToolTip(_glow_cb, "Enable/disable the bloom glow effect. "
+                          "Disable for the crispest paw stamps.")
+        _trail_cb = ttk.Checkbutton(_tog_frame, text="Hindpaw trail", variable=trail_enabled_var)
+        _trail_cb.pack(side='left', padx=(0, 12))
+        ToolTip(_trail_cb, "Enable/disable the hindpaw footprint trail. "
+                           "Disable to show only the live skeleton without persistent stamps.")
+        _skel_cb = ttk.Checkbutton(_tog_frame, text="Skeleton lines", variable=skel_enabled_var)
+        _skel_cb.pack(side='left', padx=(0, 12))
+        ToolTip(_skel_cb, "Enable/disable the skeleton stick-figure lines drawn on each frame.")
+        _gp_cb = ttk.Checkbutton(_tog_frame, text="Grey/natural paws", variable=grey_paws_var)
+        _gp_cb.pack(side='left', padx=(12, 0))
+        ToolTip(_gp_cb, "When checked, paw stamps show the raw video pixel colours "
+                        "without any colour tint. Overrides the Colorway for paw stamps.")
+        _lb_cb = ttk.Checkbutton(_tog_frame, text="Label bouts", variable=label_bouts_var)
+        _lb_cb.pack(side='left', padx=(12, 0))
+        ToolTip(_lb_cb, 'Overlay "<behavior> detected" text on frames during '
+                        'each active bout. Only applied in bout mode.')
+
+        # ── Row 6: Colorway + per-paw swatches ───────────────────────────────
+        _cw_lbl = ttk.Label(params_frame, text="Colorway:", anchor='e')
+        _cw_lbl.grid(row=6, column=0, sticky='e', padx=(8, 4), pady=3)
+        ToolTip(_cw_lbl, "Colour palette for paw stamps and skeleton:\n"
+                         "  default — gold / magenta / cyan / green\n"
+                         "  redblue — warm right, cool left (L/R distinction)\n"
+                         "  neon    — fully saturated bright colours\n"
+                         "  pastel  — soft low-saturation tints\n"
+                         "  mono    — greyscale shades per paw\n"
+                         "  custom  — click each paw icon to pick any colour")
+        _cw_combo = ttk.Combobox(params_frame, textvariable=colorway_var,
+                                 values=['default','redblue','neon','pastel','mono','custom'],
+                                 state='readonly', width=9)
+        _cw_combo.grid(row=6, column=1, sticky='w', pady=3)
+
+        # Paw swatch canvases
+        _swatch_frame = ttk.Frame(params_frame)
+        _swatch_frame.grid(row=6, column=2, columnspan=3, sticky='w', padx=(8,0), pady=2)
+
+        _paw_canvases = {}
+        for _bp in _PAW_ORDER:
+            _col_frame = ttk.Frame(_swatch_frame)
+            _col_frame.pack(side='left', padx=4)
+            ttk.Label(_col_frame, text=_PAW_LABEL[_bp], font=('Arial', 7)).pack()
+            _c = tk.Canvas(_col_frame, width=34, height=36,
+                           bg='black', highlightthickness=1, highlightbackground='#888',
+                           cursor='hand2')
+            _c.pack()
+            _paw_canvases[_bp] = _c
+            ToolTip(_c, f"{_PAW_TIPS[_bp]} — click to pick a custom colour")
+
+        def _draw_paw(canvas, hex_color):
+            canvas.delete('all')
+            canvas.create_oval( 4, 18, 30, 34, fill=hex_color, outline='')  # palm
+            canvas.create_oval( 2,  5, 11, 14, fill=hex_color, outline='')  # left toe
+            canvas.create_oval(12,  1, 22, 11, fill=hex_color, outline='')  # middle toe
+            canvas.create_oval(23,  5, 32, 14, fill=hex_color, outline='')  # right toe
+
+        def _update_swatches(*_):
+            cw = colorway_var.get()
+            if cw != 'custom':
+                pal = _GUI_PAW_COLORS.get(cw, _GUI_PAW_COLORS['default'])
+                for bp in _PAW_ORDER:
+                    paw_custom_bgr[bp] = list(pal[bp])
+            for bp in _PAW_ORDER:
+                b, g, r = paw_custom_bgr[bp]
+                _draw_paw(_paw_canvases[bp], _bgr_to_hex(b, g, r))
+
+        colorway_var.trace_add('write', _update_swatches)
+        _update_swatches()
+
+        def _pick_paw_color(bp):
+            from tkinter import colorchooser
+            b, g, r = paw_custom_bgr[bp]
+            init = _bgr_to_hex(b, g, r)
+            result = colorchooser.askcolor(color=init,
+                                           title=f'Colour for {_PAW_TIPS[bp]}', parent=win)
+            if result and result[1]:
+                ri, gi, bi = (int(c) for c in result[0])
+                paw_custom_bgr[bp] = [bi, gi, ri]  # store as BGR
+                colorway_var.set('custom')           # switch to custom mode
+                _update_swatches()
+
+        for _bp in _PAW_ORDER:
+            _paw_canvases[_bp].bind('<Button-1>',
+                                    lambda e, b=_bp: _pick_paw_color(b))
+
+        # ── Row 7: Export original ────────────────────────────────────────────
+        _eo_cb = ttk.Checkbutton(params_frame,
+                                 text="Also export cropped original video (for side-by-side comparison)",
+                                 variable=export_orig_var)
+        _eo_cb.grid(row=7, column=0, columnspan=5, sticky='w', padx=(8, 0), pady=3)
+        ToolTip(_eo_cb, "Saves a second video of the original footage cropped and trimmed "
+                        "to the exact same region and time window — ready for side-by-side.")
+
+        # ── Row 8: Crop ───────────────────────────────────────────────────────
+        _crop_lbl = ttk.Label(params_frame, text="Crop X1,Y1,X2,Y2:", anchor='e')
+        _crop_lbl.grid(row=8, column=0, sticky='e', padx=(8, 4), pady=3)
+        ToolTip(_crop_lbl, "Pixel coordinates of the crop rectangle in the source video. "
+                           "Leave blank to use the full frame.")
+        ttk.Entry(params_frame, textvariable=crop_var, width=30).grid(
+            row=8, column=1, columnspan=3, sticky='w', pady=3)
+        ttk.Label(params_frame, text="← blank = full frame", foreground='gray').grid(
+            row=8, column=4, sticky='w', padx=4)
+
+        start_var = tk.StringVar(value="")
+        end_var   = tk.StringVar(value="")
+
+        # ── Row 9: Start / End ────────────────────────────────────────────────
+        _st_lbl = ttk.Label(params_frame, text="Start:", anchor='e')
+        _st_lbl.grid(row=9, column=0, sticky='e', padx=(8, 4), pady=3)
+        ToolTip(_st_lbl, "First frame/time to render. Enter a frame number (e.g. 2000) "
+                         "or M:SS / H:MM:SS (e.g. 1:30). Leave blank for beginning.")
+        ttk.Entry(params_frame, textvariable=start_var, width=14).grid(
+            row=9, column=1, sticky='w', pady=3)
+        _en_lbl = ttk.Label(params_frame, text="End:", anchor='e')
+        _en_lbl.grid(row=9, column=2, sticky='e', padx=(8, 4), pady=3)
+        ToolTip(_en_lbl, "Last frame/time to render (exclusive). Same format as Start. "
+                         "Leave blank to render to end of video.")
+        ttk.Entry(params_frame, textvariable=end_var, width=14).grid(
+            row=9, column=3, sticky='w', pady=3)
+        ttk.Label(params_frame,
+                  text="← frame number or M:SS  (blank = full video)",
+                  foreground='gray').grid(row=9, column=4, sticky='w', padx=4)
+
+        # ── Buttons + progress ────────────────────────────────────────────────
+        ctrl_frame = ttk.Frame(win)
+        ctrl_frame.pack(fill='x', padx=10, pady=4)
+
+        progress_var = tk.DoubleVar(value=0)
+        render_btn = ttk.Button(ctrl_frame, text="▶ Render", width=14)
+        cancel_btn = ttk.Button(ctrl_frame, text="✖ Cancel", width=14, state='disabled')
+        render_btn.pack(side='left', padx=(0, 8))
+        cancel_btn.pack(side='left')
+
+        progress_bar = ttk.Progressbar(
+            win, variable=progress_var, maximum=100, length=400)
+        progress_bar.pack(fill='x', padx=10, pady=(0, 4))
+
+        pct_label = ttk.Label(win, text="0%", anchor='center')
+        pct_label.pack()
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_frame = ttk.LabelFrame(win, text=" Log ", padding=4)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=(4, 10))
+
+        log_text = tk.Text(log_frame, height=10, state='normal', wrap='word',
+                           font=('Courier', 9))
+        log_scroll = ttk.Scrollbar(log_frame, command=log_text.yview)
+        log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side='right', fill='y')
+        log_text.pack(fill='both', expand=True)
+
+        # ── State ─────────────────────────────────────────────────────────────
+        _state = {'proc': None}
+
+        def _log(msg):
+            log_text.insert(tk.END, msg + '\n')
+            log_text.see(tk.END)
+
+        def _on_done(returncode):
+            render_btn.config(state='normal')
+            cancel_btn.config(state='disabled')
+            if returncode == 0:
+                progress_var.set(100)
+                pct_label.config(text="100%")
+                _log("✓ Done — output saved.")
+            else:
+                progress_var.set(0)
+                pct_label.config(text="Error")
+                _log(f"✗ Error (return code {returncode}) — see log above.")
+
+        def _run_thread(cmd):
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                    env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+                _state['proc'] = proc
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    win.after(0, lambda l=line: _log(l))
+                    m = re.search(r'frame\s+(\d+)/(\d+)', line)
+                    if m:
+                        done, total = int(m.group(1)), int(m.group(2))
+                        pct = 100.0 * done / total if total else 0
+                        win.after(0, lambda p=pct: (
+                            progress_var.set(p),
+                            pct_label.config(text=f"{p:.0f}%")
+                        ))
+                proc.wait()
+                win.after(0, lambda: _on_done(proc.returncode))
+            except Exception as exc:
+                win.after(0, lambda: _log(f"✗ Exception: {exc}"))
+                win.after(0, lambda: _on_done(-1))
+
+        def _do_render():
+            h5  = h5_var.get().strip()
+            vid = vid_var.get().strip()
+            out = out_var.get().strip()
+            if not h5 or not os.path.isfile(h5):
+                tk.messagebox.showerror("Missing file", "Please select a valid pose .h5 file.", parent=win)
+                return
+            if not vid or not os.path.isfile(vid):
+                tk.messagebox.showerror("Missing file", "Please select a valid video file.", parent=win)
+                return
+            if not out:
+                out = _default_out(h5)
+                out_var.set(out)
+
+            cmd = [sys.executable, '-u', _render_script, h5, vid,
+                   '--output', out,
+                   '--decay',      decay_var.get().strip(),
+                   '--likelihood', lk_var.get().strip(),
+                   '--threshold',  thr_var.get().strip(),
+                   '--size',            sz_var.get().strip(),
+                   '--hindpaw-size',    hindpaw_sz_var.get().strip(),
+                   '--glow',            glow_var.get().strip(),
+                   '--glow-sigma',      glow_sigma_var.get().strip(),
+                   '--trail-interval',  trail_interval_var.get().strip(),
+                   '--trail-decay',     trail_fade_var.get().strip(),
+                   '--colorway',        colorway_var.get() if colorway_var.get() != 'custom' else 'default']
+            # Per-paw colour overrides (always sent in custom mode; no-op otherwise unless changed)
+            if colorway_var.get() == 'custom':
+                for _bp in _PAW_ORDER:
+                    b, g, r = paw_custom_bgr[_bp]
+                    cmd += [f'--color-{_bp}', f'{b},{g},{r}']
+            if grey_paws_var.get():
+                cmd += ['--grey-paws']
+            if not glow_enabled_var.get():
+                cmd += ['--no-glow']
+            if not trail_enabled_var.get():
+                cmd += ['--no-trail']
+            if not skel_enabled_var.get():
+                cmd += ['--no-skeleton']
+            if export_orig_var.get():
+                cmd += ['--export-original']
+            crop_str = crop_var.get().strip()
+            if crop_str:
+                cmd += ['--crop', crop_str]
+
+            def _parse_range_arg(s):
+                """Return ('frame', int) or ('time', float) or None."""
+                s = s.strip()
+                if not s:
+                    return None
+                if ':' in s:          # M:SS or H:MM:SS
+                    parts = s.split(':')
+                    try:
+                        secs = sum(float(p) * 60 ** i for i, p in enumerate(reversed(parts)))
+                        return ('time', secs)
+                    except ValueError:
+                        return None
+                try:
+                    return ('frame', int(s))
+                except ValueError:
+                    return None
+
+            for arg_name, raw in [('start', start_var.get()), ('end', end_var.get())]:
+                parsed = _parse_range_arg(raw)
+                if parsed:
+                    kind, val = parsed
+                    if kind == 'frame':
+                        cmd += [f'--{arg_name}-frame', str(val)]
+                    else:
+                        cmd += [f'--{arg_name}-time', f'{val:.3f}']
+
+            pred_path = pred_file_var.get().strip()
+            # Only use bout mode when no explicit start/end clip range is set.
+            # If the user picked a suggestion window, Start+End are already filled
+            # and the render should be a plain single clip — not all bouts.
+            _has_range = bool(start_var.get().strip() or end_var.get().strip())
+            if pred_path and os.path.isfile(pred_path):
+                col = bout_col_var.get().strip()
+                if not _has_range:
+                    # True bout mode: concatenate all bouts
+                    cmd += ['--bout-file', pred_path]
+                    if col and col != 'auto':
+                        cmd += ['--bout-column', col]
+                    if label_bouts_var.get():
+                        cmd += ['--label-bouts']
+                elif label_bouts_var.get():
+                    # Single clip from suggestion: pass bout-file for label text only
+                    cmd += ['--bout-file', pred_path, '--label-bouts']
+                    if col and col != 'auto':
+                        cmd += ['--bout-column', col]
+
+            render_btn.config(state='disabled')
+            cancel_btn.config(state='normal')
+            progress_var.set(0)
+            pct_label.config(text="0%")
+            log_text.delete('1.0', tk.END)
+            mode = ('bout mode' if pred_path and os.path.isfile(pred_path) and not _has_range
+                    else 'single clip')
+            _log(f"[start] {mode} — {' '.join(cmd)}")
+
+            threading.Thread(target=_run_thread, args=(cmd,), daemon=True).start()
+
+        def _do_cancel():
+            proc = _state.get('proc')
+            if proc:
+                proc.terminate()
+                _log("[cancel] Render cancelled by user.")
+            render_btn.config(state='normal')
+            cancel_btn.config(state='disabled')
+
+        render_btn.config(command=_do_render)
+        cancel_btn.config(command=_do_cancel)
+
     def create_active_learning_tab(self):
         """Create Active Learning tab"""
         al_frame = ttk.Frame(self.notebook)
