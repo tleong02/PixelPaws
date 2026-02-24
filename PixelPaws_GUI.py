@@ -401,7 +401,7 @@ def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
     if crop_offset_x != 0 or crop_offset_y != 0:
         print(f"  Applying crop offset to brightness extraction: x+{crop_offset_x}, y+{crop_offset_y}")
     
-    # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+    # Clean body parts lists (remove DLC network names)
     # For bp_include_list: None means "use all body parts" (valid)
     # For bp_pixbrt_list: Keep as-is even if empty (brightness needs specific body parts)
     bp_include_list_cleaned = clean_bodyparts_list(bp_include_list)
@@ -452,7 +452,7 @@ def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
     pose_extractor = PoseFeatureExtractor(
         bodyparts=bp_include_list_cleaned,
         likelihood_threshold=min_prob,
-        velocity_delta=dt_vel  # Use dt_vel parameter (default 2, matching BAREfoot)
+        velocity_delta=dt_vel
     )
     
     # DEBUG: Print what body parts we're actually using
@@ -1159,7 +1159,7 @@ class AutoLabelWindow:
 class SideBySidePreview:
     """Simple fast side-by-side preview"""
     
-    def __init__(self, parent, video_path, predictions, probabilities, behavior_name, threshold, human_labels=None):
+    def __init__(self, parent, video_path, predictions, probabilities, behavior_name, threshold, human_labels=None, overlay_colors=None):
         self.window = tk.Toplevel(parent)
         self.window.title(f"Prediction Preview - {behavior_name}")
         self.window.geometry("1400x750")
@@ -1175,7 +1175,10 @@ class SideBySidePreview:
         self.behavior_name = behavior_name
         self.threshold = threshold
         self.human_labels = human_labels
-        
+        _oc = overlay_colors or {}
+        self.color_behavior   = _oc.get('behavior',    (0, 0, 255))
+        self.color_nobehavior = _oc.get('no_behavior', (0, 255, 0))
+
         self.cap = cv2.VideoCapture(video_path)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1359,11 +1362,10 @@ class SideBySidePreview:
                 
                 h, w = frame_display.shape[:2]
                 if pred == 1:
-                    # Behavior detected - use red text (no tint)
-                    color = (0, 0, 255)  # Red in BGR
+                    color = self.color_behavior
                     text = "BEHAVIOR DETECTED"
                 else:
-                    color = (0, 255, 0)  # Green in BGR
+                    color = self.color_nobehavior
                     text = "No Behavior"
                 
                 # Draw text overlay
@@ -2424,6 +2426,17 @@ class EthogramGenerator:
                 f.write("\n")
 
 
+OVERLAY_COLOR_SCHEMES = {
+    'Red / Gray':          ('#E00000', '#707070'),
+    'Orange / Sky Blue':   ('#FF8C00', '#00BFFF'),
+    'Classic Red / Green': ('#DC0000', '#00C800'),
+    'Magenta / Cyan':      ('#FF00BB', '#00DDCC'),
+    'Yellow / Blue':       ('#FFD700', '#0077FF'),
+    'White / Gray':        ('#FFFFFF', '#888888'),
+    'Purple / Lime':       ('#AA00CC', '#99CC00'),
+}
+
+
 class PixelPawsGUI:
     """Complete integrated application class with all enhanced features"""
     
@@ -2476,6 +2489,7 @@ class PixelPawsGUI:
         self.train_early_stopping_rounds = None
         self.train_use_gpu = None
         self.train_generate_plots = None
+        self.train_trim_to_last_positive = None
         self.train_log = None
         
         # Initialize batch variables (will be created in create_batch_tab)
@@ -2526,10 +2540,19 @@ class PixelPawsGUI:
         self._last_pred_output_folder = None
         self._last_pred_base_name     = None
         self._last_pred_dlc_path      = None          # stored so export can reload DLC coords
+        self._last_pred_crop_offset   = (0, 0)        # (x1, y1) from DLC config crop
         self.lv_skeleton_dots         = tk.BooleanVar(value=True)
         self.lv_frame_tint            = tk.BooleanVar(value=False)
         self.lv_timeline_strip        = tk.BooleanVar(value=True)
-        
+        self.lv_halo_border           = tk.BooleanVar(value=True)
+        self.lv_bout_counter          = tk.BooleanVar(value=False)
+        self.lv_behavior_color        = tk.StringVar(value='#E00000')   # red   → (0,0,224) BGR
+        self.lv_nobehavior_color      = tk.StringVar(value='#707070')   # gray  → (112,112,112) BGR
+        self.lv_color_scheme          = tk.StringVar(value='Red / Gray')
+        self.lv_tint_opacity          = tk.DoubleVar(value=0.22)
+        self.lv_hud_position          = tk.StringVar(value='top')
+        self.lv_preview_photo         = None   # GC anchor for preview PhotoImage
+
         # Setup UI
         self.setup_ui()
         self.apply_theme()
@@ -2781,7 +2804,7 @@ class PixelPawsGUI:
                  fg='gray', bg=self.theme.colors['frame_bg']).grid(row=4, column=1, columnspan=2, sticky='w')
 
         # Optical Flow Features
-        self.train_include_optical_flow = tk.BooleanVar(value=False)
+        self.train_include_optical_flow = tk.BooleanVar(value=True)
         ttk.Checkbutton(feature_frame,
                         text="Include Optical Flow Features  (slower — reads video frames)",
                         variable=self.train_include_optical_flow).grid(
@@ -2893,6 +2916,15 @@ class PixelPawsGUI:
                    textvariable=self.train_shap_top_n, width=10).grid(
             row=9, column=1, sticky='w', padx=5, pady=2)
         tk.Label(params_frame, text="Number of features to keep after SHAP pruning (10–200)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=9, column=2, sticky='w')
+
+        # Trim to last positive
+        self.train_trim_to_last_positive = tk.BooleanVar(value=True)
+        ttk.Checkbutton(params_frame, text="Trim sessions to last labeled event",
+                        variable=self.train_trim_to_last_positive).grid(row=10, column=1, sticky='w', pady=2)
+        tk.Label(params_frame,
+                 text="Remove frames after the last '1' in each label file "
+                      "(prevents BORIS trailing zeros from flooding training)",
+                 fg='gray', bg=self.theme.colors['frame_bg']).grid(row=10, column=2, sticky='w')
 
         # === QUICK ACTIONS ===
         action_frame = ttk.LabelFrame(scrollable_frame, text="Actions", padding=10)
@@ -3077,7 +3109,7 @@ class PixelPawsGUI:
             row=5, column=1, padx=5, pady=2)
         ttk.Button(output_frame, text="📁 Browse",
                   command=self.browse_pred_output).grid(row=5, column=2, pady=2)
-        tk.Label(output_frame, text="(Leave empty to use video folder)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=6, column=1, sticky='w')
+        tk.Label(output_frame, text="(Leave empty to use project results/ folder, or video folder if no project is set)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=6, column=1, sticky='w')
         
         # === ACTIONS ===
         action_frame = ttk.Frame(scrollable_frame)
@@ -3100,12 +3132,84 @@ class PixelPawsGUI:
         # === EXPORT VIDEO OVERLAYS ===
         overlay_opts = ttk.LabelFrame(scrollable_frame, text="Export Video Overlays", padding=4)
         overlay_opts.pack(fill='x', padx=5, pady=(0, 4))
-        ttk.Checkbutton(overlay_opts, text="Skeleton dots (DLC body parts)",
-                        variable=self.lv_skeleton_dots).pack(side='left', padx=8)
-        ttk.Checkbutton(overlay_opts, text="Behavior frame tint",
-                        variable=self.lv_frame_tint).pack(side='left', padx=8)
-        ttk.Checkbutton(overlay_opts, text="Timeline strip",
-                        variable=self.lv_timeline_strip).pack(side='left', padx=8)
+
+        # Row 0 — checkboxes
+        cb_row = ttk.Frame(overlay_opts)
+        cb_row.grid(row=0, column=0, columnspan=4, sticky='w', pady=(2, 4))
+        ttk.Checkbutton(cb_row, text="Skeleton dots",
+                        variable=self.lv_skeleton_dots).pack(side='left', padx=6)
+        ttk.Checkbutton(cb_row, text="Frame tint",
+                        variable=self.lv_frame_tint,
+                        command=self._on_tint_toggle).pack(side='left', padx=6)
+        ttk.Checkbutton(cb_row, text="Timeline strip",
+                        variable=self.lv_timeline_strip,
+                        command=self._refresh_overlay_preview).pack(side='left', padx=6)
+        ttk.Checkbutton(cb_row, text="Halo border",
+                        variable=self.lv_halo_border,
+                        command=self._refresh_overlay_preview).pack(side='left', padx=6)
+        ttk.Checkbutton(cb_row, text="Bout counter in HUD",
+                        variable=self.lv_bout_counter,
+                        command=self._refresh_overlay_preview).pack(side='left', padx=6)
+
+        # Row 1 — scheme preset + color pickers + tint opacity
+        color_row = ttk.Frame(overlay_opts)
+        color_row.grid(row=1, column=0, columnspan=4, sticky='w', pady=2)
+        ttk.Label(color_row, text="Scheme:").pack(side='left', padx=(6, 2))
+        self._lv_scheme_combo = ttk.Combobox(
+            color_row,
+            textvariable=self.lv_color_scheme,
+            values=list(OVERLAY_COLOR_SCHEMES.keys()) + ['Custom'],
+            state='readonly', width=18)
+        self._lv_scheme_combo.pack(side='left', padx=(0, 12))
+        self._lv_scheme_combo.bind('<<ComboboxSelected>>', lambda _: self._on_color_scheme_changed())
+        ttk.Label(color_row, text="Behavior color:").pack(side='left', padx=(6, 2))
+        self._lv_beh_color_btn = tk.Button(
+            color_row, text="  ", width=3,
+            bg=self.lv_behavior_color.get(), relief='raised',
+            command=lambda: self._pick_overlay_color(self.lv_behavior_color,
+                                                     self._lv_beh_color_btn))
+        self._lv_beh_color_btn.pack(side='left', padx=(0, 8))
+
+        ttk.Label(color_row, text="No-behavior color:").pack(side='left', padx=(0, 2))
+        self._lv_nobeh_color_btn = tk.Button(
+            color_row, text="  ", width=3,
+            bg=self.lv_nobehavior_color.get(), relief='raised',
+            command=lambda: self._pick_overlay_color(self.lv_nobehavior_color,
+                                                     self._lv_nobeh_color_btn))
+        self._lv_nobeh_color_btn.pack(side='left', padx=(0, 12))
+
+        ttk.Label(color_row, text="Tint opacity:").pack(side='left', padx=(0, 2))
+        self._lv_tint_scale = ttk.Scale(
+            color_row, from_=0.05, to=0.50, length=90,
+            variable=self.lv_tint_opacity,
+            command=lambda _v: self._refresh_overlay_preview())
+        self._lv_tint_scale.pack(side='left')
+        self._on_tint_toggle()   # set initial enabled/disabled state
+
+        # Row 2 — HUD position
+        hud_row = ttk.Frame(overlay_opts)
+        hud_row.grid(row=2, column=0, columnspan=4, sticky='w', pady=2)
+        ttk.Label(hud_row, text="HUD position:").pack(side='left', padx=(6, 4))
+        for _val, _lbl in (('top', 'Top'), ('bottom', 'Bottom')):
+            ttk.Radiobutton(hud_row, text=_lbl, variable=self.lv_hud_position,
+                            value=_val,
+                            command=self._refresh_overlay_preview).pack(side='left', padx=3)
+
+        # Row 3 — in-tab preview
+        prev_row = ttk.Frame(overlay_opts)
+        prev_row.grid(row=3, column=0, columnspan=4, sticky='w', pady=(4, 2))
+        self.lv_preview_canvas = tk.Canvas(prev_row, width=320, height=200, bg='black',
+                                           highlightthickness=1, highlightbackground='#555')
+        self.lv_preview_canvas.pack(side='left', padx=(6, 4))
+        _prev_ctrl = ttk.Frame(prev_row)
+        _prev_ctrl.pack(side='left', anchor='n', padx=4)
+        ttk.Button(_prev_ctrl, text="↺ Refresh Preview",
+                   command=self._refresh_overlay_preview).pack(anchor='w')
+        ttk.Label(_prev_ctrl, text="(behavior-active overlay preview)",
+                  foreground='gray').pack(anchor='w', pady=(4, 0))
+
+        # Auto-refresh preview when video path changes
+        self.pred_video_path.trace_add('write', lambda *_: self._refresh_overlay_preview())
 
         # === RESULTS DISPLAY ===
         results_frame = ttk.LabelFrame(scrollable_frame, text="Results", padding=5)
@@ -4267,6 +4371,7 @@ class PixelPawsGUI:
                 'include_optical_flow': self.train_include_optical_flow.get(),
                 'bp_optflow_list': [x.strip() for x in self.train_bp_optflow.get().split(',') if x.strip()]
                     if self.train_include_optical_flow.get() else [],
+                'trim_to_last_positive': self.train_trim_to_last_positive.get(),
             }
             
             # Setup feature caching
@@ -4281,13 +4386,15 @@ class PixelPawsGUI:
             all_X = []
             all_y = []
             session_ids = []
-            
+            session_cache_paths = {}
+
             for i, session in enumerate(sessions):
-                X_s, y_s = self.extract_features_for_session(
+                X_s, y_s, cache_path_s = self.extract_features_for_session(
                     session, cfg, feature_cache_root, behavior_name)
                 all_X.append(X_s)
                 all_y.append(y_s)
                 session_ids.extend([i] * len(y_s))
+                session_cache_paths[session['session_name']] = cache_path_s
                 
                 pos_count = np.sum(y_s)
                 pos_pct = (pos_count / len(y_s)) * 100 if len(y_s) > 0 else 0
@@ -4623,6 +4730,10 @@ class PixelPawsGUI:
                     final_model, X, y, classifier_folder, behavior_name,
                     oof_proba=oof_proba, oof_best_params=best_params,
                     pre_prune_model=pre_prune_model_ref)
+                self._generate_raster_plots(
+                    y, oof_proba, sessions,
+                    [len(y_s) for y_s in all_y],
+                    best_params, behavior_name, classifier_folder)
                 self.log_train("  ✓ Plots saved")
             
             self.log_train("\n" + "=" * 60)
@@ -4692,15 +4803,16 @@ class PixelPawsGUI:
             
             # Store results for active learning
             self.last_training_results = {
-                'classifier_path': classifier_path,
-                'sessions':        sessions,
-                'mean_f1':         mean_f1,
-                'std_f1':          std_f1,
-                'behavior_name':   behavior_name,
-                'X':               X,
-                'y':               y,
-                'final_model':     final_model,
-                'best_thresh':     best_params['thresh'],
+                'classifier_path':    classifier_path,
+                'sessions':           sessions,
+                'mean_f1':            mean_f1,
+                'std_f1':             std_f1,
+                'behavior_name':      behavior_name,
+                'X':                  X,
+                'y':                  y,
+                'final_model':        final_model,
+                'best_thresh':        best_params['thresh'],
+                'session_cache_paths': session_cache_paths,
             }
 
             # Auto-save project config so other tabs can pick up the new classifier
@@ -4773,25 +4885,32 @@ class PixelPawsGUI:
             resolved = []
             skipped  = []
 
+            stored_caches = results.get('session_cache_paths', {})
+
             for session in sessions:
                 base_name  = session['session_name']
                 video_dir  = os.path.dirname(session['video_path'])
-                search_locs = [
-                    video_dir,
-                    os.path.dirname(video_dir),
-                    os.path.join(os.path.dirname(video_dir), 'FeatureCache'),  # legacy
-                    os.path.join(project_folder, 'FeatureCache'),              # legacy
-                    os.path.join(project_folder, 'features'),                  # canonical
-                ]
-                cache_path = None
-                for loc in search_locs:
-                    if not os.path.exists(loc):
-                        continue
-                    matches = glob.glob(
-                        os.path.join(loc, f"{base_name}_features*.pkl"))
-                    if matches:
-                        cache_path = matches[0]
-                        break
+
+                # Prefer the path recorded at training time (exact hash match)
+                cache_path = stored_caches.get(base_name)
+                if not (cache_path and os.path.exists(cache_path)):
+                    # Fallback: glob search (backwards compat / manual reload)
+                    cache_path = None
+                    search_locs = [
+                        video_dir,
+                        os.path.dirname(video_dir),
+                        os.path.join(os.path.dirname(video_dir), 'FeatureCache'),  # legacy
+                        os.path.join(project_folder, 'FeatureCache'),              # legacy
+                        os.path.join(project_folder, 'features'),                  # canonical
+                    ]
+                    for loc in search_locs:
+                        if not os.path.exists(loc):
+                            continue
+                        matches = glob.glob(
+                            os.path.join(loc, f"{base_name}_features*.pkl"))
+                        if matches:
+                            cache_path = matches[0]
+                            break
 
                 if not cache_path:
                     self.log_train(f"  ✗ Features cache not found for {base_name} — skipping")
@@ -4915,8 +5034,9 @@ class PixelPawsGUI:
                 'generate_plots': self.train_generate_plots.get(),
                 'shap_prune': self.train_shap_prune.get(),
                 'shap_top_n': self.train_shap_top_n.get(),
+                'trim_to_last_positive': self.train_trim_to_last_positive.get(),
             }
-            
+
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
 
@@ -4995,7 +5115,9 @@ class PixelPawsGUI:
                 self.train_shap_prune.set(config['shap_prune'])
             if 'shap_top_n' in config:
                 self.train_shap_top_n.set(config['shap_top_n'])
-            
+            if 'trim_to_last_positive' in config:
+                self.train_trim_to_last_positive.set(config['trim_to_last_positive'])
+
             messagebox.showinfo("Loaded", f"Configuration loaded from:\n{config_path}")
             
         except Exception as e:
@@ -5075,14 +5197,56 @@ class PixelPawsGUI:
                     for f in glob.glob(os.path.join(d, f"{session['session_name']}_features_*.pkl")):
                         mismatches.append(f)
                 if mismatches:
-                    self.log_train(
-                        f"  [Cache] \u26a0 Feature file(s) found with DIFFERENT hash "
-                        f"(config mismatch or stale cache):")
-                    for m in mismatches:
-                        self.log_train(f"    \u2192 {m}")
-                    self.log_train(
-                        f"  [Cache] Expected hash {cfg_hash}. "
-                        f"Check that Feature Extraction settings match training settings.")
+                    # Attempt incremental upgrade for version-bump mismatches
+                    upgraded = False
+                    for old_path in mismatches:
+                        try:
+                            with open(old_path, 'rb') as fh:
+                                old_X = pickle.load(fh)
+                            has_base = any('_Vel1' in c for c in old_X.columns)
+                            needs_v3 = not any('_Jerk1' in c for c in old_X.columns)
+                            if has_base and needs_v3:
+                                self.log_train(
+                                    f"  [Cache] Found v2 cache \u2192 upgrading to v3 (no video re-read)")
+                                upg_extractor = PoseFeatureExtractor(
+                                    bodyparts=cfg.get('bp_include_list') or [],
+                                    likelihood_threshold=cfg.get('pix_threshold', 0.8),
+                                    velocity_delta=cfg.get('dt_vel', 2),
+                                )
+                                new_feats = upg_extractor.extract_new_kinematics_only(
+                                    session['pose_path'])
+                                if len(new_feats) > len(old_X):
+                                    # Trailing rows were NaN-dropped during original extraction
+                                    # (OpenCV read fewer frames than DLC has rows). Trim to match.
+                                    new_feats = new_feats.iloc[:len(old_X)].reset_index(drop=True)
+
+                                if len(new_feats) == len(old_X):
+                                    X_full = pd.concat(
+                                        [old_X, new_feats.reset_index(drop=True)], axis=1)
+                                    os.makedirs(os.path.dirname(feature_cache_file), exist_ok=True)
+                                    with open(feature_cache_file, 'wb') as fh:
+                                        pickle.dump(X_full, fh)
+                                    self.log_train(
+                                        f"  \u2713 Cache upgraded: +{len(new_feats.columns)} new columns "
+                                        f"\u2192 {feature_cache_file}")
+                                    upgraded = True
+                                    break
+                                else:
+                                    self.log_train(
+                                        f"  [Cache] Row count mismatch "
+                                        f"({len(old_X)} vs {len(new_feats)}) \u2014 full extraction needed")
+                        except Exception as upgrade_err:
+                            self.log_train(f"  [Cache] Upgrade attempt failed: {upgrade_err}")
+
+                    if not upgraded:
+                        self.log_train(
+                            f"  [Cache] \u26a0 Feature file(s) found with DIFFERENT hash "
+                            f"(config mismatch or stale cache):")
+                        for m in mismatches:
+                            self.log_train(f"    \u2192 {m}")
+                        self.log_train(
+                            f"  [Cache] Expected hash {cfg_hash}. "
+                            f"Check that Feature Extraction settings match training settings.")
                 else:
                     self.log_train(f"  [Cache] No cached features found \u2014 will extract.")
 
@@ -5189,11 +5353,32 @@ class PixelPawsGUI:
         
         X = X_full.iloc[:n].copy()
         y = y_full[:n]
-        
-        # If features had NaN rows removed, labels might be misaligned
-        # This is handled by the min() above - we just use what we have
-        
-        return X, y
+
+        # Trim trailing frames after the last positive event
+        if cfg.get('trim_to_last_positive', False):
+            positive_indices = np.where(y == 1)[0]
+            if len(positive_indices) > 0:
+                trim_at = int(positive_indices[-1]) + 1
+                n_trimmed = len(y) - trim_at
+                if n_trimmed > 0:
+                    self.log_train(
+                        f"    Trimmed {n_trimmed} trailing frame(s) after last positive "
+                        f"\u2192 {trim_at} frames used")
+                    X = X.iloc[:trim_at].reset_index(drop=True)
+                    y = y[:trim_at]
+            # (if no positives found, no trim — training fails later with a clear error)
+
+        # Filter unlabeled frames (value = -1 means the user never reviewed this frame)
+        labeled_mask = (y != -1)
+        n_unlabeled = int((~labeled_mask).sum())
+        if n_unlabeled > 0:
+            self.log_train(
+                f"    Filtered {n_unlabeled} unlabeled frame(s) (label=-1) "
+                f"— only {labeled_mask.sum()} reviewed frames used")
+            X = X.iloc[labeled_mask].reset_index(drop=True)
+            y = y[labeled_mask]
+
+        return X, y, feature_cache_file
     
     def _sweep_postprocessing(self, oof_proba, y):
         """
@@ -5282,6 +5467,140 @@ class PixelPawsGUI:
         
         return best_thresh, best_f1
     
+    def _generate_raster_plots(self, y_all, oof_proba_all, sessions, all_y_lengths,
+                               best_params, behavior_name, output_folder):
+        """Generate per-session 3-panel diagnostic figure: raster | confusion matrix | time bins."""
+        if plt is None:
+            return
+
+        try:
+            from scipy.stats import pearsonr
+        except ImportError:
+            pearsonr = None
+
+        # Cumulative frame boundaries for slicing
+        boundaries = np.cumsum([0] + list(all_y_lengths))
+
+        thresh    = best_params['thresh']
+        min_bout  = best_params['min_bout']
+        max_gap   = best_params['max_gap']
+
+        def _bouts_from_array(arr):
+            padded = np.concatenate([[0], arr.astype(int), [0]])
+            diff   = np.diff(padded)
+            starts = np.where(diff ==  1)[0]
+            ends   = np.where(diff == -1)[0]
+            return list(zip(starts.tolist(), (ends - starts).tolist()))
+
+        for i, session in enumerate(sessions):
+            y_true  = y_all[boundaries[i]:boundaries[i + 1]]
+            proba_s = oof_proba_all[boundaries[i]:boundaries[i + 1]]
+
+            # Apply threshold + bout filtering
+            y_raw  = (proba_s >= thresh).astype(int)
+            y_pred = _apply_bout_filtering(y_raw, min_bout, 0, max_gap)
+
+            # FPS from video
+            fps = 30.0
+            video_path = session.get('video_path', '')
+            if video_path and os.path.isfile(video_path):
+                try:
+                    cap = cv2.VideoCapture(video_path)
+                    _fps = cap.get(cv2.CAP_PROP_FPS)
+                    if _fps and _fps > 0:
+                        fps = float(_fps)
+                    cap.release()
+                except Exception:
+                    pass
+
+            # Per-session F1
+            from sklearn.metrics import f1_score as _f1, confusion_matrix as _cm
+            f1 = _f1(y_true, y_pred, zero_division=0)
+
+            # Confusion matrix (row-normalised)
+            cm_raw  = _cm(y_true, y_pred, labels=[0, 1])
+            row_sums = cm_raw.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1          # avoid division by zero
+            cm_norm = cm_raw / row_sums
+
+            # Time-bin arrays (10 s bins)
+            bin_frames = max(1, int(10 * fps))
+            n_frames   = len(y_true)
+            n_bins     = max(1, int(np.ceil(n_frames / bin_frames)))
+            human_s = np.zeros(n_bins)
+            model_s = np.zeros(n_bins)
+            for k in range(n_bins):
+                sl = slice(k * bin_frames, (k + 1) * bin_frames)
+                human_s[k] = y_true[sl].sum() / fps
+                model_s[k] = y_pred[sl].sum() / fps
+
+            if pearsonr is not None and n_bins > 1:
+                r_val, _ = pearsonr(human_s, model_s)
+            else:
+                r_val = float('nan')
+
+            # ── Figure ──────────────────────────────────────────────────
+            fig = plt.figure(figsize=(16, 4))
+            gs  = fig.add_gridspec(1, 3, width_ratios=[5, 2, 4], wspace=0.35)
+            ax_raster, ax_cm, ax_bins = gs.subplots()
+
+            # Panel 1 — Raster
+            bouts_true = _bouts_from_array(y_true)
+            bouts_pred = _bouts_from_array(y_pred)
+            if bouts_true:
+                ax_raster.broken_barh(bouts_true, (2.6, 0.8), facecolors='black')
+            if bouts_pred:
+                ax_raster.broken_barh(bouts_pred, (1.2, 0.8), facecolors='#E87722')
+            ax_raster.set_yticks([1.6, 3.0])
+            ax_raster.set_yticklabels(['Model', 'Human'])
+            ax_raster.set_ylim(0.8, 3.8)
+            ax_raster.set_xlabel('Frame')
+            ax_raster.set_ylabel('Labels')
+            session_name = session.get('session_name', f'session_{i}')
+            ax_raster.set_title(f"{behavior_name} raster: {session_name}\n(thr={thresh:.2f})")
+            from matplotlib.lines import Line2D
+            legend_handles = [
+                Line2D([0], [0], color='black',    linewidth=8, label='Human'),
+                Line2D([0], [0], color='#E87722',  linewidth=8, label='Model'),
+            ]
+            ax_raster.legend(handles=legend_handles, loc='upper left', fontsize=8)
+
+            # Panel 2 — Confusion Matrix
+            im = ax_cm.imshow(cm_norm, cmap='RdPu', vmin=0, vmax=1)
+            for row in range(2):
+                for col in range(2):
+                    v = cm_norm[row, col]
+                    text_color = 'white' if v > 0.5 else 'black'
+                    ax_cm.text(col, row, f"{v:.2f}", ha='center', va='center',
+                               color=text_color, fontsize=10)
+            ax_cm.set_xticks([0, 1])
+            ax_cm.set_yticks([0, 1])
+            ax_cm.set_xticklabels(['0', '1'])
+            ax_cm.set_yticklabels(['0', '1'])
+            ax_cm.set_xlabel('Pred')
+            ax_cm.set_ylabel('True')
+            ax_cm.set_title(f"F1={f1:.2f}")
+
+            # Panel 3 — Time Bins
+            x_centers = np.arange(n_bins) * 10 + 5
+            width = 0.4
+            ax_bins.bar(x_centers - width / 2, human_s, width=width,
+                        color='steelblue', label='Human')
+            ax_bins.bar(x_centers + width / 2, model_s, width=width,
+                        color='#E87722', label='Model')
+            ax_bins.set_xlabel('Time (s)')
+            ax_bins.set_ylabel('Seconds/bin')
+            r_str = f"{r_val:.2f}" if not np.isnan(r_val) else "n/a"
+            ax_bins.set_title(f"Time bins (10s);  R = {r_str}")
+            ax_bins.legend(fontsize=8)
+
+            out_path = os.path.join(
+                output_folder,
+                f"PixelPaws_{behavior_name}_Raster_{session_name}.png")
+            fig.savefig(out_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            self.log_train(f"    Raster plot: {os.path.basename(out_path)}")
+
     def generate_performance_plots(self, model, X, y, output_folder, behavior_name,
                                     oof_proba=None, oof_best_params=None,
                                     pre_prune_model=None):
@@ -7167,7 +7486,7 @@ Median: {feature_data.median():.6f}
                 messagebox.showerror("Error", "Could not find model in classifier file.\nExpected 'clf_model' or 'model' key.")
                 return
             
-            # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+            # Clean body parts lists (remove DLC network names)
             clf_data['bp_include_list'] = clean_bodyparts_list(clf_data.get('bp_include_list', []))
             clf_data['bp_pixbrt_list'] = clean_bodyparts_list(clf_data.get('bp_pixbrt_list', []))
             
@@ -7610,7 +7929,7 @@ Median: {feature_data.median():.6f}
                     messagebox.showerror("Error", "Could not find model in classifier file.\nExpected 'clf_model' or 'model' key.")
                     return
                 
-                # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+                # Clean body parts lists (remove DLC network names)
                 clf_data['bp_include_list'] = clean_bodyparts_list(clf_data.get('bp_include_list', []))
                 clf_data['bp_pixbrt_list'] = clean_bodyparts_list(clf_data.get('bp_pixbrt_list', []))
                 
@@ -8149,7 +8468,7 @@ Median: {feature_data.median():.6f}
         # Create converter window
         converter_window = tk.Toplevel(self.root)
         converter_window.title("BORIS to PixelPaws Converter")
-        converter_window.geometry("700x550")
+        converter_window.geometry("700x700")
         
         # Title
         title = ttk.Label(converter_window, text="BORIS to PixelPaws Converter", 
@@ -8170,13 +8489,29 @@ Median: {feature_data.median():.6f}
         boris_file_var = tk.StringVar()
         ttk.Label(file_frame, text="BORIS CSV/TSV:").grid(row=0, column=0, sticky='w', pady=5)
         ttk.Entry(file_frame, textvariable=boris_file_var, width=50).grid(row=0, column=1, padx=5)
-        ttk.Button(file_frame, text="📁 Browse", 
+        ttk.Button(file_frame, text="📁 Browse",
                   command=lambda: boris_file_var.set(
                       filedialog.askopenfilename(
                           title="Select BORIS File",
                           filetypes=[("CSV/TSV files", "*.csv *.tsv"), ("All files", "*.*")])
                   )).grid(row=0, column=2)
-        
+
+        # Batch folder (optional)
+        batch_frame = ttk.LabelFrame(converter_window, text="Batch Folder (Optional)", padding=10)
+        batch_frame.pack(fill='x', padx=10, pady=(0, 5))
+
+        batch_folder_var = tk.StringVar()
+        ttk.Label(batch_frame, text="Folder:").grid(row=0, column=0, sticky='w', pady=5)
+        ttk.Entry(batch_frame, textvariable=batch_folder_var, width=50).grid(row=0, column=1, padx=5)
+        ttk.Button(batch_frame, text="📁 Browse",
+                   command=lambda: batch_folder_var.set(filedialog.askdirectory(
+                       title="Select folder containing BORIS CSV/TSV files"))
+                   ).grid(row=0, column=2)
+        ttk.Label(batch_frame,
+                  text="If set, converts every .csv/.tsv in this folder.\n"
+                       "Single file above is used only when no batch folder is selected.",
+                  foreground='gray').grid(row=1, column=0, columnspan=3, sticky='w')
+
         # Helper functions (defined early so they can be used)
         def find_column(df, candidates):
             """Find column matching one of the candidates (case-insensitive)"""
@@ -8302,9 +8637,22 @@ Median: {feature_data.median():.6f}
         ttk.Button(output_frame, text="📁 Browse", 
                   command=lambda: output_dir_var.set(filedialog.askdirectory())).grid(row=0, column=2)
         
-        # Status
-        status_label = ttk.Label(converter_window, text="", foreground='blue')
-        status_label.pack(pady=5)
+        # Status / log
+        log_frame = ttk.LabelFrame(converter_window, text="Log", padding=5)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        log_box = tk.Text(log_frame, height=8, wrap='word', state='disabled',
+                          font=('Courier', 9))
+        log_scroll = ttk.Scrollbar(log_frame, command=log_box.yview)
+        log_box.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side='right', fill='y')
+        log_box.pack(fill='both', expand=True)
+
+        def log_status(msg, color='blue'):
+            log_box.config(state='normal')
+            log_box.insert('end', msg + '\n')
+            log_box.config(state='disabled')
+            log_box.see('end')
+            converter_window.update()
         
         def get_fps(fps_text, df):
             """Get FPS from input or DataFrame"""
@@ -8322,132 +8670,131 @@ Median: {feature_data.median():.6f}
             
             raise ValueError("Could not determine FPS. Please enter it manually or include FPS column.")
         
+        def do_convert_one(boris_path, behavior_name, fps_text, output_dir):
+            """Convert a single BORIS file. Returns (n_frames, n_positive, used_image_idx)."""
+            df = None
+            try:
+                df = pd.read_csv(boris_path)
+                if len(df.columns) < 3:
+                    df = pd.read_csv(boris_path, sep='\t')
+            except Exception:
+                df = pd.read_csv(boris_path, sep='\t')
+
+            if df is None or df.empty:
+                raise Exception("File is empty or could not be parsed")
+
+            fps_val = get_fps(fps_text, df)
+
+            behavior_col  = find_column(df, ["Behavior", "behaviour"])
+            type_col      = find_column(df, ["Behavior type", "Type"])
+            time_col      = find_column(df, ["Time", "Time (s)", "time"])
+            image_idx_col = find_column(df, ["Image index", "image index"])
+
+            if not all([behavior_col, type_col, time_col]):
+                raise Exception("Could not find required columns: Behavior, Behavior type, Time")
+
+            df_sorted = df.sort_values(time_col).reset_index(drop=True)
+
+            # Total frame count — prefer Image index max over time × fps
+            if image_idx_col and not df[image_idx_col].isna().all():
+                n_frames = int(df[image_idx_col].dropna().max()) + 1
+            else:
+                max_time = float(df_sorted[time_col].max())
+                duration_col = find_column(df, ["Media duration", "Media duration (s)"])
+                if duration_col and not df[duration_col].isna().all():
+                    max_time = max(max_time, float(df[duration_col].dropna().iloc[0]))
+                n_frames = int(np.ceil(max_time * fps_val))
+
+            labels = np.zeros(n_frames, dtype=int)
+            active_start_frame = None
+
+            for _, row in df_sorted.iterrows():
+                beh      = str(row[behavior_col])
+                beh_type = str(row[type_col]).strip().upper()
+                t        = float(row[time_col])
+
+                # Frame number: use Image index if present, else time × fps
+                if image_idx_col is not None and pd.notna(row.get(image_idx_col)):
+                    frame_num = int(row[image_idx_col])
+                else:
+                    frame_num = int(round(t * fps_val))
+
+                if beh != behavior_name:
+                    continue
+
+                if beh_type == "START":
+                    active_start_frame = frame_num
+                elif beh_type == "STOP":
+                    if active_start_frame is not None:
+                        for f in range(active_start_frame, min(frame_num, n_frames)):
+                            labels[f] = 1
+                        active_start_frame = None
+                elif beh_type == "POINT":
+                    if 0 <= frame_num < n_frames:
+                        labels[frame_num] = 1
+
+            output_df  = pd.DataFrame({behavior_name: labels})
+            base_name  = os.path.splitext(os.path.basename(boris_path))[0]
+            output_path = os.path.join(output_dir, f"{base_name}_labels.csv")
+            output_df.to_csv(output_path, index=False)
+
+            return n_frames, int(np.sum(labels)), image_idx_col is not None
+
         def run_conversion():
-            boris_path = boris_file_var.get().strip()
-            if not boris_path or not os.path.isfile(boris_path):
-                messagebox.showwarning("No File", "Please select a valid BORIS file.")
-                return
-            
             behavior_name = behavior_var.get().strip()
             if not behavior_name:
                 messagebox.showwarning("No Behavior", "Please enter a behavior name.")
                 return
-            
+
+            fps_text   = fps_var.get()
             output_dir = output_dir_var.get().strip()
-            if not output_dir:
-                output_dir = os.path.dirname(boris_path)
-            
-            try:
-                status_label.config(text=f"Loading {os.path.basename(boris_path)}...")
-                converter_window.update()
-                
-                # Load file - try CSV first (more common), then TSV
-                df = None
-                try:
-                    df = pd.read_csv(boris_path)
-                    # Check if it has enough columns - if only 1-2, might be TSV
-                    if len(df.columns) < 3:
-                        df = pd.read_csv(boris_path, sep='\t')
-                except:
-                    try:
-                        df = pd.read_csv(boris_path, sep='\t')
-                    except Exception as e2:
-                        raise Exception(f"Could not read file as CSV or TSV: {e2}")
-                
-                if df is None or df.empty:
-                    raise Exception("File is empty or could not be parsed")
-                
-                # Get FPS
-                fps_val = get_fps(fps_var.get(), df)
-                
-                # Find required columns
-                behavior_col = find_column(df, ["Behavior", "behaviour"])
-                type_col = find_column(df, ["Behavior type", "Type"])
-                time_col = find_column(df, ["Time", "Time (s)", "time"])
-                
-                if not all([behavior_col, type_col, time_col]):
-                    messagebox.showerror("Error", 
-                        "Could not find required columns: Behavior, Behavior type, and Time.\n"
-                        "Make sure your BORIS export includes these columns.")
-                    return
-                
-                status_label.config(text="Converting events to frames...")
-                converter_window.update()
-                
-                # Sort by time
-                df_sorted = df.sort_values(time_col).reset_index(drop=True)
-                
-                # Get max time to determine video length
-                max_time = df_sorted[time_col].max()
-                
-                # Try to get video duration from Media duration column
-                duration_col = find_column(df, ["Media duration", "Media duration (s)"])
-                if duration_col and not df[duration_col].isna().all():
-                    video_duration = float(df[duration_col].dropna().iloc[0])
-                    max_time = max(max_time, video_duration)
-                
-                # Calculate total frames
-                n_frames = int(np.ceil(max_time * fps_val))
-                
-                # Initialize all frames as 0
-                labels = np.zeros(n_frames, dtype=int)
-                
-                # Process START/STOP events
-                active_start = None
-                
-                for _, row in df_sorted.iterrows():
-                    beh = str(row[behavior_col])
-                    beh_type = str(row[type_col]).strip().upper()
-                    t = float(row[time_col])
-                    
-                    if beh != behavior_name:
-                        continue
-                    
-                    if beh_type == "START":
-                        active_start = t
-                    
-                    elif beh_type == "STOP":
-                        if active_start is not None:
-                            # Mark frames from START to STOP as 1
-                            frame_start = int(round(active_start * fps_val))
-                            frame_end = int(round(t * fps_val))
-                            for f in range(frame_start, min(frame_end, n_frames)):
-                                labels[f] = 1
-                            active_start = None
-                    
-                    elif beh_type == "POINT":
-                        frame = int(round(t * fps_val))
-                        if 0 <= frame < n_frames:
-                            labels[frame] = 1
-                
-                # Save per-frame CSV (PixelPaws format: just behavior column, no Frame column)
-                output_df = pd.DataFrame({behavior_name: labels})
-                base_name = os.path.splitext(os.path.basename(boris_path))[0]
-                output_path = os.path.join(output_dir, f"{base_name}_labels.csv")
-                output_df.to_csv(output_path, index=False)
-                
-                status_label.config(text=f"✓ Conversion successful!", foreground='green')
-                
-                n_positive = np.sum(labels)
-                pct = (n_positive / n_frames) * 100 if n_frames > 0 else 0
-                
-                messagebox.showinfo("Success", 
-                    f"BORIS → PixelPaws conversion complete!\n\n"
-                    f"Output: {output_path}\n\n"
-                    f"Total frames: {n_frames}\n"
-                    f"Behavior frames: {n_positive} ({pct:.1f}%)\n"
-                    f"FPS used: {fps_val}\n\n"
-                    f"Format: One column '{behavior_name}' with 0/1 per frame\n"
-                    f"File is named {os.path.basename(output_path)} — place it in\n"
-                    f"the same folder as the matching video for PixelPaws to find it automatically."
+            batch_dir  = batch_folder_var.get().strip()
+
+            # Collect files to process
+            if batch_dir and os.path.isdir(batch_dir):
+                files = sorted(
+                    glob.glob(os.path.join(batch_dir, "*.csv")) +
+                    glob.glob(os.path.join(batch_dir, "*.tsv"))
                 )
-                
-            except Exception as e:
-                import traceback
-                error_details = traceback.format_exc()
-                print(error_details)
-                status_label.config(text="✗ Conversion failed", foreground='red')
-                messagebox.showerror("Conversion Error", f"Error: {str(e)}\n\nSee console for details.")
+                if not files:
+                    messagebox.showwarning("No Files", f"No .csv/.tsv files found in:\n{batch_dir}")
+                    return
+                use_output_dir = output_dir or batch_dir
+            else:
+                single = boris_file_var.get().strip()
+                if not single or not os.path.isfile(single):
+                    messagebox.showwarning("No File", "Please select a BORIS file or batch folder.")
+                    return
+                files = [single]
+                use_output_dir = output_dir or os.path.dirname(single)
+
+            os.makedirs(use_output_dir, exist_ok=True)
+            ok, failed = 0, 0
+
+            for boris_path in files:
+                log_status(f"→ {os.path.basename(boris_path)}")
+                try:
+                    n_frames, n_pos, used_idx = do_convert_one(
+                        boris_path, behavior_name, fps_text, use_output_dir)
+                    pct = (n_pos / n_frames * 100) if n_frames else 0
+                    src = "frame index" if used_idx else "time×fps"
+                    log_status(
+                        f"  ✓ {n_frames} frames, {n_pos} positive ({pct:.1f}%), src={src}",
+                        'green')
+                    ok += 1
+                except Exception as e:
+                    import traceback
+                    print(traceback.format_exc())
+                    log_status(f"  ✗ {e}", 'red')
+                    failed += 1
+
+            summary = f"\nDone: {ok} succeeded, {failed} failed."
+            log_status(summary, 'green' if failed == 0 else 'red')
+            if len(files) == 1 and ok == 1:
+                messagebox.showinfo("Success", f"Converted 1 file.\nOutput: {use_output_dir}")
+            elif ok > 0:
+                messagebox.showinfo("Batch Complete",
+                    f"{ok}/{len(files)} files converted.\nOutput: {use_output_dir}")
         
         # Convert button
         ttk.Button(converter_window, text="🔄 Convert", command=run_conversion, 
@@ -8956,7 +9303,7 @@ Left/Right  - Previous/Next frame
             with open(clf_path, 'rb') as f:
                 clf_data_preview = pickle.load(f)
             
-            # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+            # Clean body parts lists (remove DLC network names)
             clf_data_preview['bp_include_list'] = clean_bodyparts_list(clf_data_preview.get('bp_include_list', []))
             clf_data_preview['bp_pixbrt_list'] = clean_bodyparts_list(clf_data_preview.get('bp_pixbrt_list', []))
             
@@ -8990,7 +9337,7 @@ Left/Right  - Previous/Next frame
                     with open(clf_path, 'rb') as f:
                         clf_data = pickle.load(f)
                     
-                    # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+                    # Clean body parts lists (remove DLC network names)
                     clf_data['bp_include_list'] = clean_bodyparts_list(clf_data.get('bp_include_list', []))
                     clf_data['bp_pixbrt_list'] = clean_bodyparts_list(clf_data.get('bp_pixbrt_list', []))
                     
@@ -9213,16 +9560,24 @@ Left/Right  - Previous/Next frame
                             result_data['behavior_name'],
                             result_data['best_thresh'],
                             result_data['clf_data'],
-                            result_data['human_labels']
+                            result_data['human_labels'],
+                            overlay_colors={
+                                'behavior':    self._hex_to_bgr(self.lv_behavior_color.get()),
+                                'no_behavior': self._hex_to_bgr(self.lv_nobehavior_color.get()),
+                            }
                         )
                         print("[Main Thread] Preview window created successfully!")
-                    
+
                     progress.destroy()
-                    
+
                     # Call preview directly on main thread (the original working way!)
                     print(f"Opening preview window...")
-                    SideBySidePreview(self.root, video_path, y_pred, y_proba, 
-                                    behavior_name, best_thresh, human_labels=human_labels)
+                    SideBySidePreview(self.root, video_path, y_pred, y_proba,
+                                    behavior_name, best_thresh, human_labels=human_labels,
+                                    overlay_colors={
+                                        'behavior':    self._hex_to_bgr(self.lv_behavior_color.get()),
+                                        'no_behavior': self._hex_to_bgr(self.lv_nobehavior_color.get()),
+                                    })
                     
                 except Exception as e:
                     import traceback
@@ -9282,6 +9637,143 @@ Left/Right  - Previous/Next frame
         
         threading.Thread(target=self._predict_thread, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Overlay color helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hex_to_bgr(hex_str):
+        """Convert '#RRGGBB' to OpenCV BGR tuple."""
+        h = hex_str.lstrip('#')
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (b, g, r)
+
+    def _pick_overlay_color(self, var, btn):
+        """Open a color chooser, update *var* and button background."""
+        from tkinter.colorchooser import askcolor
+        result = askcolor(color=var.get(), title="Choose overlay color")
+        if result and result[1]:
+            chosen = result[1]          # '#rrggbb'
+            var.set(chosen)
+            btn.configure(bg=chosen, activebackground=chosen)
+            self.lv_color_scheme.set('Custom')
+            self._refresh_overlay_preview()
+
+    def _on_color_scheme_changed(self):
+        """Apply a named color scheme preset to the behavior/no-behavior overlay colors."""
+        scheme = self.lv_color_scheme.get()
+        if scheme in OVERLAY_COLOR_SCHEMES:
+            beh_hex, nobeh_hex = OVERLAY_COLOR_SCHEMES[scheme]
+            self.lv_behavior_color.set(beh_hex)
+            self.lv_nobehavior_color.set(nobeh_hex)
+            self._lv_beh_color_btn.configure(bg=beh_hex, activebackground=beh_hex)
+            self._lv_nobeh_color_btn.configure(bg=nobeh_hex, activebackground=nobeh_hex)
+            self._refresh_overlay_preview()
+
+    def _on_tint_toggle(self, *_):
+        """Enable / disable the tint opacity scale based on the tint checkbox."""
+        state = 'normal' if self.lv_frame_tint.get() else 'disabled'
+        try:
+            self._lv_tint_scale.configure(state=state)
+        except AttributeError:
+            pass   # called before widget exists
+        self._refresh_overlay_preview()
+
+    def _refresh_overlay_preview(self, *_):
+        """Draw a mock behavior-active overlay onto the in-tab preview canvas."""
+        try:
+            import cv2, numpy as np
+            from PIL import Image, ImageTk
+        except ImportError:
+            return
+
+        canvas = getattr(self, 'lv_preview_canvas', None)
+        if canvas is None:
+            return
+
+        CW, CH = 320, 200
+
+        def _placeholder(msg):
+            canvas.delete('all')
+            canvas.create_text(CW // 2, CH // 2, text=msg,
+                               fill='gray', font=('Arial', 9))
+
+        video_path = self.pred_video_path.get().strip()
+        if not video_path or not os.path.isfile(video_path):
+            _placeholder("Load a video to see preview")
+            return
+
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total < 1:
+            cap.release()
+            _placeholder("Cannot read video")
+            return
+
+        seek = min(30, max(0, total // 2))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, seek)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            _placeholder("Cannot read frame")
+            return
+
+        color_b  = self._hex_to_bgr(self.lv_behavior_color.get())
+        hud_top  = self.lv_hud_position.get() == 'top'
+        do_halo  = self.lv_halo_border.get()
+        do_bouts = self.lv_bout_counter.get()
+
+        lv_h, lv_w = frame.shape[:2]
+
+        # HUD coords
+        if hud_top:
+            hud_y0, hud_y1 = 0, 80
+            txt_y1, txt_y2, bar_y0, bar_y1 = 22, 58, 71, 79
+        else:
+            hud_y0, hud_y1 = lv_h - 80, lv_h
+            txt_y1 = lv_h - 80 + 22
+            txt_y2 = lv_h - 80 + 58
+            bar_y0 = lv_h - 80 + 71
+            bar_y1 = lv_h - 80 + 79
+
+        # HUD background
+        overlay_img = frame.copy()
+        cv2.rectangle(overlay_img, (0, hud_y0), (lv_w, hud_y1), (0, 0, 0), -1)
+        cv2.addWeighted(overlay_img, 0.5, frame, 0.5, 0, frame)
+
+        mock_prob = 0.85
+        cv2.putText(frame, f"Frame {seek}  [preview]",
+                    (8, txt_y1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+        cv2.putText(frame, f"Behavior: YES   p = {mock_prob:.3f}",
+                    (8, txt_y2), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color_b, 2)
+        if do_bouts:
+            cv2.putText(frame, "Bout 1 / ?",
+                        (8, txt_y2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_b, 1)
+
+        bar_w = int(lv_w * mock_prob)
+        cv2.rectangle(frame, (0, bar_y0), (bar_w, bar_y1), color_b, -1)
+        cv2.rectangle(frame, (0, bar_y0), (lv_w - 1, bar_y1), (80, 80, 80), 1)
+
+        if do_halo:
+            cv2.rectangle(frame, (0, 0), (lv_w - 1, lv_h - 1), color_b, 18)
+            inner = tuple(max(0, c - 40) for c in color_b)
+            cv2.rectangle(frame, (9, 9), (lv_w - 10, lv_h - 10), inner, 6)
+
+        # Fit into 320×200
+        aspect = lv_w / lv_h
+        if CW / CH > aspect:
+            nh, nw = CH, int(CH * aspect)
+        else:
+            nw, nh = CW, int(CW / aspect)
+        frame_small = cv2.resize(frame, (nw, nh))
+        img_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(img_rgb))
+
+        canvas.delete('all')
+        x0, y0 = (CW - nw) // 2, (CH - nh) // 2
+        canvas.create_image(x0, y0, anchor='nw', image=photo)
+        self.lv_preview_photo = photo   # prevent GC
+
     def export_labeled_video(self):
         """Start the labeled-video export thread (on-demand after prediction)."""
         if self._last_pred_y_pred is None:
@@ -9304,10 +9796,16 @@ Left/Right  - Previous/Next frame
             output_folder = self._last_pred_output_folder
             base_name     = self._last_pred_base_name
 
-            # Read overlay checkbox values
+            # Read overlay checkbox / color values
             do_skeleton = self.lv_skeleton_dots.get()
             do_tint     = self.lv_frame_tint.get()
             do_timeline = self.lv_timeline_strip.get()
+            do_halo     = self.lv_halo_border.get()
+            do_bouts    = self.lv_bout_counter.get()
+            color_b     = self._hex_to_bgr(self.lv_behavior_color.get())
+            color_nb    = self._hex_to_bgr(self.lv_nobehavior_color.get())
+            tint_alpha  = float(self.lv_tint_opacity.get())
+            hud_top     = self.lv_hud_position.get() == 'top'
 
             self.pred_results_text.insert(tk.END, "\nCreating labeled video...\n")
 
@@ -9328,6 +9826,7 @@ Left/Right  - Previous/Next frame
 
             # Load DLC body-part coordinates for skeleton overlay
             bp_xy = {}   # bodypart -> (x_arr, y_arr, prob_arr) each shape (n_frames,)
+            _crop_dx, _crop_dy = self._last_pred_crop_offset  # offset from DLC config crop
             if do_skeleton and self._last_pred_dlc_path and os.path.exists(self._last_pred_dlc_path):
                 try:
                     import pandas as _pd
@@ -9337,8 +9836,8 @@ Left/Right  - Previous/Next frame
                         [(_c[1], _c[2]) for _c in _dlc.columns])
                     for _bp in _dlc.columns.get_level_values(0).unique():
                         bp_xy[_bp] = (
-                            _dlc[_bp]['x'].values.astype(float),
-                            _dlc[_bp]['y'].values.astype(float),
+                            _dlc[_bp]['x'].values.astype(float) + _crop_dx,
+                            _dlc[_bp]['y'].values.astype(float) + _crop_dy,
                             _dlc[_bp]['likelihood'].values.astype(float),
                         )
                 except Exception:
@@ -9352,11 +9851,40 @@ Left/Right  - Previous/Next frame
                 for _x in range(lv_w):
                     _idx = clip_start + int(_x * total_clip / lv_w)
                     _idx = min(_idx, clip_end - 1)
-                    timeline_img[:, _x] = (0, 0, 180) if y_pred[_idx] == 1 else (0, 140, 0)
+                    _tl_b  = tuple(int(c * 0.82) for c in color_b)
+                    _tl_nb = tuple(int(c * 0.82) for c in color_nb)
+                    timeline_img[:, _x] = _tl_b if y_pred[_idx] == 1 else _tl_nb
                 # Dim slightly so it doesn't overpower
                 cv2.addWeighted(np.full((14, lv_w, 3), 20, dtype=np.uint8), 0.3,
                                 timeline_img, 0.7, 0, timeline_img)
 
+            # Pre-compute bout indices (contiguous runs of pred==1) for counter
+            frame_to_bout_idx = {}
+            if do_bouts:
+                bout_idx  = 0
+                in_bout   = False
+                total_bouts = 0
+                # Count bouts first
+                _prev = 0
+                for _p in y_pred:
+                    if int(_p) == 1 and _prev == 0:
+                        total_bouts += 1
+                    _prev = int(_p)
+                # Map frames
+                bout_idx = 0
+                in_bout  = False
+                _prev    = 0
+                for _fi, _p in enumerate(y_pred):
+                    if int(_p) == 1 and _prev == 0:
+                        bout_idx += 1
+                        in_bout = True
+                    elif int(_p) == 0:
+                        in_bout = False
+                    if in_bout:
+                        frame_to_bout_idx[_fi] = (bout_idx, total_bouts)
+                    _prev = int(_p)
+
+            # HUD geometry (recomputed once after we know lv_h)
             cap_lv.set(cv2.CAP_PROP_POS_FRAMES, clip_start)
             for fi in range(clip_start, clip_end):
                 ret, frame = cap_lv.read()
@@ -9365,29 +9893,48 @@ Left/Right  - Previous/Next frame
 
                 prob  = float(y_proba[fi]) if fi < len(y_proba) else 0.0
                 pred  = int(y_pred[fi])    if fi < len(y_pred)  else 0
-                color = (0, 0, 220) if pred == 1 else (0, 200, 0)
+                color = color_b if pred == 1 else color_nb
+
+                # HUD coord set
+                if hud_top:
+                    hud_y0, hud_y1 = 0, 80
+                    txt_y1, txt_y2 = 22, 58
+                    bar_y0, bar_y1 = 71, 79
+                else:
+                    hud_y0 = lv_h - 80
+                    hud_y1 = lv_h
+                    txt_y1 = hud_y0 + 22
+                    txt_y2 = hud_y0 + 58
+                    bar_y0 = hud_y0 + 71
+                    bar_y1 = hud_y0 + 79
 
                 # 1. Frame tint (pred==1 only, applied before HUD so HUD stays crisp)
                 if do_tint and pred == 1:
-                    _red = np.full_like(frame, (0, 0, 80))
-                    cv2.addWeighted(_red, 0.22, frame, 0.78, 0, frame)
+                    _tint_color = tuple(c // 3 for c in color_b)
+                    _tint_layer = np.full_like(frame, _tint_color)
+                    cv2.addWeighted(_tint_layer, tint_alpha, frame,
+                                    1.0 - tint_alpha, 0, frame)
 
                 # 2. HUD background + text + confidence bar
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (0, 0), (lv_w, 80), (0, 0, 0), -1)
+                cv2.rectangle(overlay, (0, hud_y0), (lv_w, hud_y1), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
                 ts   = fi / fps
                 tstr = f"{int(ts // 3600):01d}:{int((ts % 3600) // 60):02d}:{ts % 60:05.2f}"
                 cv2.putText(frame, f"Frame {fi}  [{tstr}]",
-                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+                            (8, txt_y1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
                 cv2.putText(frame,
                             f"{behavior_name}: {'YES' if pred else 'NO'}   p = {prob:.3f}",
-                            (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                            (8, txt_y2), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                if do_bouts and fi in frame_to_bout_idx:
+                    _bi, _bt = frame_to_bout_idx[fi]
+                    cv2.putText(frame, f"Bout {_bi} / {_bt}",
+                                (8, txt_y2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
                 bar_w = int(lv_w * prob)
-                cv2.rectangle(frame, (0, 71), (bar_w, 79), color, -1)
-                cv2.rectangle(frame, (0, 71), (lv_w - 1, 79), (80, 80, 80), 1)
+                cv2.rectangle(frame, (0, bar_y0), (bar_w, bar_y1), color, -1)
+                cv2.rectangle(frame, (0, bar_y0), (lv_w - 1, bar_y1), (80, 80, 80), 1)
 
                 # 3. Skeleton dots
                 if bp_xy:
@@ -9400,10 +9947,11 @@ Left/Right  - Previous/Next frame
                                 cv2.circle(frame, (_x, _y), _r, color, -1)
                                 cv2.circle(frame, (_x, _y), _r + 1, (255, 255, 255), 1)
 
-                # 4. Red halo border (pred==1 only)
-                if pred == 1:
-                    cv2.rectangle(frame, (0, 0), (lv_w - 1, lv_h - 1), (0, 0, 220), 18)
-                    cv2.rectangle(frame, (9, 9), (lv_w - 10, lv_h - 10), (40, 40, 180), 6)
+                # 4. Halo border (pred==1 only, optional)
+                if do_halo and pred == 1:
+                    cv2.rectangle(frame, (0, 0), (lv_w - 1, lv_h - 1), color_b, 18)
+                    _inner = tuple(max(0, c - 40) for c in color_b)
+                    cv2.rectangle(frame, (9, 9), (lv_w - 10, lv_h - 10), _inner, 6)
 
                 # 5. Timeline strip (drawn last — sits on top at bottom edge)
                 if timeline_img is not None:
@@ -9460,7 +10008,7 @@ Left/Right  - Previous/Next frame
             with open(clf_path, 'rb') as f:
                 clf_data = pickle.load(f)
             
-            # Clean body parts lists (remove DLC network names for BAREfoot compatibility)
+            # Clean body parts lists (remove DLC network names)
             clf_data['bp_include_list'] = clean_bodyparts_list(clf_data.get('bp_include_list', []))
             clf_data['bp_pixbrt_list'] = clean_bodyparts_list(clf_data.get('bp_pixbrt_list', []))
             
@@ -9665,8 +10213,13 @@ Left/Right  - Previous/Next frame
             # Save outputs
             output_folder = self.pred_output_folder.get()
             if not output_folder:
-                output_folder = video_dir
-            
+                proj = self.current_project_folder.get()
+                if proj:
+                    output_folder = os.path.join(proj, 'results')
+                else:
+                    output_folder = video_dir
+            os.makedirs(output_folder, exist_ok=True)
+
             # Get video base name
             video_name = os.path.basename(video_path)
             base_name = os.path.splitext(video_name)[0]
@@ -9698,7 +10251,7 @@ Left/Right  - Previous/Next frame
                     f.write(f"Behavior time: {behavior_time:.1f} seconds\n")
                     f.write(f"Number of bouts: {len(bouts)}\n")
                     if bouts:
-                        f.write(f"Mean bout duration: {np.mean(bout_durations):.2f} seconds\n")
+                        f.write(f"Mean bout duration: {bout_stats['mean_dur_sec']:.2f} seconds\n")
                 
                 self.pred_results_text.insert(tk.END, f"✓ Summary: {summary_path}\n")
             
@@ -9712,6 +10265,7 @@ Left/Right  - Previous/Next frame
             self._last_pred_output_folder = output_folder
             self._last_pred_base_name     = base_name
             self._last_pred_dlc_path      = dlc_path   # for skeleton overlay in export
+            self._last_pred_crop_offset   = (crop_x_offset, crop_y_offset)
             self.pred_export_video_btn.config(state='normal')
 
             if self.pred_generate_ethogram.get():

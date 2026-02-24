@@ -1,18 +1,18 @@
 """
 Pose Feature Extraction Module
-Inspired by BAREfoot's AniML_utils_PoseFeatureExtraction.py
 
 Extracts kinematic and spatial features from DeepLabCut pose estimation data.
-This implementation matches BAREfoot's approach while using original code.
 
 Features extracted:
-- Distances between body part pairs
-- Angles at joints (3-point angles)
-- Velocities of body parts
+- Pairwise distances between body parts
+- Joint angles (3-point law-of-cosines)
+- Velocities and accelerations at multiple timescales
 - Distance velocities (rate of change)
 - Body part visibility (in-frame probability)
-
-Citation: Inspired by Barkai et al. (2025), Cell Rep Methods
+- Paw height, jerk, convex hull, body elongation, bilateral asymmetry
+- Rolling velocity statistics (max, std over short windows)
+- Angular velocity (rate of change of joint angles)
+- Signed velocity components (x and y directions separately)
 """
 
 import numpy as np
@@ -21,13 +21,12 @@ from typing import List, Tuple, Optional
 import itertools
 
 # Increment this when the feature set changes so cached files are invalidated
-POSE_FEATURE_VERSION = 2
+POSE_FEATURE_VERSION = 3
 
 
 class PoseFeatureExtractor:
     """
-    Extract kinematic and spatial features from pose estimation data.
-    Matches BAREfoot's feature extraction approach.
+    Extracts kinematic and spatial features from pose estimation data.
     """
     
     def __init__(self, 
@@ -39,8 +38,8 @@ class PoseFeatureExtractor:
         
         Args:
             bodyparts: List of body part names from DLC
-            likelihood_threshold: Minimum confidence for including data points (default 0.8 from BAREfoot)
-            velocity_delta: Time steps for middle velocity calculation (default 2, matching BAREfoot's dt_vel)
+            likelihood_threshold: Minimum confidence for including data points (default 0.8)
+            velocity_delta: Time steps for middle velocity calculation (default 2)
                            Note: Velocities are always calculated for dt=1, dt=velocity_delta, and dt=10
         """
         self.bodyparts = bodyparts
@@ -50,8 +49,7 @@ class PoseFeatureExtractor:
     def load_dlc_data(self, filepath: str) -> pd.DataFrame:
         """
         Load DeepLabCut H5 or CSV file.
-        Matches BAREfoot's open_file_as_dataframe function exactly.
-        """
+"""
         file_extension = filepath.split('.')[-1]
         
         if file_extension == 'csv':
@@ -88,20 +86,18 @@ class PoseFeatureExtractor:
     def get_bodypart_coords(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Extract x, y coordinates and probabilities for all body parts.
-        Matches BAREfoot's getBPcords function EXACTLY.
-        
+
         Expects flattened columns: bodypart_x, bodypart_y, bodypart_prob
         
         Returns:
             Tuple of (x_coords, y_coords, probabilities)
         """
         # Extract every 3rd column: x (0, 3, 6...), y (1, 4, 7...), prob (2, 5, 8...)
-        # This matches BAREfoot's approach exactly
         bp_xcord = df.iloc[:, ::3].reset_index(drop=True)
         bp_ycord = df.iloc[:, 1::3].reset_index(drop=True)
         bp_prob = df.iloc[:, 2::3].reset_index(drop=True)
         
-        # Filter to requested bodyparts using substring matching (like BAREfoot)
+        # Filter to requested bodyparts using substring matching
         if self.bodyparts:
             included_columns_x = [col for col in bp_xcord.columns if any(substr in col for substr in self.bodyparts)]
             included_columns_y = [col for col in bp_ycord.columns if any(substr in col for substr in self.bodyparts)]
@@ -125,8 +121,7 @@ class PoseFeatureExtractor:
     def calculate_distances(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate Euclidean distances between all pairs of body parts.
-        Matches BAREfoot's bp_distances function.
-        
+
         Naming convention: Dis_bp1-bp2
         """
         new_columns = []
@@ -154,8 +149,7 @@ class PoseFeatureExtractor:
     def calculate_angles(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate angles at joints using law of cosines.
-        Matches BAREfoot's angle function.
-        
+
         For three points (i, k, j), calculates angle at point k.
         Naming convention: Ang_bp1-bp2-bp3 (angle at bp2)
         """
@@ -206,8 +200,7 @@ class PoseFeatureExtractor:
     def calculate_velocities(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame, t: int = 1) -> pd.DataFrame:
         """
         Calculate velocity of each body part.
-        Matches BAREfoot's bp_velocity function.
-        
+
         Args:
             bp_xcord: X coordinates
             bp_ycord: Y coordinates
@@ -238,8 +231,7 @@ class PoseFeatureExtractor:
     def calculate_distance_velocities(self, bp_dist: pd.DataFrame, t: int = 1) -> pd.DataFrame:
         """
         Calculate rate of change of distances.
-        Matches BAREfoot's distances_velocity function.
-        """
+"""
         bp_dist_vel = bp_dist.diff(periods=t)
         bp_dist_vel.columns = [col + "_Vel" + str(t) for col in bp_dist_vel.columns]
         return bp_dist_vel
@@ -247,8 +239,7 @@ class PoseFeatureExtractor:
     def calculate_in_frame_probability(self, bp_prob: pd.DataFrame, prob_thresh: float = 0.8) -> pd.DataFrame:
         """
         Calculate binary features indicating if body part is visible in frame.
-        Matches BAREfoot's bp_inFrame function.
-        
+
         Args:
             bp_prob: Probability dataframe
             prob_thresh: Threshold for considering body part visible
@@ -408,16 +399,101 @@ class PoseFeatureExtractor:
 
         return pd.concat(result_dfs, axis=1).reset_index(drop=True)
 
+    def calculate_jerk(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame,
+                       t: int = 1) -> pd.DataFrame:
+        """
+        Calculate jerk (third derivative of position) for each body part.
+
+        Captures the explosive onset of brief high-speed behaviors like flinches.
+        Naming convention: bpname_Jerk{t}
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(t)
+            vy = bp_ycord.iloc[:, i].diff(t)
+            jx = vx.diff(t).diff(t)
+            jy = vy.diff(t).diff(t)
+            jerk = np.sqrt(jx ** 2 + jy ** 2) / t
+            jerk.name = f'{bp_name}_Jerk{t}'
+            result_cols.append(jerk)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_rolling_velocity_stats(self, bp_xcord: pd.DataFrame,
+                                         bp_ycord: pd.DataFrame,
+                                         windows: tuple = (5, 10)) -> pd.DataFrame:
+        """
+        Rolling max and std of velocity over short windows.
+
+        Captures the peak velocity even when the classifier frame is slightly
+        before/after the motion peak. Critical for brief bouts.
+        Naming convention: bpname_Vel1_VelMaxW{w}, bpname_Vel1_VelStdW{w}
+        """
+        vel = self.calculate_velocities(bp_xcord, bp_ycord, t=1)
+        result_cols = []
+        for w in windows:
+            roll_max = vel.rolling(w, center=True, min_periods=1).max()
+            roll_std = vel.rolling(w, center=True, min_periods=1).std().fillna(0)
+            roll_max.columns = [f'{c}_VelMaxW{w}' for c in vel.columns]
+            roll_std.columns = [f'{c}_VelStdW{w}' for c in vel.columns]
+            result_cols.extend([roll_max, roll_std])
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_velocity_components(self, bp_xcord: pd.DataFrame,
+                                      bp_ycord: pd.DataFrame,
+                                      t: int = 1) -> pd.DataFrame:
+        """
+        Signed x and y velocity components for each body part.
+
+        Directional withdrawal has a specific sign pattern not captured by
+        speed magnitude alone.
+        Naming convention: bpname_Vx{t}, bpname_Vy{t}
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(t).fillna(0)
+            vy = bp_ycord.iloc[:, i].diff(t).fillna(0)
+            vx.name = f'{bp_name}_Vx{t}'
+            vy.name = f'{bp_name}_Vy{t}'
+            result_cols.extend([vx, vy])
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def extract_new_kinematics_only(self, dlc_file: str) -> pd.DataFrame:
+        """Compute only v3-new kinematic features (no brightness, no video needed).
+
+        Used for incremental cache upgrades — requires only the DLC file.
+        """
+        dlc_df = self.load_dlc_data(dlc_file)
+        bp_xcord, bp_ycord, bp_prob = self.get_bodypart_coords(dlc_df)
+        feature_dfs = []
+        for fn in [self.calculate_jerk, self.calculate_velocity_components]:
+            result = fn(bp_xcord, bp_ycord)
+            if result is not None and not result.empty:
+                feature_dfs.append(result)
+        rolling_stats = self.calculate_rolling_velocity_stats(bp_xcord, bp_ycord, windows=(5, 10))
+        if not rolling_stats.empty:
+            feature_dfs.append(rolling_stats)
+        if not feature_dfs:
+            return pd.DataFrame()
+        return pd.concat(feature_dfs, axis=1).fillna(0)
+
     def extract_all_features(self,
                            dlc_file: str,
                            include_angles: bool = True,
                            include_velocities: bool = True,
                            include_distance_velocities: bool = True,
                            include_in_frame: bool = True,
-                           include_new_pose: bool = True) -> pd.DataFrame:
+                           include_new_pose: bool = True,
+                           include_new_kinematics: bool = True) -> pd.DataFrame:
         """
         Extract all pose features from DLC file.
-        Combines all feature types like BAREfoot's feature extraction pipeline.
 
         Args:
             dlc_file: Path to DLC H5 or CSV file
@@ -428,6 +504,8 @@ class PoseFeatureExtractor:
             include_new_pose: Include the 5 new coordinate-based features
                 (paw height, acceleration, convex hull area, body elongation,
                 bilateral asymmetry).  Default True.
+            include_new_kinematics: Include v3 kinematic features (jerk, rolling
+                velocity stats, signed velocity components).  Default True.
 
         Returns:
             DataFrame with all pose features
@@ -446,7 +524,7 @@ class PoseFeatureExtractor:
         if not bp_distances.empty:
             feature_dfs.append(bp_distances)
         
-        # Add velocities with multiple time deltas (matching BAREfoot exactly)
+        # Add velocities with multiple time deltas
         if include_velocities:
             # Velocity with dt=1
             bp_vel_1 = self.calculate_velocities(bp_xcord, bp_ycord, t=1)
@@ -465,7 +543,7 @@ class PoseFeatureExtractor:
                     sum_vel_delta = bp_vel_delta.sum(axis=1).to_frame(name=f'sum_Vel{self.velocity_delta}')
                     feature_dfs.append(sum_vel_delta)
             
-            # Velocity with dt=10 (BAREfoot standard)
+            # Velocity with dt=10
             if self.velocity_delta != 10:
                 bp_vel_10 = self.calculate_velocities(bp_xcord, bp_ycord, t=10)
                 if not bp_vel_10.empty:
@@ -480,8 +558,7 @@ class PoseFeatureExtractor:
             if not bp_angles.empty:
                 feature_dfs.append(bp_angles)
         
-        # Add distance velocities (only if we have distances) - NOT used in standard BAREfoot
-        # Keeping for backward compatibility with PixelPaws-trained models
+        # Add distance velocities
         if include_distance_velocities and not bp_distances.empty:
             bp_dist_vel = self.calculate_distance_velocities(bp_distances, t=self.velocity_delta)
             if not bp_dist_vel.empty:
@@ -506,6 +583,16 @@ class PoseFeatureExtractor:
                 if result is not None and not result.empty:
                     feature_dfs.append(result)
 
+        # New kinematic features (v3): jerk, rolling velocity stats, signed velocity components
+        if include_new_kinematics:
+            for fn in [self.calculate_jerk, self.calculate_velocity_components]:
+                result = fn(bp_xcord, bp_ycord)
+                if result is not None and not result.empty:
+                    feature_dfs.append(result)
+            rolling_stats = self.calculate_rolling_velocity_stats(bp_xcord, bp_ycord, windows=(5, 10))
+            if not rolling_stats.empty:
+                feature_dfs.append(rolling_stats)
+
         # Check if we have any features
         if not feature_dfs:
             raise ValueError("No features could be extracted. Check that your DLC file has valid body part data.")
@@ -523,8 +610,7 @@ class PoseFeatureExtractor:
 def moving_window_filter(df: pd.DataFrame, window: int, std_threshold: float) -> pd.DataFrame:
     """
     Apply moving window filter to smooth data.
-    Matches BAREfoot's filtering approach.
-    
+
     Args:
         df: DataFrame to filter
         window: Window size

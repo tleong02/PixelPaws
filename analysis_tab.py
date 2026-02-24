@@ -2038,8 +2038,14 @@ class AnalysisTab(ttk.Frame):
             f = self.create_heatmap_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_heatmap_graph(None, b, _frame=_f)))
 
+            f = self.create_heatmap_bouts_graph(graph_notebook, behavior)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_heatmap_bouts_graph(None, b, _frame=_f)))
+
             f = self.create_cumulative_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_graph(None, b, _frame=_f)))
+
+            f = self.create_cumulative_bouts_graph(graph_notebook, behavior)
+            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_bouts_graph(None, b, _frame=_f)))
 
             f = self.create_latency_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_latency_graph(None, b, _frame=_f)))
@@ -2433,6 +2439,70 @@ class AnalysisTab(ttk.Frame):
                    command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                    command=lambda: self.export_cumulative_data(behavior_name)).pack(side='left', padx=5)
+        return frame
+
+    def create_cumulative_bouts_graph(self, notebook, behavior_name="", _frame=None):
+        """Create cumulative number of bouts line plot"""
+        if _frame is None:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text="Cumulative Bouts")
+        else:
+            frame = _frame
+            for w in frame.winfo_children():
+                w.destroy()
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+
+        if 'N_Bouts' in df.columns:
+            error_type = self.error_type if hasattr(self, 'error_type') else 'SEM'
+            treatments = self.treatment_order if hasattr(self, 'treatment_order') else df['Treatment'].unique()
+            colors = self.treatment_colors if hasattr(self, 'treatment_colors') else {}
+
+            cumdf = df.sort_values('Bin_Start_Min').copy()
+            cumdf['Cumulative_Bouts'] = cumdf.groupby('Subject')['N_Bouts'].cumsum()
+
+            if error_type == 'SD':
+                grouped = cumdf.groupby(['Treatment', 'Bin_Start_Min'])['Cumulative_Bouts'].agg(['mean', 'std']).reset_index()
+                grouped.rename(columns={'std': 'error'}, inplace=True)
+            else:
+                grouped = cumdf.groupby(['Treatment', 'Bin_Start_Min'])['Cumulative_Bouts'].agg(['mean', 'sem']).reset_index()
+                grouped.rename(columns={'sem': 'error'}, inplace=True)
+
+            for treatment in treatments:
+                data = grouped[grouped['Treatment'] == treatment]
+                color = colors.get(treatment, None)
+                if color == 'white_black':
+                    ax.errorbar(data['Bin_Start_Min'], data['mean'], yerr=data['error'],
+                                marker='o', label=treatment, linewidth=2.5, capsize=5, capthick=2,
+                                color='black', markerfacecolor='white', markeredgecolor='black',
+                                markeredgewidth=2, markersize=8)
+                else:
+                    ax.errorbar(data['Bin_Start_Min'], data['mean'], yerr=data['error'],
+                                marker='o', label=treatment, linewidth=2, capsize=5, capthick=2,
+                                color=color)
+
+            ax.set_xlabel('Time (minutes)', fontsize=12)
+            ax.set_ylabel(f'Cumulative Bouts \u00b1 {error_type}', fontsize=12)
+            title = f'{behavior_name} - Cumulative Number of Bouts' if behavior_name else 'Cumulative Number of Bouts'
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            if hasattr(self, 'time_window'):
+                ax.set_xlim(-2, self.time_window + 2)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=5)
+        ttk.Button(button_frame, text="💾 Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="📊 Export Data",
+                   command=lambda: self.export_cumulative_bouts_data(behavior_name)).pack(side='left', padx=5)
         return frame
 
     def create_latency_graph(self, notebook, behavior_name="", _frame=None):
@@ -3215,6 +3285,108 @@ class AnalysisTab(ttk.Frame):
         
         ttk.Button(frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(pady=5)
+        return frame
+
+    def create_heatmap_bouts_graph(self, notebook, behavior_name="", _frame=None):
+        """Create heatmap of bout counts across time and subjects, grouped by treatment"""
+        if _frame is None:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text="Heatmap (Bouts)")
+        else:
+            frame = _frame
+            for w in frame.winfo_children():
+                w.destroy()
+
+        df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+
+        if 'N_Bouts' not in df.columns:
+            return frame if _frame is not None else ttk.Frame(notebook)
+
+        treatment_order = self.treatment_order if hasattr(self, 'treatment_order') else sorted(df['Treatment'].unique())
+        cmap = self.heatmap_palette if hasattr(self, 'heatmap_palette') else 'YlOrRd'
+
+        subject_treatment = df[['Subject', 'Treatment']].drop_duplicates().set_index('Subject')['Treatment'].to_dict()
+
+        sorted_subjects = []
+        treatment_info = []
+
+        for treatment in treatment_order:
+            treatment_subjects = [subj for subj, trt in subject_treatment.items() if trt == treatment]
+            treatment_subjects.sort()
+            if treatment_subjects:
+                start_idx = len(sorted_subjects)
+                n_subjects = len(treatment_subjects)
+                treatment_info.append((treatment, start_idx, n_subjects))
+                sorted_subjects.extend(treatment_subjects)
+
+        pivot_data = df.pivot_table(
+            values='N_Bouts',
+            index='Subject',
+            columns='Bin_Start_Min',
+            aggfunc='mean'
+        )
+
+        pivot_data = pivot_data.reindex(sorted_subjects)
+
+        n_subjects = len(sorted_subjects)
+        n_bins = len(pivot_data.columns)
+        fig_height = max(7, n_subjects * 0.4)
+        fig_width = max(11, n_bins * 0.35)
+
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+        im = ax.imshow(pivot_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
+
+        ax.set_xticks(np.arange(len(pivot_data.columns)))
+        ax.set_xticklabels(pivot_data.columns, fontsize=9)
+        ax.set_xlabel('Time Bin (minutes)', fontsize=11, fontweight='bold')
+
+        ax.set_yticks(np.arange(len(pivot_data.index)))
+        ax.set_yticklabels(pivot_data.index, fontsize=8)
+        ax.set_ylabel('Subject', fontsize=11, fontweight='bold')
+
+        for i, (treatment, start_idx, n_subjects) in enumerate(treatment_info):
+            end_idx = start_idx + n_subjects
+            mid_pos = start_idx + (n_subjects - 1) / 2
+
+            if i < len(treatment_info) - 1:
+                separator_y = end_idx - 0.5
+                ax.axhline(y=separator_y, color='white', linewidth=5, linestyle='-', zorder=10)
+
+            label_x = len(pivot_data.columns) + 1.2
+            ax.text(
+                label_x,
+                mid_pos,
+                f'{treatment}\n(n={n_subjects})',
+                va='center',
+                ha='left',
+                fontsize=9,
+                fontweight='bold',
+                bbox=dict(
+                    boxstyle='round,pad=0.35',
+                    facecolor='white',
+                    edgecolor='black',
+                    linewidth=1.5,
+                    alpha=0.95
+                )
+            )
+
+        cbar = plt.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label('Number of Bouts', rotation=270, labelpad=18, fontsize=10)
+        cbar.ax.tick_params(labelsize=8)
+
+        title = f'{behavior_name} - Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)' if behavior_name else 'Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)'
+        ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
+
+        plt.tight_layout()
+        plt.subplots_adjust(right=0.85)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        ttk.Button(frame, text="💾 Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(pady=5)
         return frame
 
     def create_statistics_tab(self, notebook, behavior_name, behavior_df,
@@ -4046,6 +4218,24 @@ class AnalysisTab(ttk.Frame):
                 export_df = export_df.sort_values(['Treatment', 'Subject', 'Bin_Start_Min'])
                 export_df.to_csv(filename, index=False)
                 messagebox.showinfo("Success", f"Cumulative data exported to:\n{filename}")
+
+    def export_cumulative_bouts_data(self, behavior_name=""):
+        """Export cumulative number of bouts data to CSV"""
+        from tkinter import filedialog
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"{behavior_name}_cumulative_bouts.csv" if behavior_name else "cumulative_bouts.csv"
+        )
+        if filename:
+            df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
+            if 'N_Bouts' in df.columns:
+                cumdf = df.sort_values('Bin_Start_Min').copy()
+                cumdf['Cumulative_Bouts'] = cumdf.groupby('Subject')['N_Bouts'].cumsum()
+                export_df = cumdf[['Subject', 'Treatment', 'Bin_Start_Min', 'N_Bouts', 'Cumulative_Bouts']].copy()
+                export_df = export_df.sort_values(['Treatment', 'Subject', 'Bin_Start_Min'])
+                export_df.to_csv(filename, index=False)
+                messagebox.showinfo("Success", f"Cumulative bouts data exported to:\n{filename}")
 
     def export_latency_data(self, behavior_name=""):
         """Export latency to first bout data to CSV"""
