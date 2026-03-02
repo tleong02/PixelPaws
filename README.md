@@ -1,6 +1,6 @@
 # PixelPaws — User Guide
 
-Desktop GUI for automated animal behavior classification using DeepLabCut pose data and XGBoost. PixelPaws takes the `.h5` output from DeepLabCut, extracts kinematic and pixel-brightness features, trains an XGBoost classifier to detect a target behavior frame-by-frame, and then runs batch predictions and group statistics — all through a point-and-click interface with no coding required.
+Desktop GUI for automated animal behavior classification using DeepLabCut pose data and XGBoost. PixelPaws takes the `.h5` output from DeepLabCut, extracts kinematic and pixel-brightness features, trains an XGBoost classifier to detect a target behavior frame-by-frame, and then runs batch predictions and group statistics.
 
 ---
 
