@@ -28,16 +28,9 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 
 ## Installation
 
-**GPU (recommended — faster brightness extraction):**
 ```bash
 git clone https://github.com/rslivicki/PixelPaws.git
 cd PixelPaws
-pip install -r requirements_gpu.txt
-python enable_pytorch_gpu.py
-```
-
-**CPU only:**
-```bash
 pip install -r requirements.txt
 ```
 
@@ -172,7 +165,7 @@ The Train tab is where you build a classifier for a single behavior.
 
 **Feature settings.**
 - *Pose features* — kinematic features computed from body-part coordinates: pairwise distances, joint angles, velocities at multiple timescales, and in-frame probability (confidence) scores.
-- *Brightness features* — pixel brightness in square ROIs around selected body parts, extracted directly from video frames. Requires the video file. PyTorch/CUDA accelerates this significantly on GPU.
+- *Brightness features* — pixel brightness in square ROIs around selected body parts, extracted directly from video frames. Requires the video file.
 - Choose which body parts to include. Fewer body parts = faster extraction; more = richer features.
 
 **Bout parameters.** Set the minimum bout duration (frames) and minimum inter-bout interval to merge adjacent detections. These are applied at prediction time, not during training.
@@ -204,7 +197,7 @@ The Predict tab runs a trained classifier on a single video and reports behavior
 #### What it does
 
 1. Loads the classifier and reads its stored behavior name, threshold, body-part lists, bout-filtering parameters, and feature settings.
-2. Extracts pose + brightness features if no cached file is provided (this is the slow step — expect 2–10 minutes depending on video length and whether GPU is available).
+2. Extracts pose + brightness features if no cached file is provided (this is the slow step — expect 2–10 minutes depending on video length).
 3. Runs the XGBoost model on every frame to produce a per-frame probability score.
 4. Applies the trained threshold to produce binary frame labels (0 = absent, 1 = present).
 5. Applies **bout filtering**: removes detections shorter than the minimum bout duration and fills gaps shorter than the maximum inter-bout interval. These parameters are stored in the classifier file, not set manually here.
@@ -332,7 +325,6 @@ my_project/
 | h5py / tables | ≥ 3.8 | Reading DLC HDF5 output |
 | matplotlib | ≥ 3.7 | Graphs |
 | seaborn | ≥ 0.12 | Heatmaps |
-| torch *(optional)* | ≥ 2.0 | GPU-accelerated brightness extraction |
 
 ---
 
