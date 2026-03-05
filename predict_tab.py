@@ -471,7 +471,6 @@ class PredictTab:
                     bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                     square_size=clf_data.get('square_size', [40]),
                     pix_threshold=clf_data.get('pix_threshold', 0.3),
-                    use_gpu=True,
                 )
                 
                 self.results_text.insert(tk.END, f"  ✓ Features extracted\n\n")

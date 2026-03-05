@@ -13,7 +13,7 @@ Enhanced features:
 Modular feature extraction system:
 - pose_features.py - Pose/kinematic features (distances, angles, velocities)
 - brightness_features.py - Pixel brightness features (light-based depth analysis)
-- classifier_training.py - XGBoost training pipeline with GPU support
+- classifier_training.py - XGBoost training pipeline
 
 A unified interface for training classifiers, evaluating models, and analyzing
 animal behavior videos using DeepLabCut pose estimation.
@@ -59,6 +59,18 @@ try:
 except ImportError:
     EVALUATION_TAB_AVAILABLE = False
     print("Warning: evaluation_tab.py not found. Evaluation tab will be disabled.")
+
+try:
+    from unsupervised_tab import UnsupervisedTab
+    UNSUPERVISED_TAB_AVAILABLE = True
+except ImportError:
+    UNSUPERVISED_TAB_AVAILABLE = False
+
+try:
+    from weight_bearing_tab import WeightBearingTab
+    WEIGHT_BEARING_TAB_AVAILABLE = True
+except ImportError:
+    WEIGHT_BEARING_TAB_AVAILABLE = False
 
 # ============================================================================
 # SMART DEFAULT FEATURE EXTRACTION SETTINGS
@@ -343,7 +355,7 @@ def auto_detect_bodyparts_from_model(clf_data, verbose=True):
 
 def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
                              square_size, pix_threshold, bp_include_list=None,
-                             scale_x=1, scale_y=1, dt_vel=2, min_prob=0.8, use_gpu=True,
+                             scale_x=1, scale_y=1, dt_vel=2, min_prob=0.8,
                              crop_offset_x=0, crop_offset_y=0, config_yaml_path=None,
                              include_optical_flow=False, bp_optflow_list=None):
     """
@@ -362,7 +374,6 @@ def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
         scale_x, scale_y: Scaling factors
         dt_vel: Time delta for derivatives
         min_prob: Minimum DLC confidence
-        use_gpu: Use GPU acceleration for brightness extraction (default True, auto-fallback to CPU)
         crop_offset_x: X offset for DLC crop (overrides config_yaml_path)
         crop_offset_y: Y offset for DLC crop (overrides config_yaml_path)
         config_yaml_path: Path to DLC config.yaml for auto-detecting crop (optional)
@@ -472,9 +483,8 @@ def PixelPaws_ExtractFeatures(pose_data_file, video_file_path, bp_pixbrt_list,
         square_size=square_size if isinstance(square_size, int) else square_size[0],
         pixel_threshold=pix_threshold,
         min_prob=min_prob,
-        use_gpu=use_gpu,  # Pass GPU setting through
-        crop_offset_x=crop_offset_x,  # NEW: Pass crop offset
-        crop_offset_y=crop_offset_y   # NEW: Pass crop offset
+        crop_offset_x=crop_offset_x,
+        crop_offset_y=crop_offset_y
     )
 
     # Build an optical flow extractor preloaded with DLC coords if requested.
@@ -547,37 +557,6 @@ def predict_with_xgboost(model, X):
             print("  Warning: Model doesn't have feature_names_in_. Using all features.")
             X_model = X
         
-        # Check if model has device parameter (XGBoost model with GPU)
-        if hasattr(model, 'get_params') and hasattr(model, 'set_params'):
-            params = model.get_params()
-            current_device = params.get('device', None)
-            tree_method = params.get('tree_method', None)
-            
-            # If model uses GPU tree_method but GPU not available, switch to CPU
-            if tree_method == 'gpu_hist':
-                try:
-                    # Try prediction with GPU
-                    y_proba = model.predict_proba(X_model)[:, 1]
-                    return y_proba
-                except Exception as gpu_error:
-                    # GPU not available, switch to CPU tree method
-                    print(f"  GPU not available ({str(gpu_error)}), switching to CPU (hist)")
-                    model.set_params(tree_method='hist')
-                    y_proba = model.predict_proba(X_model)[:, 1]
-                    return y_proba
-            
-            # If model is on GPU device, temporarily switch to CPU for prediction
-            if current_device and ('cuda' in str(current_device) or 'gpu' in str(current_device)):
-                # Set to CPU
-                model.set_params(device='cpu')
-                
-                # Predict
-                y_proba = model.predict_proba(X_model)[:, 1]
-                
-                # Restore GPU device
-                model.set_params(device=current_device)
-                
-                return y_proba
     except ValueError:
         # Re-raise feature mismatch errors with full context
         raise
@@ -2487,7 +2466,6 @@ class PixelPawsGUI:
         self.train_use_scale_pos_weight = None
         self.train_use_early_stopping = None
         self.train_early_stopping_rounds = None
-        self.train_use_gpu = None
         self.train_generate_plots = None
         self.train_trim_to_last_positive = None
         self.train_log = None
@@ -2648,7 +2626,21 @@ class PixelPawsGUI:
             self.notebook.add(self.analysis_tab_frame, text="📊 Analysis")
             self.analysis_tab = AnalysisTab(self.analysis_tab_frame, self)
             self.analysis_tab.pack(fill='both', expand=True)
-        
+
+        # Unsupervised behavior discovery tab
+        if UNSUPERVISED_TAB_AVAILABLE:
+            self.unsupervised_tab_frame = ttk.Frame(self.notebook)
+            self.notebook.add(self.unsupervised_tab_frame, text="🔍 Discover")
+            self.unsupervised_tab = UnsupervisedTab(self.unsupervised_tab_frame, self)
+            self.unsupervised_tab.pack(fill='both', expand=True)
+
+        # Weight bearing / pressure analysis tab
+        if WEIGHT_BEARING_TAB_AVAILABLE:
+            self.wb_tab_frame = ttk.Frame(self.notebook)
+            self.notebook.add(self.wb_tab_frame, text="⚖️ Weight Bearing")
+            self.wb_tab = WeightBearingTab(self.wb_tab_frame, self)
+            self.wb_tab.pack(fill='both', expand=True)
+
         self.create_tools_tab()  # New tab for enhanced tools
         
         # Status bar at bottom
@@ -2892,12 +2884,6 @@ class PixelPawsGUI:
             row=5, column=1, sticky='w', padx=5, pady=2)
         tk.Label(params_frame, text="Stop if no improvement for this many trees (50 typical)", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=5, column=2, sticky='w')
 
-        # Use GPU
-        self.train_use_gpu = tk.BooleanVar(value=True)
-        ttk.Checkbutton(params_frame, text="Use GPU acceleration (if available)", 
-                       variable=self.train_use_gpu).grid(row=6, column=1, sticky='w', pady=2)
-        tk.Label(params_frame, text="Much faster training with CUDA-compatible GPU", fg='gray', bg=self.theme.colors['frame_bg']).grid(row=6, column=2, sticky='w')
-        
         # Generate plots
         self.train_generate_plots = tk.BooleanVar(value=True)
         ttk.Checkbutton(params_frame, text="Generate performance and SHAP plots",
@@ -4449,6 +4435,14 @@ class PixelPawsGUI:
                 # Defer scan slightly so the tab finishes any pending layout
                 self.root.after(200, lambda: self.analysis_tab.scan_project_folder(folder))
 
+        # Sync unsupervised tab
+        if UNSUPERVISED_TAB_AVAILABLE and hasattr(self, 'unsupervised_tab'):
+            self.unsupervised_tab.on_project_changed()
+
+        # Sync weight bearing tab
+        if WEIGHT_BEARING_TAB_AVAILABLE and hasattr(self, 'wb_tab'):
+            self.wb_tab.on_project_changed()
+
         # Write back (merge) so any newly set fields are persisted immediately
         self.save_project_config(folder)
 
@@ -5085,7 +5079,6 @@ class PixelPawsGUI:
                 'bp_pixbrt_list': [x.strip() for x in self.train_bp_pixbrt.get().split(',') if x.strip()],
                 'square_size': [int(x.strip()) for x in self.train_square_sizes.get().split(',') if x.strip()],
                 'pix_threshold': self.train_pix_threshold.get(),
-                'use_gpu': self.train_use_gpu.get(),
                 'include_optical_flow': self.train_include_optical_flow.get(),
                 'bp_optflow_list': [x.strip() for x in self.train_bp_optflow.get().split(',') if x.strip()]
                     if self.train_include_optical_flow.get() else [],
@@ -5130,17 +5123,7 @@ class PixelPawsGUI:
                 f"\nTotal: {len(X)} frames, {pos_total} positive "
                 f"({np.mean(y)*100:.1f}%), {neg_total} negative")
             
-            # ── GPU detection (once, before the CV loop) ───────────────
             tree_method = 'hist'
-            if self.train_use_gpu.get():
-                try:
-                    import xgboost as xgb_test
-                    tm = xgb_test.XGBClassifier(tree_method='gpu_hist', n_estimators=1)
-                    tm.fit([[0, 0]], [0])
-                    tree_method = 'gpu_hist'
-                    self.log_train("\nUsing GPU acceleration (gpu_hist)")
-                except Exception as e:
-                    self.log_train(f"\nGPU not available, using CPU (hist): {e}")
             
             # ── Session-level K-Fold Cross-Validation ─────────────────
             self.log_train("\n" + "=" * 60)
@@ -5748,7 +5731,6 @@ class PixelPawsGUI:
                 'use_scale_pos_weight': self.train_use_scale_pos_weight.get(),
                 'use_early_stopping': self.train_use_early_stopping.get(),
                 'early_stopping_rounds': self.train_early_stopping_rounds.get(),
-                'use_gpu': self.train_use_gpu.get(),
                 'generate_plots': self.train_generate_plots.get(),
                 'shap_prune': self.train_shap_prune.get(),
                 'shap_top_n': self.train_shap_top_n.get(),
@@ -5825,8 +5807,6 @@ class PixelPawsGUI:
                 self.train_use_early_stopping.set(config['use_early_stopping'])
             if 'early_stopping_rounds' in config:
                 self.train_early_stopping_rounds.set(config['early_stopping_rounds'])
-            if 'use_gpu' in config:
-                self.train_use_gpu.set(config['use_gpu'])
             if 'generate_plots' in config:
                 self.train_generate_plots.set(config['generate_plots'])
             if 'shap_prune' in config:
@@ -5987,7 +5967,6 @@ class PixelPawsGUI:
                 bp_pixbrt_list=cfg['bp_pixbrt_list'],
                 square_size=cfg['square_size'],
                 pix_threshold=cfg['pix_threshold'],
-                use_gpu=cfg.get('use_gpu', True),  # Use GPU setting from config (default True)
                 config_yaml_path=config_yaml,  # Pass config for crop detection
                 include_optical_flow=cfg.get('include_optical_flow', False),
                 bp_optflow_list=cfg.get('bp_optflow_list', []) or None,
@@ -7947,11 +7926,6 @@ Median: {feature_data.median():.6f}
         ttk.Entry(settings, textvariable=fe_threshold, width=10).grid(
             row=2, column=1, padx=5, pady=3, sticky='w')
 
-        fe_use_gpu = tk.BooleanVar(
-            value=self.train_use_gpu.get() if hasattr(self, 'train_use_gpu') else True)
-        ttk.Checkbutton(settings, text="Use GPU acceleration",
-                        variable=fe_use_gpu).grid(row=3, column=1, sticky='w', pady=3)
-
         fe_optflow = tk.BooleanVar(
             value=self.train_include_optical_flow.get()
             if hasattr(self, 'train_include_optical_flow') else False)
@@ -8012,7 +7986,6 @@ Median: {feature_data.median():.6f}
                 'bp_pixbrt_list': [x.strip() for x in fe_bp_pixbrt.get().split(',') if x.strip()],
                 'square_size':    [int(x.strip()) for x in fe_square.get().split(',') if x.strip()],
                 'pix_threshold':  fe_threshold.get(),
-                'use_gpu':        fe_use_gpu.get(),
                 'include_optical_flow': fe_optflow.get(),
                 'bp_optflow_list': [x.strip() for x in fe_bp_optflow.get().split(',') if x.strip()]
                                    if fe_optflow.get() else [],
@@ -8151,7 +8124,6 @@ Median: {feature_data.median():.6f}
                         bp_pixbrt_list=cfg['bp_pixbrt_list'],
                         square_size=cfg['square_size'],
                         pix_threshold=cfg['pix_threshold'],
-                        use_gpu=cfg['use_gpu'],
                         config_yaml_path=cfg.get('dlc_config'),
                         include_optical_flow=cfg['include_optical_flow'],
                         bp_optflow_list=cfg['bp_optflow_list'] or None,
@@ -8334,7 +8306,6 @@ Median: {feature_data.median():.6f}
                             bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                             square_size=clf_data.get('square_size', [40]),
                             pix_threshold=clf_data.get('pix_threshold', 0.3),
-                            use_gpu=True,  # GPU enabled (auto-fallback)
                             config_yaml_path=config_yaml,  # Auto-detect crop from config
                             include_optical_flow=clf_data.get('include_optical_flow', False),
                             bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
@@ -8766,7 +8737,6 @@ Median: {feature_data.median():.6f}
                             bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                             square_size=clf_data.get('square_size', [40]),
                             pix_threshold=clf_data.get('pix_threshold', 0.3),
-                            use_gpu=True,  # GPU enabled (auto-fallback)
                             config_yaml_path=config_yaml,  # Pass config for crop detection
                             include_optical_flow=clf_data.get('include_optical_flow', False),
                             bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
@@ -9063,7 +9033,6 @@ Median: {feature_data.median():.6f}
                     bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                     square_size=clf_data.get('square_size', [40]),
                     pix_threshold=clf_data.get('pix_threshold', 0.3),
-                    use_gpu=True,  # GPU enabled (auto-fallback)
                     config_yaml_path=config_yaml,  # Pass config for crop detection
                 )
                 
@@ -10168,7 +10137,6 @@ Left/Right  - Previous/Next frame
                                 bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                                 square_size=clf_data.get('square_size', [40]),
                                 pix_threshold=clf_data.get('pix_threshold', 0.3),
-                                use_gpu=True,  # GPU enabled (auto-fallback)
                                 config_yaml_path=config_yaml,  # Pass config for crop detection
                                 include_optical_flow=clf_data.get('include_optical_flow', False),
                                 bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
@@ -10851,7 +10819,6 @@ Left/Right  - Previous/Next frame
                         bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                         square_size=clf_data.get('square_size', [40]),
                         pix_threshold=clf_data.get('pix_threshold', 0.3),
-                        use_gpu=True,  # GPU enabled (auto-fallback)
                         crop_offset_x=crop_x_offset,  # Pass detected crop offset
                         crop_offset_y=crop_y_offset,
                         config_yaml_path=dlc_config_path if dlc_config_path else None,  # Pass config for auto-detection
@@ -11705,7 +11672,6 @@ Left/Right  - Previous/Next frame
                                 bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                                 square_size=clf_data.get('square_size', [40]),
                                 pix_threshold=clf_data.get('pix_threshold', 0.3),
-                                use_gpu=True,
                                 config_yaml_path=config_yaml,  # Pass config for crop detection
                                 include_optical_flow=clf_data.get('include_optical_flow', False),
                                 bp_optflow_list=clf_data.get('bp_optflow_list', []) or None,
@@ -11737,7 +11703,6 @@ Left/Right  - Previous/Next frame
                                 bp_pixbrt_list=smart_bp_pixbrt,  # Smart default brightness
                                 square_size=smart_square_size,
                                 pix_threshold=smart_pix_threshold,
-                                use_gpu=True,
                                 config_yaml_path=config_yaml,  # Pass config for crop detection
                             )
                             
@@ -12448,7 +12413,6 @@ Left/Right  - Previous/Next frame
                 bp_pixbrt_list=feature_config['bp_pixbrt_list'],
                 square_size=feature_config['square_size'],
                 pix_threshold=feature_config['pix_threshold'],
-                use_gpu=True,
                 config_yaml_path=config_yaml,  # Pass config for crop detection
                 include_optical_flow=feature_config.get('include_optical_flow', False),
                 bp_optflow_list=feature_config.get('bp_optflow_list', []) or None,

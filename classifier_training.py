@@ -5,7 +5,6 @@ Matching BAREfoot's training approach (Barkai et al., 2025)
 This module provides a comprehensive classifier training pipeline:
 - Feature extraction (pose + brightness)
 - Data balancing
-- XGBoost training with GPU support
 - Threshold optimization
 - Cross-validation
 - Learning curve analysis
@@ -50,11 +49,10 @@ class BehaviorClassifier:
                  colsample_bytree: float = 0.2,
                  alpha: float = 1.0,
                  lambda_: float = 0.1,
-                 use_gpu: bool = True,
                  seed: int = 42):
         """
         Initialize behavior classifier with BAREfoot's default parameters.
-        
+
         Args:
             n_estimators: Number of boosting rounds (BAREfoot uses 1700)
             max_depth: Maximum tree depth (BAREfoot uses 6)
@@ -63,7 +61,6 @@ class BehaviorClassifier:
             colsample_bytree: Fraction of features for each tree (0.2)
             alpha: L1 regularization term (1.0)
             lambda_: L2 regularization term (0.1)
-            use_gpu: Use GPU acceleration if available
             seed: Random seed for reproducibility
         """
         self.n_estimators = n_estimators
@@ -73,7 +70,6 @@ class BehaviorClassifier:
         self.colsample_bytree = colsample_bytree
         self.alpha = alpha
         self.lambda_ = lambda_
-        self.use_gpu = use_gpu
         self.seed = seed
         
         self.model = None
@@ -97,16 +93,7 @@ class BehaviorClassifier:
             'n_jobs': -1
         }
         
-        if self.use_gpu:
-            try:
-                params['tree_method'] = 'gpu_hist'
-                params['predictor'] = 'gpu_predictor'
-                params['gpu_id'] = 0
-            except Exception as e:
-                print(f"GPU not available, using CPU: {e}")
-                params['tree_method'] = 'hist'
-        else:
-            params['tree_method'] = 'hist'
+        params['tree_method'] = 'hist'
         
         return xgb.XGBClassifier(**params)
     
@@ -569,7 +556,6 @@ if __name__ == "__main__":
     print("Behavior Classifier Training Module")
     print("=" * 50)
     print("Features:")
-    print("  - XGBoost with GPU support")
     print("  - Data balancing (downsample/upsample)")
     print("  - Threshold optimization")
     print("  - Cross-validation")

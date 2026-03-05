@@ -782,7 +782,6 @@ class EvaluationTab(ttk.Frame):
                             bp_pixbrt_list=clf_data.get('bp_pixbrt_list', []),
                             square_size=clf_data.get('square_size', [40]),
                             pix_threshold=clf_data.get('pix_threshold', 0.3),
-                            use_gpu=True,
                             crop_offset_x=crop_x,
                             crop_offset_y=crop_y,
                             config_yaml_path=dlc_config_path or None,
