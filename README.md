@@ -2,6 +2,12 @@
 
 Desktop GUI for automated animal behavior classification using DeepLabCut pose data and XGBoost. PixelPaws takes the `.h5` output from DeepLabCut, extracts kinematic and pixel-brightness features, trains an XGBoost classifier to detect a target behavior frame-by-frame, and then runs batch predictions and group statistics.
 
+## Demo
+
+Example of automated behavior scoring using a scratching classifier. Behavior detections are overlaid frame-by-frame on the video.
+
+<video src="media/260219_Rim_S1_cropped_labeled.mp4" controls width="720"></video>
+
 ---
 
 > 📷 **Building the filming enclosure?** See [hardware.md](hardware.md) for the full bill of materials, 3D-printed enclosure files, wiring notes, and camera/lens specs.
