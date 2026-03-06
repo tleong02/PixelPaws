@@ -6,7 +6,7 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 
 Example of automated behavior scoring using a scratching classifier. Behavior detections are overlaid frame-by-frame on the video.
 
-<video src="media/260219_Rim_S1_cropped_labeled.mp4" controls width="720"></video>
+<video src="https://github.com/rslivicki/PixelPaws/raw/master/media/260219_Rim_S1_cropped_labeled.mp4" controls width="720"></video>
 
 ---
 
