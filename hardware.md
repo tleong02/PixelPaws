@@ -4,6 +4,14 @@ This document describes all hardware components used in the PixelPaws filming en
 
 ---
 
+## 🏁 Final Build
+
+| Interior (camera + LED strips) | Fully assembled enclosures |
+| --- | --- |
+| ![Bottom chamber with camera and LED strips](hardware/images/Bottom_with_camera.jpg) | ![Three fully assembled PixelPaws enclosures](hardware/images/Fully_assembled.jpg) |
+
+---
+
 ## 📦 Bill of Materials
 
 | Component | Manufacturer | Model / Part Number | Key Specs | Link |
@@ -12,7 +20,7 @@ This document describes all hardware components used in the PixelPaws filming en
 | **Lens** | Marshall Electronics | `CV-2812-3MP` | M12 (S-mount) · 2.8–12 mm varifocal · f/1.4 · 3 MP · IR corrected · 109°–31.2° horizontal FOV · 1/2.7" sensor format · Manual focus + zoom with lock screws | [B&H Product Page](https://www.bhphotovideo.com/c/product/1428706-REG/marshall_electronics_cv_2812_3mp_m12_2_8_12mm_f_1_4_3mp.html) |
 | **LED Strip (IR)** | — | SMD5050 850 nm IR strip | 850 nm infrared · SMD 5050 tri-chip · 12V DC · 60 LEDs/m · 14.4 W/m · 120° beam angle · Non-waterproof (IP20) · 3-LED cuttable · 5 m/roll · 50,000 hr lifespan | [Amazon](https://www.amazon.com/dp/B0FC2GJTR4) |
 | **LED Power Supply** | — | 12V 2A LED Adapter (2-pack) | Input: 100–240V AC · Output: 12V DC @ 2A · 24W max · 5.5/2.1 mm DC barrel connector · Non-dimmable | [Amazon](https://www.amazon.com/dp/B08Y6VHMHS) |
-| **Acrylic Sheet (Colored)** | TAP Plastics | Chemcast Cast Acrylic — Color | 110 mm width · 4 sheets per order · Tops are 3D printed (see below) · Cut-to-size · Glossy finish · UV stable | [TAP Plastics](https://www.tapplastics.com/product/plastics/cut_to_size_plastic/acrylic_sheets_color/341) |
+| **Acrylic Sheet (Colored)** | TAP Plastics | Chemcast Cast Acrylic — Color | 110 mm width · 4 sheets per order · Box sides only (tops are 3D printed) · Cut-to-size · Glossy finish · UV stable | [TAP Plastics](https://www.tapplastics.com/product/plastics/cut_to_size_plastic/acrylic_sheets_color/341) |
 | **Acrylic Sheet (Clear Cast)** | TAP Plastics | Chemcast Cast Acrylic — Clear | 189 mm width · 1 sheet per order · Cut-to-size · Optical clarity · UV stable · Non-yellowing | [TAP Plastics](https://www.tapplastics.com/product/plastics/cut_to_size_plastic/acrylic_sheets_cast_clear/510) |
 | **3D Printer Filament** | eSUN | PLA+ 1.75 mm — Black | 1.75 mm diameter · Black · 1 kg (2.2 lbs) spool · PLA+ formulation | [Amazon](https://www.amazon.com/eSUN-1-75mm-Printer-Filament-2-2lbs/dp/B01EKEMDA6/) |
 
@@ -92,7 +100,7 @@ Acrylic sheets are ordered cut-to-size from [TAP Plastics](https://www.tapplasti
 - **Material:** Chemcast® Cast Acrylic (opaque/translucent color options)
 - **Width:** 110 mm
 - **Quantity:** 4 sheets per box
-- **Notes:** Box tops are 3D printed — see [3D Printed Enclosure](#️-3d-printed-enclosure) section below.
+- **Notes:** Box sides only — the filming box top and mouse chamber top are both 3D printed. See [3D Printed Enclosure](#️-3d-printed-enclosure) section below.
 
 ### Clear Cast Acrylic (Viewing Panel)
 
@@ -111,7 +119,8 @@ The filming box consists of 3D-printed parts. STL files are in [`hardware/stl/`]
 | File | Description |
 | --- | --- |
 | `Bottom_Chamber_with_Camera_holder.stl` | Lower chamber housing the camera module and LED strips |
-| `Top_of_filming_box_original.stl` | Top lid / cover of the filming enclosure (also used as box tops for colored acrylic panels) |
+| `Top_of_filming_box_LED_8cm_from_bottom.stl` | Top lid of the filming enclosure with integrated LED mount positioned 8 cm from the bottom — **current recommended top** |
+| `Mouse_box_top.stl` | Top of the mouse chamber (3D-printed replacement for the acrylic panel top) |
 
 > **Recommended print settings:** Use eSUN PLA+ 1.75 mm Black filament · 0.2 mm layer height · 20–30% infill · Supports as needed for camera holder geometry.
 
