@@ -4,6 +4,14 @@ This document describes all hardware components used in the PixelPaws filming en
 
 ---
 
+## 🏁 Final Build
+
+| Interior (camera + LED strips) | Fully assembled enclosures |
+| --- | --- |
+| ![Bottom chamber with camera and LED strips](hardware/images/Bottom_with_camera.jpg) | ![Three fully assembled PixelPaws enclosures](hardware/images/Fully_assembled.jpg) |
+
+---
+
 ## 📦 Bill of Materials
 
 | Component | Manufacturer | Model / Part Number | Key Specs | Link |
