@@ -114,7 +114,7 @@ Acrylic sheets are ordered cut-to-size from [TAP Plastics](https://www.tapplasti
 
 ## 🖨️ 3D Printed Enclosure
 
-The filming box consists of 3D-printed parts. STL files are in [`hardware/stl/`](/rslivicki/PixelPaws/blob/master/hardware/stl).
+The filming box consists of 3D-printed parts. STL files are in [`hardware/stl/`](/hardware/stl).
 
 | File | Description |
 | --- | --- |
