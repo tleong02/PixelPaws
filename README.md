@@ -10,7 +10,10 @@ Example of automated behavior scoring using a scratching classifier. Behavior de
 
 
 
-<video src="https://github.com/user-attachments/assets/5d22121a-40f9-4f8b-ba33-a168fdc95fca" controls width="720"></video>
+
+
+
+<video src="https://github.com/user-attachments/assets/e0a584de-79b6-440f-a04d-0090ccbda179" controls width="720"></video>
 
 ---
 
