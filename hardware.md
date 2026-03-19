@@ -136,6 +136,18 @@ The filming box consists of 3D-printed parts. STL files are in [`hardware/stl/`]
 * LED strips are cuttable every **3 LEDs (~50 mm)**. Cut only along marked cut lines.
 * The 850 nm IR LEDs emit **invisible light** — do not use for visible accent lighting.
 
+### Soldering LED Strip Segments
+
+LED strips are sold in rolls and must be cut to length along the marked cut lines. To form the enclosure lighting layout you will need to solder cut segments back together.
+
+1. **Match polarity.** Each cut point exposes solder pads marked `+` and `−`. Always connect `+` to `+` and `−` to `−` across segments.
+2. **Bridge with short wires.** Use 2–4 cm lengths of **22 AWG silicone-jacketed wire** to connect segments at corners or across gaps in the enclosure frame.
+3. **Tin first.** Apply a small bead of solder to each pad and to each wire end before joining them. This makes the final joint faster and cleaner.
+4. **Solder type.** Use **lead-free rosin-core solder** (e.g., Sn99.3/Cu0.7, 0.8 mm diameter).
+5. **Insulate joints.** Slide heat-shrink tubing over the wire before soldering, then shrink it over the finished joint with a heat gun. Electrical tape works in a pinch but is less durable.
+
+> **Tip:** A pair of helping-hands clips or a small vise makes it much easier to hold strip segments flat while soldering.
+
 ---
 
 ## 📐 Camera Specifications (Detail)
