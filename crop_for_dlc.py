@@ -366,6 +366,7 @@ class CropForDLCApp:
     # ------------------------------------------------------------------
 
     def _build_ui(self):
+        self._batch_crops = {}   # video_path → (x, y, w, h) for per-video interactive selections
         pad = dict(padx=8, pady=4)
 
         # ---- File selection ----
@@ -501,13 +502,15 @@ class CropForDLCApp:
         self.log.pack(fill="both", expand=True, padx=4, pady=4)
 
     def _on_mode_change(self):
-        pass  # could adjust label text; kept simple
+        self._batch_crops = {}
+        self.duration_label.config(text="")
 
     # ------------------------------------------------------------------
     # Browse helpers
     # ------------------------------------------------------------------
 
     def _on_video_changed(self, *_):
+        self._batch_crops = {}
         path = self.video_var.get().strip()
         if os.path.isfile(path):
             threading.Thread(target=self._load_duration, args=(path,), daemon=True).start()
@@ -558,6 +561,104 @@ class CropForDLCApp:
 
     def _preview_and_select(self):
         video = self.video_var.get().strip()
+
+        # --- Batch mode ---
+        if self.mode_var.get() == "batch":
+            if not video or not os.path.isdir(video):
+                messagebox.showwarning("No folder",
+                                       "Please select a folder first.")
+                return
+            video_exts = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+            videos = sorted(f for f in Path(video).iterdir()
+                            if f.is_file() and f.suffix.lower() in video_exts)
+            if not videos:
+                messagebox.showwarning("No videos",
+                                       f"No video files found in:\n{video}")
+                return
+
+            choice = messagebox.askyesnocancel(
+                "Batch Crop Selection",
+                f"Found {len(videos)} video(s).\n\n"
+                "Yes  →  Same crop for all (select on first video)\n"
+                "No   →  Select crop per video individually\n"
+                "Cancel  →  Abort",
+            )
+
+            if choice is None:  # Cancel
+                return
+
+            if choice:  # Yes — same crop for all
+                self._batch_crops = {}
+                self._log(f"Opening first video for crop selection: {videos[0].name}")
+                try:
+                    result = select_crop_interactive(str(videos[0]))
+                except Exception as exc:
+                    self._log(f"Error during preview: {exc}")
+                    messagebox.showerror("Preview Error", str(exc))
+                    return
+                if result is None:
+                    self._log("Preview cancelled — crop params unchanged.")
+                    return
+                x, y, w, h = result
+                self.x_var.set(x)
+                self.y_var.set(y)
+                self.w_var.set(w)
+                self.h_var.set(h)
+                self._log(f"Uniform crop selected: x={x}  y={y}  w={w}  h={h}")
+                self.duration_label.config(
+                    text=f"Uniform crop set for {len(videos)} video(s)")
+            else:  # No — per video
+                self._batch_crops = {}
+                self._log(f"Per-video crop selection: {len(videos)} video(s)")
+                for i, vp in enumerate(videos):
+                    self.root.title(
+                        f"Crop Selection — Video {i + 1}/{len(videos)} — {vp.name}")
+                    self._log(f"  [{i + 1}/{len(videos)}] {vp.name}")
+                    try:
+                        result = select_crop_interactive(str(vp))
+                    except Exception as exc:
+                        self._log(f"  Error: {exc}")
+                        messagebox.showerror("Preview Error", str(exc))
+                        continue
+                    if result is None:
+                        # User cancelled this video — ask whether to stop
+                        if i == 0:
+                            stop = messagebox.askyesno(
+                                "Cancel",
+                                "Cancelled on first video. Abort per-video selection?")
+                            if stop:
+                                self._batch_crops = {}
+                                self._log("Per-video selection cancelled.")
+                                break
+                            continue
+                        stop = messagebox.askyesno(
+                            "Cancelled",
+                            f"Skipped {vp.name}.\n\n"
+                            f"Crops stored so far: {len(self._batch_crops)}/{len(videos)}\n\n"
+                            "Yes  →  Stop here and keep what you have\n"
+                            "No   →  Continue with remaining videos",
+                        )
+                        if stop:
+                            break
+                        continue
+                    bx, by, bw, bh = result
+                    self._batch_crops[str(vp)] = (bx, by, bw, bh)
+                    # Update spinboxes to the last-selected values
+                    self.x_var.set(bx)
+                    self.y_var.set(by)
+                    self.w_var.set(bw)
+                    self.h_var.set(bh)
+
+                self.root.title("PixelPaws — Crop Video for DLC")
+                n = len(self._batch_crops)
+                m = len(videos)
+                self._log(f"Per-video crops set for {n}/{m} video(s). "
+                          "Click 'Crop Video(s)' to encode.")
+                self.duration_label.config(
+                    text=f"Per-video crops: {n}/{m} video(s)")
+            return
+
+        # --- Single mode ---
         if not video or not os.path.isfile(video):
             messagebox.showwarning("No video", "Please select a video file first.")
             return
@@ -767,43 +868,59 @@ class CropForDLCApp:
                     log(f"No video files found in: {video}")
                     return
 
-                log(f"Found {len(videos)} video(s) — confirm crops before encoding starts.")
+                log(f"Found {len(videos)} video(s).")
 
-                # --- Phase 1: collect decisions for all videos up front ---
-                # Each dialog starts with the params from the previous dialog so
-                # any per-video adjustment carries forward automatically.
-                plan = []   # list of (video_path, decision, cx, cy, cw, ch)
-                cur_x, cur_y, cur_w, cur_h = x, y, w, h
-                for vp in videos:
-                    result_holder = [None]
-                    ev = threading.Event()
-                    self.root.after(
-                        0, self._ask_batch_confirm,
-                        str(vp), cur_x, cur_y, cur_w, cur_h, result_holder, ev,
-                    )
-                    ev.wait()
+                # --- Build encoding plan ---
+                # If per-video crops were set via Preview & Select, use those
+                # directly (skip confirmation dialogs for those videos).
+                batch_crops = dict(self._batch_crops)  # snapshot
+                to_encode = []
+                need_confirm = []
 
-                    decision, cx, cy, cw, ch = result_holder[0]
-                    plan.append((vp, decision, cx, cy, cw, ch))
+                if batch_crops:
+                    for vp in videos:
+                        key = str(vp)
+                        if key in batch_crops:
+                            cx, cy, cw, ch = batch_crops[key]
+                            to_encode.append((vp, cx, cy, cw, ch))
+                        else:
+                            need_confirm.append(vp)
+                    if need_confirm:
+                        log(f"{len(to_encode)} video(s) have per-video crops; "
+                            f"{len(need_confirm)} still need confirmation.")
+                else:
+                    need_confirm = list(videos)
 
-                    if decision == "cancel":
-                        log("Batch cancelled — no files encoded.")
-                        return
+                # --- Phase 1: confirmation dialogs for remaining videos ---
+                if need_confirm:
+                    log(f"Confirm crops for {len(need_confirm)} video(s)…")
+                    cur_x, cur_y, cur_w, cur_h = x, y, w, h
+                    for vp in need_confirm:
+                        result_holder = [None]
+                        ev = threading.Event()
+                        self.root.after(
+                            0, self._ask_batch_confirm,
+                            str(vp), cur_x, cur_y, cur_w, cur_h, result_holder, ev,
+                        )
+                        ev.wait()
 
-                    # Carry the (possibly edited) params forward to the next dialog
-                    cur_x, cur_y, cur_w, cur_h = cx, cy, cw, ch
+                        decision, cx, cy, cw, ch = result_holder[0]
 
-                # --- Phase 2: encode confirmed videos ---
-                to_encode = [(vp, cx, cy, cw, ch)
-                             for vp, dec, cx, cy, cw, ch in plan if dec == "crop"]
-                skipped   = [vp.name for vp, dec, *_ in plan if dec == "skip"]
+                        if decision == "cancel":
+                            log("Batch cancelled — no files encoded.")
+                            return
+                        elif decision == "crop":
+                            to_encode.append((vp, cx, cy, cw, ch))
+                        else:
+                            log(f"  Skipping: {vp.name}")
 
-                if skipped:
-                    log(f"Skipping {len(skipped)} video(s): {', '.join(skipped)}")
+                        cur_x, cur_y, cur_w, cur_h = cx, cy, cw, ch
+
                 if not to_encode:
                     log("Nothing to encode.")
                     return
 
+                # --- Phase 2: encode ---
                 log(f"Starting encoding: {len(to_encode)} video(s)…")
                 n_enc = len(to_encode)
                 for i, (vp, cx, cy, cw, ch) in enumerate(to_encode):

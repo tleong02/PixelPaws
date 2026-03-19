@@ -37,6 +37,13 @@ try:
 except ImportError:
     plt = None
 
+try:
+    from feature_cache import FeatureCacheManager
+    _FEATURE_CACHE_AVAILABLE = True
+except ImportError:
+    FeatureCacheManager = None
+    _FEATURE_CACHE_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Helper — applies the same bout-filtering rules as the prediction pipeline
@@ -62,7 +69,7 @@ def _apply_bout_filtering(y_pred, min_bout, min_after_bout, max_gap):
     # --- max_gap: bridge short gaps between bouts ---
     if max_gap > 0:
         i = 0
-        while i < len(y_filtered) - max_gap:
+        while i < len(y_filtered):
             if y_filtered[i] == 1:
                 gap_start = i + 1
                 while gap_start < len(y_filtered) and y_filtered[gap_start] == 0:
@@ -573,10 +580,18 @@ class EvaluationTab(ttk.Frame):
 
     def _log(self, msg):
         """Thread-safe append to the results text box."""
-        self.root.after(0, lambda m=msg: (
+        self._safe_after(lambda m=msg: (
             self.eval_results_text.insert(tk.END, m + '\n'),
             self.eval_results_text.see(tk.END)
         ))
+
+    def _safe_after(self, callback):
+        """Schedule *callback* on the main thread, swallowing errors if the
+        window has been destroyed (e.g. user closed it during evaluation)."""
+        try:
+            self.root.after(0, callback)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def _evaluation_thread(self):
         """
@@ -602,7 +617,7 @@ class EvaluationTab(ttk.Frame):
             return
 
         try:
-            self.root.after(0, lambda: self.eval_results_text.delete('1.0', tk.END))
+            self._safe_after(lambda: self.eval_results_text.delete('1.0', tk.END))
             self._log('=' * 60)
             self._log('PixelPaws Classifier Evaluation')
             self._log('=' * 60)
@@ -655,7 +670,7 @@ class EvaluationTab(ttk.Frame):
             sessions = self._find_sessions()
             if not sessions:
                 self._log('✗ No complete sessions found (need video + DLC .h5 + _labels.csv).')
-                self.root.after(0, lambda: messagebox.showerror(
+                self._safe_after(lambda: messagebox.showerror(
                     'No Sessions',
                     'No complete test sessions found.\n\n'
                     'Each session needs:\n'
@@ -735,28 +750,36 @@ class EvaluationTab(ttk.Frame):
                 _cache_fname = f'{base_name}_features_{cfg_hash}.pkl'
                 cache_file = os.path.join(cache_dir, _cache_fname)
 
-                # If not in canonical location, search fallback dirs (legacy + ancestor walk)
+                # If not in canonical location, search fallback dirs
                 if not os.path.isfile(cache_file):
-                    _fallback_locs = [
-                        os.path.join(video_dir, 'PredictionCache', _cache_fname),
-                        os.path.join(video_dir, 'FeatureCache', _cache_fname),
-                        os.path.join(video_dir, _cache_fname),
-                    ]
-                    _ancestor = video_dir
-                    while True:
-                        _parent = os.path.dirname(_ancestor)
-                        if _parent == _ancestor:
-                            break
-                        _ancestor = _parent
-                        _fallback_locs.append(os.path.join(_ancestor, 'features', _cache_fname))
-                        _fallback_locs.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
-                        if pf and os.path.normpath(_ancestor) == os.path.normpath(pf):
-                            break
-                    for _loc in _fallback_locs:
-                        if os.path.isfile(_loc):
-                            cache_file = _loc
-                            self._log(f'  [Cache] Found in fallback: {_loc}')
-                            break
+                    if _FEATURE_CACHE_AVAILABLE:
+                        _found = FeatureCacheManager.find_cache(
+                            base_name, cfg_hash, cache_dir, video_dir,
+                            project_root=pf)
+                        if _found:
+                            cache_file = _found
+                            self._log(f'  [Cache] Found in fallback: {_found}')
+                    else:
+                        _fallback_locs = [
+                            os.path.join(video_dir, 'PredictionCache', _cache_fname),
+                            os.path.join(video_dir, 'FeatureCache', _cache_fname),
+                            os.path.join(video_dir, _cache_fname),
+                        ]
+                        _ancestor = video_dir
+                        while True:
+                            _parent = os.path.dirname(_ancestor)
+                            if _parent == _ancestor:
+                                break
+                            _ancestor = _parent
+                            _fallback_locs.append(os.path.join(_ancestor, 'features', _cache_fname))
+                            _fallback_locs.append(os.path.join(_ancestor, 'FeatureCache', _cache_fname))
+                            if pf and os.path.normpath(_ancestor) == os.path.normpath(pf):
+                                break
+                        for _loc in _fallback_locs:
+                            if os.path.isfile(_loc):
+                                cache_file = _loc
+                                self._log(f'  [Cache] Found in fallback: {_loc}')
+                                break
 
                 if os.path.isfile(cache_file):
                     self._log('  Loading cached features…')
@@ -786,8 +809,20 @@ class EvaluationTab(ttk.Frame):
                             crop_offset_y=crop_y,
                             config_yaml_path=dlc_config_path or None,
                         )
-                        with open(cache_file, 'wb') as f:
-                            pickle.dump(X, f)
+                        # Atomic write to prevent corruption on crash
+                        import tempfile
+                        _dir = os.path.dirname(cache_file) or '.'
+                        _fd, _tmp = tempfile.mkstemp(dir=_dir, suffix='.tmp')
+                        try:
+                            with os.fdopen(_fd, 'wb') as f:
+                                pickle.dump(X, f)
+                            os.replace(_tmp, cache_file)
+                        except BaseException:
+                            try:
+                                os.unlink(_tmp)
+                            except OSError:
+                                pass
+                            raise
                         self._log(
                             f'  ✓ Features extracted & cached: '
                             f'{X.shape[0]} frames, {X.shape[1]} features')
@@ -935,7 +970,7 @@ class EvaluationTab(ttk.Frame):
                     self._log(f'⚠️  Could not generate plots: {e}')
 
             self._log('\n✓ Evaluation complete!')
-            self.root.after(0, lambda: messagebox.showinfo(
+            self._safe_after(lambda: messagebox.showinfo(
                 'Evaluation Complete',
                 f'Evaluated {len(per_video_results)} session(s).\n\n'
                 f'Overall F1:        {ov_f1:.4f}\n'
@@ -947,7 +982,7 @@ class EvaluationTab(ttk.Frame):
         except Exception as e:
             err = traceback.format_exc()
             self._log(f'\n✗ ERROR:\n{err}')
-            self.root.after(0, lambda: messagebox.showerror(
+            self._safe_after(lambda: messagebox.showerror(
                 'Evaluation Error', f'Evaluation failed:\n\n{str(e)}'))
 
     @staticmethod
@@ -981,15 +1016,19 @@ class EvaluationTab(ttk.Frame):
         """
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle(f'Evaluation — {behavior_name}', fontsize=13, fontweight='bold')
+        for a in axes:
+            a.spines['top'].set_visible(False)
+            a.spines['right'].set_visible(False)
+        axes[1].yaxis.grid(True, alpha=0.3, linestyle='--')
 
         # Confusion matrix
         ax = axes[0]
         if cm is not None and cm.size == 4:
             im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
             fig.colorbar(im, ax=ax)
-            ax.set_xlabel('Predicted label')
-            ax.set_ylabel('True label')
-            ax.set_title('Confusion Matrix (aggregate)')
+            ax.set_xlabel('Predicted label', fontsize=12)
+            ax.set_ylabel('True label', fontsize=12)
+            ax.set_title('Confusion Matrix (aggregate)', fontsize=13, fontweight='bold')
             ax.set_xticks([0, 1])
             ax.set_yticks([0, 1])
             ax.set_xticklabels(['0 (no)', '1 (yes)'])
@@ -1016,11 +1055,11 @@ class EvaluationTab(ttk.Frame):
             ax2.bar(x,     precs, width=w, label='Precision', color='darkorange')
             ax2.bar(x + w, recs,  width=w, label='Recall',    color='seagreen')
             ax2.set_xticks(x)
-            ax2.set_xticklabels(names, rotation=30, ha='right', fontsize=8)
+            ax2.set_xticklabels(names, rotation=30, ha='right', fontsize=9)
             ax2.set_ylim(0, 1.05)
-            ax2.set_ylabel('Score')
-            ax2.set_title('Per-video Performance')
-            ax2.legend()
+            ax2.set_ylabel('Score', fontsize=12)
+            ax2.set_title('Per-video Performance', fontsize=13, fontweight='bold')
+            ax2.legend(fontsize=10)
             if f1s:
                 ax2.axhline(y=np.mean(f1s), color='steelblue',
                             linestyle='--', alpha=0.5)
@@ -1031,7 +1070,7 @@ class EvaluationTab(ttk.Frame):
         plt.tight_layout()
         plot_path = os.path.join(
             output_folder, f'evaluation_plots_{behavior_name}.png')
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         self._log(f'  ✓ {os.path.basename(plot_path)}')
 
@@ -1121,7 +1160,7 @@ class EvaluationTab(ttk.Frame):
             import matplotlib.pyplot as mpl_plt
 
             def _log_shap(msg):
-                self.root.after(0, lambda m=msg: (
+                self._safe_after(lambda m=msg: (
                     self.eval_results_text.insert(tk.END, m + '\n'),
                     self.eval_results_text.see(tk.END)
                 ))
@@ -1141,14 +1180,14 @@ class EvaluationTab(ttk.Frame):
                                      (X.columns.tolist() if hasattr(X, 'columns') else None))
                     _log_shap(f'✓ Using training data from classifier ({len(X)} samples)')
                 else:
-                    self.root.after(0, lambda: messagebox.showerror(
+                    self._safe_after(lambda: messagebox.showerror(
                         'Error', 'No training data found in classifier file.'))
                     return
 
             elif source == 'test':
                 test_folder = self.eval_test_folder.get()
                 if not test_folder:
-                    self.root.after(0, lambda: messagebox.showerror(
+                    self._safe_after(lambda: messagebox.showerror(
                         'Error', 'No test folder specified.'))
                     return
                 for dirpath, _, files in os.walk(test_folder):
@@ -1165,7 +1204,7 @@ class EvaluationTab(ttk.Frame):
                     if X is not None:
                         break
                 if X is None:
-                    self.root.after(0, lambda: messagebox.showerror(
+                    self._safe_after(lambda: messagebox.showerror(
                         'Error', 'No feature .pkl files found in test folder.'))
                     return
 
@@ -1185,7 +1224,7 @@ class EvaluationTab(ttk.Frame):
                             X = data['X_train']
                             feature_names = data.get('feature_names')
                         else:
-                            self.root.after(0, lambda ks=list(data.keys()):
+                            self._safe_after(lambda ks=list(data.keys()):
                                 messagebox.showerror(
                                     'Error',
                                     f'Unknown dict format. Keys: {ks}\n\n'
@@ -1195,7 +1234,7 @@ class EvaluationTab(ttk.Frame):
                         X = data
                     _log_shap(f'✓ Loaded features from: {os.path.basename(file_path)}')
                 except Exception as e:
-                    self.root.after(0, lambda: messagebox.showerror(
+                    self._safe_after(lambda: messagebox.showerror(
                         'Error', f'Failed to load features:\n{e}'))
                     return
 
@@ -1218,7 +1257,7 @@ class EvaluationTab(ttk.Frame):
                 X = X[numeric_cols]
 
             if X.shape[1] == 0:
-                self.root.after(0, lambda: messagebox.showerror(
+                self._safe_after(lambda: messagebox.showerror(
                     'Error', 'No numeric features found in the selected data.'))
                 return
 
@@ -1230,7 +1269,7 @@ class EvaluationTab(ttk.Frame):
                 _log_shap(f'Using {n_samples} random samples')
 
             _log_shap('\nComputing SHAP values (this may take a minute)…')
-            self.root.after(0, lambda: self.eval_results_text.see(tk.END))
+            self._safe_after(lambda: self.eval_results_text.see(tk.END))
 
             explainer   = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X)
@@ -1250,7 +1289,7 @@ class EvaluationTab(ttk.Frame):
             shap.summary_plot(shap_values, X, plot_type='bar', show=False)
             mpl_plt.tight_layout()
             mpl_plt.savefig(os.path.join(output_dir, '1_feature_importance.png'),
-                            dpi=150, bbox_inches='tight')
+                            dpi=300, bbox_inches='tight')
             mpl_plt.close()
             _log_shap('✓ Feature importance plot saved')
 
@@ -1259,7 +1298,7 @@ class EvaluationTab(ttk.Frame):
             shap.summary_plot(shap_values, X, show=False)
             mpl_plt.tight_layout()
             mpl_plt.savefig(os.path.join(output_dir, '2_feature_effects_beeswarm.png'),
-                            dpi=150, bbox_inches='tight')
+                            dpi=300, bbox_inches='tight')
             mpl_plt.close()
             _log_shap('✓ Feature effects plot saved')
 
@@ -1276,7 +1315,7 @@ class EvaluationTab(ttk.Frame):
                 safe = fname_feat[:30].replace(os.sep, '_')
                 mpl_plt.savefig(os.path.join(
                     output_dir, f'3_dependence_{i:02d}_{safe}.png'),
-                    dpi=150, bbox_inches='tight')
+                    dpi=300, bbox_inches='tight')
                 mpl_plt.close()
                 if i % 3 == 0:
                     _log_shap(f'✓ Dependence plots: {i}/10 done')
@@ -1303,7 +1342,7 @@ class EvaluationTab(ttk.Frame):
             _log_shap(f'Results saved to:\n{output_dir}')
             _log_shap(f"{'=' * 60}")
 
-            self.root.after(0, lambda: messagebox.showinfo(
+            self._safe_after(lambda: messagebox.showinfo(
                 'SHAP Analysis Complete',
                 f'Results saved to:\n{output_dir}\n\n'
                 'Files generated:\n'
@@ -1313,6 +1352,6 @@ class EvaluationTab(ttk.Frame):
                 '  • SHAP_report.txt'))
 
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror(
+            self._safe_after(lambda: messagebox.showerror(
                 'SHAP Error', f'Error during SHAP analysis:\n\n{str(e)}'))
             traceback.print_exc()

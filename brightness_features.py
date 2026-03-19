@@ -71,7 +71,9 @@ class PixelBrightnessExtractorOptimized:
                                     create_video: bool = False,
                                     optical_flow_extractor=None,
                                     stride: int = 1,
-                                    frame_mask=None) -> pd.DataFrame:
+                                    frame_mask=None,
+                                    cancel_flag=None,
+                                    frame_callback=None) -> pd.DataFrame:
         """
         Extract brightness features using optimized CPU processing.
 
@@ -121,6 +123,8 @@ class PixelBrightnessExtractorOptimized:
             optical_flow_extractor=optical_flow_extractor,
             stride=stride,
             frame_mask=frame_mask,
+            cancel_flag=cancel_flag,
+            frame_callback=frame_callback,
         )
         
         # Calculate absolute first derivative (temporal changes)
@@ -143,7 +147,9 @@ class PixelBrightnessExtractorOptimized:
                            frame_width, frame_height, num_frames,
                            optical_flow_extractor=None,
                            stride: int = 1,
-                           frame_mask=None):
+                           frame_mask=None,
+                           cancel_flag=None,
+                           frame_callback=None):
         """
         Vectorized extraction - pre-allocate arrays and minimize Python loops
         """
@@ -227,6 +233,9 @@ class PixelBrightnessExtractorOptimized:
                         'prob': np.zeros(num_frames, dtype=np.float32)
                     }
             else:
+                import warnings
+                warnings.warn(f"Brightness features: body part '{bp}' not found in DLC columns. "
+                              f"Using zero coordinates — features for this body part will be invalid.")
                 print(f"  ✗ Could not find columns for bodypart: {bp}")
                 print(f"     Looking for variations of: {bp}_x, {bp}_y, {bp}_prob")
                 coords[bp] = {
@@ -257,6 +266,9 @@ class PixelBrightnessExtractorOptimized:
 
         # Process frames
         for i_frame in range(num_frames):
+            if cancel_flag is not None and cancel_flag.is_set():
+                cap.release()
+                raise InterruptedError("Brightness extraction cancelled.")
             # Determine whether to skip this frame (grab only, no decode)
             skip = (i_frame % stride != 0) or (
                 frame_mask is not None
@@ -275,6 +287,10 @@ class PixelBrightnessExtractorOptimized:
 
             # uint8 grayscale — used as-is for Lucas-Kanade
             gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Per-frame callback (e.g. contour extraction piggy-backing on this pass)
+            if frame_callback is not None:
+                frame_callback(i_frame, gray_u8, frame)
 
             # float32 copy for brightness (with threshold applied)
             frame_gray = gray_u8.astype(np.float32)
@@ -317,7 +333,7 @@ class PixelBrightnessExtractorOptimized:
                     bp1 = self.bodyparts_to_track[i]
                     bp2 = self.bodyparts_to_track[j]
                     ratio = brightness_values[i] / max(brightness_values[j], 1e-10)
-                    bp_data[f'Log10(Pix_{bp1}/Pix_{bp2})'] = np.log10(ratio)
+                    bp_data[f'Log10(Pix_{bp1}/Pix_{bp2})'] = np.log10(max(ratio, 1e-10))
 
             # Optical flow — same frame, no extra video read
             if optical_flow_extractor is not None and prev_gray_u8 is not None:

@@ -98,6 +98,9 @@ class OpticalFlowExtractor:
             if p < self.min_prob:
                 result[bp] = {'mag': 0.0, 'x': 0.0, 'y': 0.0}
                 continue
+            if prev_idx >= len(self._coords[bp]['x']) or prev_idx >= len(self._coords[bp]['y']):
+                result[bp] = {'mag': 0.0, 'x': 0.0, 'y': 0.0}
+                continue
             x0 = float(self._coords[bp]['x'][prev_idx])
             y0 = float(self._coords[bp]['y'][prev_idx])
             if np.isnan(x0) or np.isnan(y0):

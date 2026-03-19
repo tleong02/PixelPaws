@@ -138,7 +138,7 @@ class BehaviorClassifier:
             print(f"  Positive rate: {np.mean(y_balanced):.3f}")
         
         # Calculate scale_pos_weight for XGBoost
-        scale_pos_weight = (len(y_balanced) - np.sum(y_balanced)) / np.sum(y_balanced)
+        scale_pos_weight = (len(y_balanced) - np.sum(y_balanced)) / max(np.sum(y_balanced), 1)
         
         # Create model
         self.model = self._create_model(scale_pos_weight)
@@ -479,9 +479,21 @@ class BehaviorClassifier:
             model_data.update(metadata)
         
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
+
+        # Atomic write: temp file → rename to prevent corruption on crash
+        import tempfile
+        dir_path = os.path.dirname(filepath) or '.'
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix='.tmp')
+        try:
+            with os.fdopen(tmp_fd, 'wb') as f:
+                pickle.dump(model_data, f)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         
         print(f"Model saved to: {filepath}")
     

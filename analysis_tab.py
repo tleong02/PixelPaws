@@ -128,6 +128,8 @@ class AnalysisTab(ttk.Frame):
         self.key_file_combo.pack(side='left', padx=5)
         self.key_file_combo.bind('<<ComboboxSelected>>', self._on_key_file_combo_selected)
         ttk.Button(key_frame, text="Browse", command=self.browse_key_file).pack(side='left')
+        ttk.Button(key_frame, text="Generate…",
+                   command=self.generate_key_file).pack(side='left', padx=(4, 0))
 
         ttk.Label(
             frame,
@@ -277,7 +279,19 @@ class AnalysisTab(ttk.Frame):
         ttk.Radiobutton(alpha_frame, text="p < 0.05", variable=self.stats_alpha_var, value=0.05).pack(side='left', padx=5)
         ttk.Radiobutton(alpha_frame, text="p < 0.01", variable=self.stats_alpha_var, value=0.01).pack(side='left', padx=5)
         ttk.Radiobutton(alpha_frame, text="p < 0.001", variable=self.stats_alpha_var, value=0.001).pack(side='left', padx=5)
-        
+
+        # Paradigm
+        par_frame = ttk.Frame(self.stats_settings_frame)
+        par_frame.pack(fill='x', pady=5)
+        ttk.Label(par_frame, text="Paradigm:", width=15).pack(side='left')
+        self.stats_paradigm_var = tk.StringVar(value='parametric')
+        ttk.Radiobutton(par_frame, text="Parametric",
+                        variable=self.stats_paradigm_var, value='parametric').pack(anchor='w', padx=20)
+        ttk.Radiobutton(par_frame, text="Non-parametric",
+                        variable=self.stats_paradigm_var, value='nonparametric').pack(anchor='w', padx=20)
+        ttk.Radiobutton(par_frame, text="Auto (Shapiro-Wilk)",
+                        variable=self.stats_paradigm_var, value='auto').pack(anchor='w', padx=20)
+
         # Time course specific option
         ttk.Separator(self.stats_settings_frame, orient='horizontal').pack(fill='x', pady=5)
         ttk.Label(self.stats_settings_frame, text="Time Course Options:", font=('Arial', 9, 'bold')).pack(anchor='w')
@@ -456,11 +470,72 @@ class AnalysisTab(ttk.Frame):
                 ("All files", "*.*")
             ]
         )
-        
+
         if filepath:
             self.key_file_var.set(filepath)
             self.load_key_file(filepath)
-    
+
+    def generate_key_file(self):
+        """Open KeyFileGeneratorDialog to create a key_file.csv for this project."""
+        try:
+            from project_setup import KeyFileGeneratorDialog
+        except ImportError:
+            messagebox.showerror("Unavailable",
+                                 "project_setup.py not found — cannot open key file generator.")
+            return
+
+        folder = getattr(self.main_gui, 'current_project_folder', None)
+        folder = folder.get() if folder else ''
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("No Project",
+                                   "Please open a project first so PixelPaws knows "
+                                   "where to find your videos and save the key file.")
+            return
+
+        # Collect video basenames from videos/ folder
+        import glob as _g
+        videos_dir = os.path.join(folder, 'videos')
+        _seen = {}
+        for ext in ('.mp4', '.avi', '.mov', '.wmv', '.MP4', '.AVI', '.MOV', '.WMV'):
+            for vf in _g.glob(os.path.join(videos_dir, f'*{ext}')):
+                _seen[os.path.normcase(vf)] = vf
+        basenames = [os.path.splitext(os.path.basename(v))[0]
+                     for v in sorted(_seen.values())]
+        if not basenames:
+            messagebox.showinfo("No Videos",
+                                "No video files found in videos/.\n"
+                                "Add your videos first, then generate the key file.")
+            return
+
+        # Pre-populate from existing key file if present
+        existing = {}
+        key_path = os.path.join(folder, 'key_file.csv')
+        if os.path.isfile(key_path):
+            try:
+                import csv
+                with open(key_path, newline='') as f:
+                    for row in csv.DictReader(f):
+                        s = row.get('Subject', '').strip()
+                        t = row.get('Treatment', '').strip()
+                        if s:
+                            existing[s] = t
+            except Exception:
+                pass
+
+        def _on_save(data):
+            # data = {Subject: Treatment}
+            if hasattr(self.main_gui, 'key_file_data'):
+                self.main_gui.key_file_data = data
+            # Auto-load into this tab
+            saved_path = os.path.join(folder, 'key_file.csv')
+            if os.path.isfile(saved_path):
+                self.key_file_var.set(saved_path)
+                self.load_key_file(saved_path)
+
+        KeyFileGeneratorDialog(
+            self.winfo_toplevel(), folder, basenames,
+            existing_groups=existing, on_save=_on_save)
+
     def load_key_file(self, filepath):
         """Load and validate key file"""
         try:
@@ -578,8 +653,8 @@ class AnalysisTab(ttk.Frame):
                         folder_ok = True
                     else:
                         print(f"[scan] skipped {os.path.basename(fpath)} — columns: {sorted(cols)}")
-                except Exception:
-                    pass
+                except Exception as _csv_err:
+                    print(f"Warning: could not read CSV {os.path.basename(fpath)}: {_csv_err}")
             if folder_ok:
                 pred_folders[folder_path] = validated or len(fpaths)
 
@@ -594,8 +669,8 @@ class AnalysisTab(ttk.Frame):
                     cols = pd.read_csv(full_path, nrows=0).columns.tolist()
                 if 'Subject' in cols and 'Treatment' in cols:
                     key_candidates.append(full_path)
-            except Exception:
-                pass
+            except Exception as _key_err:
+                print(f"Warning: could not read key file {os.path.basename(full_path)}: {_key_err}")
 
         # ── Populate predictions dropdown ─────────────────────────────────
         sorted_pred = sorted(pred_folders.items(), key=lambda x: x[1], reverse=True)
@@ -998,9 +1073,18 @@ class AnalysisTab(ttk.Frame):
             self.run_btn.config(state='disabled')
             self.update_idletasks()
             
-            # Get settings
+            # Get settings (with validation)
             bin_size_min = self.bin_size_var.get()
+            if bin_size_min <= 0:
+                messagebox.showwarning("Invalid Bin Size",
+                                       "Bin size must be a positive number.")
+                self.run_btn.config(state='normal')
+                return
             fps = self.fps_var.get()
+            if not fps or fps <= 0:
+                fps = 30.0
+                self.fps_var.set(30.0)
+                print("Warning: FPS was 0 or negative, defaulting to 30")
             analysis_mode = self.analyze_mode.get()
             
             # Filter prediction files to only selected behaviors
@@ -2203,46 +2287,62 @@ class AnalysisTab(ttk.Frame):
                             
                             # Perform post-hoc test if we have enough groups
                             if len(groups) >= 2 and all(len(g) > 0 for g in groups):
+                                paradigm = self.stats_paradigm_var.get() if hasattr(self, 'stats_paradigm_var') else 'parametric'
+                                use_param = paradigm != 'nonparametric'
+                                if paradigm == 'auto':
+                                    use_param = all(
+                                        stats.shapiro(g)[1] >= 0.05 for g in groups if len(g) >= 3
+                                    )
+
                                 if len(groups) == 2:
-                                    # t-test for 2 groups (no multiple comparison issue)
-                                    _, p_val = stats.ttest_ind(groups[0], groups[1])
-                                    test_type = 't-test'
+                                    if use_param:
+                                        _, p_val = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+                                        test_type = "Welch's t-test"
+                                    else:
+                                        _, p_val = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+                                        test_type = "Mann-Whitney U"
                                 else:
-                                    # For 3+ groups: First do ANOVA, then Tukey HSD if significant
-                                    f_stat, anova_p = stats.f_oneway(*groups)
-                                    
-                                    print(f"Timepoint {bin_start}: {len(groups)} groups, ANOVA p={anova_p:.4f}")
-                                    
-                                    # If ANOVA is significant, use Tukey HSD for pairwise comparisons
+                                    # For 3+ groups: omnibus test first
+                                    if use_param:
+                                        f_stat, anova_p = stats.f_oneway(*groups)
+                                    else:
+                                        f_stat, anova_p = stats.kruskal(*groups)
+
+                                    print(f"Timepoint {bin_start}: {len(groups)} groups, omnibus p={anova_p:.4f}")
+
                                     if anova_p < alpha:
-                                        try:
-                                            from scipy.stats import tukey_hsd
-                                            # Tukey HSD test for all pairwise comparisons
-                                            res = tukey_hsd(*groups)
-                                            # Get the minimum p-value from all pairwise comparisons
-                                            p_val = res.pvalue.min()
-                                            test_type = 'Tukey HSD'
-                                            print(f"  → Using Tukey HSD, min p={p_val:.4f}")
-                                        except (ImportError, AttributeError) as e:
-                                            print(f"  → Tukey HSD not available ({e}), using Bonferroni")
-                                            # Fallback: Use Bonferroni correction
-                                            # Number of pairwise comparisons
+                                        if use_param:
+                                            try:
+                                                from scipy.stats import tukey_hsd
+                                                res = tukey_hsd(*groups)
+                                                p_val = res.pvalue.min()
+                                                test_type = 'Tukey HSD'
+                                                print(f"  → Using Tukey HSD, min p={p_val:.4f}")
+                                            except (ImportError, AttributeError) as e:
+                                                print(f"  → Tukey HSD not available ({e}), using Bonferroni")
+                                                n_comparisons = len(groups) * (len(groups) - 1) / 2
+                                                bonferroni_alpha = alpha / n_comparisons
+                                                min_p = 1.0
+                                                for i in range(len(groups)):
+                                                    for j in range(i+1, len(groups)):
+                                                        _, p = stats.ttest_ind(groups[i], groups[j], equal_var=False)
+                                                        min_p = min(min_p, p)
+                                                p_val = min_p
+                                                test_type = 'Bonferroni'
+                                                print(f"  → Using Bonferroni, min p={p_val:.4f}")
+                                        else:
+                                            # Non-parametric pairwise: Mann-Whitney with Bonferroni
                                             n_comparisons = len(groups) * (len(groups) - 1) / 2
-                                            bonferroni_alpha = alpha / n_comparisons
-                                            
-                                            # Find minimum p-value from pairwise t-tests
                                             min_p = 1.0
                                             for i in range(len(groups)):
                                                 for j in range(i+1, len(groups)):
-                                                    _, p = stats.ttest_ind(groups[i], groups[j])
+                                                    _, p = stats.mannwhitneyu(groups[i], groups[j], alternative='two-sided')
                                                     min_p = min(min_p, p)
-                                            
                                             p_val = min_p
-                                            test_type = 'Bonferroni'
-                                            print(f"  → Using Bonferroni, min p={p_val:.4f}")
+                                            test_type = 'Mann-Whitney/Bonf'
+                                            print(f"  → Using Mann-Whitney/Bonferroni, min p={p_val:.4f}")
                                     else:
-                                        # ANOVA not significant, skip this timepoint
-                                        print(f"  → ANOVA not significant, skipping")
+                                        print(f"  → Omnibus not significant, skipping")
                                         continue
                                 
                                 # Determine significance marker
@@ -2320,22 +2420,45 @@ class AnalysisTab(ttk.Frame):
                                 group_means.append(np.mean(treat_data))
                         
                         if len(groups) >= 2 and all(len(g) > 0 for g in groups):
+                            paradigm = self.stats_paradigm_var.get() if hasattr(self, 'stats_paradigm_var') else 'parametric'
+                            use_param = paradigm != 'nonparametric'
+                            if paradigm == 'auto':
+                                use_param = all(
+                                    stats.shapiro(g)[1] >= 0.05 for g in groups if len(g) >= 3
+                                )
+
                             if len(groups) == 2:
-                                _, p_val = stats.ttest_ind(groups[0], groups[1])
+                                if use_param:
+                                    _, p_val = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+                                else:
+                                    _, p_val = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
                             else:
-                                # ANOVA first, then Bonferroni-corrected pairwise tests
-                                f_stat, anova_p = stats.f_oneway(*groups)
+                                # Omnibus test first
+                                if use_param:
+                                    f_stat, anova_p = stats.f_oneway(*groups)
+                                else:
+                                    f_stat, anova_p = stats.kruskal(*groups)
                                 if anova_p >= alpha:
-                                    continue  # ANOVA not significant, skip this timepoint
-                                
-                                # Bonferroni correction for multiple pairwise comparisons
-                                n_comparisons = len(groups) * (len(groups) - 1) / 2
-                                min_p = 1.0
-                                for i in range(len(groups)):
-                                    for j in range(i+1, len(groups)):
-                                        _, p = stats.ttest_ind(groups[i], groups[j])
-                                        min_p = min(min_p, p)
-                                p_val = min_p
+                                    continue  # Omnibus not significant, skip this timepoint
+
+                                if use_param:
+                                    # Bonferroni correction for multiple pairwise comparisons
+                                    n_comparisons = len(groups) * (len(groups) - 1) / 2
+                                    min_p = 1.0
+                                    for i in range(len(groups)):
+                                        for j in range(i+1, len(groups)):
+                                            _, p = stats.ttest_ind(groups[i], groups[j], equal_var=False)
+                                            min_p = min(min_p, p)
+                                    p_val = min_p
+                                else:
+                                    # Non-parametric pairwise: Mann-Whitney with Bonferroni
+                                    n_comparisons = len(groups) * (len(groups) - 1) / 2
+                                    min_p = 1.0
+                                    for i in range(len(groups)):
+                                        for j in range(i+1, len(groups)):
+                                            _, p = stats.mannwhitneyu(groups[i], groups[j], alternative='two-sided')
+                                            min_p = min(min_p, p)
+                                    p_val = min_p
                             
                             if p_val < 0.001:
                                 marker = '***'
@@ -3685,8 +3808,10 @@ class AnalysisTab(ttk.Frame):
                  relief='solid', borderwidth=1, width=15).grid(row=0, column=2, sticky='ew', padx=1, pady=1)
         ttk.Label(table_frame, text="p-value", font=('Arial', 9, 'bold'), 
                  relief='solid', borderwidth=1, width=15).grid(row=0, column=3, sticky='ew', padx=1, pady=1)
-        ttk.Label(table_frame, text="Significance", font=('Arial', 9, 'bold'), 
+        ttk.Label(table_frame, text="Significance", font=('Arial', 9, 'bold'),
                  relief='solid', borderwidth=1, width=12).grid(row=0, column=4, sticky='ew', padx=1, pady=1)
+        ttk.Label(table_frame, text="Effect Size", font=('Arial', 9, 'bold'),
+                 relief='solid', borderwidth=1, width=15).grid(row=0, column=5, sticky='ew', padx=1, pady=1)
         
         row_idx = 1
         n_significant = 0
@@ -3706,37 +3831,62 @@ class AnalysisTab(ttk.Frame):
             # Perform test if we have enough groups
             if len(groups) >= 2 and all(len(g) > 0 for g in groups):
                 if len(groups) == 2:
-                    # t-test for 2 groups (no multiple comparison correction needed)
-                    test_stat, p_val = stats.ttest_ind(groups[0], groups[1])
-                    test_name = "t-test (2 groups)"
-                    stat_display = f"t={test_stat:.3f}"
+                    paradigm = self.stats_paradigm_var.get() if hasattr(self, 'stats_paradigm_var') else 'parametric'
+                    use_param = paradigm != 'nonparametric'
+                    if paradigm == 'auto':
+                        use_param = all(
+                            stats.shapiro(g)[1] >= 0.05 for g in groups if len(g) >= 3
+                        )
+                    if use_param:
+                        test_stat, p_val = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+                        test_name = "Welch's t-test (2 groups)"
+                        stat_display = f"t={test_stat:.3f}"
+                    else:
+                        test_stat, p_val = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+                        test_name = "Mann-Whitney U (2 groups)"
+                        stat_display = f"U={test_stat:.3f}"
                 else:
-                    # For 3+ groups: First ANOVA, then Tukey HSD if significant
-                    f_stat, anova_p = stats.f_oneway(*groups)
-                    
-                    if anova_p < alpha:
-                        # ANOVA significant, perform Tukey HSD
-                        try:
-                            from scipy.stats import tukey_hsd
-                            res = tukey_hsd(*groups)
-                            # Get minimum p-value (most significant comparison)
-                            p_val = res.pvalue.min()
-                            test_name = f"Tukey HSD ({len(groups)} groups)"
-                            stat_display = f"q(min)={res.statistic.min():.3f}"
-                        except (ImportError, AttributeError) as e:
-                            # Fallback to Bonferroni correction
-                            print(f"Warning: Tukey HSD not available ({e}), using Bonferroni")
+                    paradigm = self.stats_paradigm_var.get() if hasattr(self, 'stats_paradigm_var') else 'parametric'
+                    use_param = paradigm != 'nonparametric'
+                    if paradigm == 'auto':
+                        use_param = all(
+                            stats.shapiro(g)[1] >= 0.05 for g in groups if len(g) >= 3
+                        )
+                    if use_param:
+                        f_stat, omnibus_p = stats.f_oneway(*groups)
+                    else:
+                        f_stat, omnibus_p = stats.kruskal(*groups)
+
+                    if omnibus_p < alpha:
+                        if use_param:
+                            try:
+                                from scipy.stats import tukey_hsd
+                                res = tukey_hsd(*groups)
+                                p_val = res.pvalue.min()
+                                test_name = f"Tukey HSD ({len(groups)} groups)"
+                                stat_display = f"q(min)={res.statistic.min():.3f}"
+                            except (ImportError, AttributeError) as e:
+                                n_comparisons = len(groups) * (len(groups) - 1) / 2
+                                min_p = 1.0
+                                for i in range(len(groups)):
+                                    for j in range(i+1, len(groups)):
+                                        _, p = stats.ttest_ind(groups[i], groups[j], equal_var=False)
+                                        min_p = min(min_p, p)
+                                p_val = min_p
+                                test_name = f"Bonferroni ({len(groups)} groups)"
+                                stat_display = f"p(min)={min_p:.4f}"
+                        else:
+                            # Non-parametric pairwise: Mann-Whitney with Bonferroni
                             n_comparisons = len(groups) * (len(groups) - 1) / 2
                             min_p = 1.0
                             for i in range(len(groups)):
                                 for j in range(i+1, len(groups)):
-                                    _, p = stats.ttest_ind(groups[i], groups[j])
+                                    _, p = stats.mannwhitneyu(groups[i], groups[j], alternative='two-sided')
                                     min_p = min(min_p, p)
                             p_val = min_p
-                            test_name = f"Bonferroni ({len(groups)} groups)"
+                            test_name = f"Mann-Whitney/Bonf ({len(groups)} groups)"
                             stat_display = f"p(min)={min_p:.4f}"
                     else:
-                        # ANOVA not significant, skip this timepoint
                         continue
                 
                 # Only show if significant
@@ -3774,11 +3924,29 @@ class AnalysisTab(ttk.Frame):
                     ttk.Label(table_frame, text=p_display, 
                              relief='solid', borderwidth=1, width=15).grid(
                         row=row_idx, column=3, sticky='ew', padx=1, pady=1)
-                    ttk.Label(table_frame, text=sig, 
+                    ttk.Label(table_frame, text=sig,
                              relief='solid', borderwidth=1, width=12,
                              foreground=fg, font=('Arial', 9, 'bold')).grid(
                         row=row_idx, column=4, sticky='ew', padx=1, pady=1)
-                    
+
+                    # Effect size
+                    if len(groups) == 2:
+                        n1, n2 = len(groups[0]), len(groups[1])
+                        v1, v2 = np.var(groups[0], ddof=1), np.var(groups[1], ddof=1)
+                        ps = np.sqrt(((n1-1)*v1 + (n2-1)*v2) / (n1+n2-2))
+                        es = abs(np.mean(groups[0]) - np.mean(groups[1])) / ps if ps > 0 else 0
+                        es_text = f"d={es:.3f}"
+                    else:
+                        all_data = np.concatenate(groups)
+                        gm = np.mean(all_data)
+                        ss_b = sum(len(g)*(np.mean(g)-gm)**2 for g in groups)
+                        ss_t = np.sum((all_data - gm)**2)
+                        es = ss_b / ss_t if ss_t > 0 else 0
+                        es_text = f"eta2={es:.3f}"
+                    ttk.Label(table_frame, text=es_text,
+                             relief='solid', borderwidth=1, width=15).grid(
+                        row=row_idx, column=5, sticky='ew', padx=1, pady=1)
+
                     row_idx += 1
         
         if n_significant == 0:
@@ -3942,65 +4110,115 @@ class AnalysisTab(ttk.Frame):
     
     def perform_statistical_test(self, data_by_treatment, treatments):
         """
-        Perform statistical test and return results
-        
+        Perform statistical test and return results.
+
+        Supports parametric (Welch's t-test / ANOVA), non-parametric
+        (Mann-Whitney U / Kruskal-Wallis), and auto mode (Shapiro-Wilk
+        normality check to decide).
+
         Args:
             data_by_treatment: dict {treatment: [values]}
             treatments: list of treatment names
-            
+
         Returns:
-            dict with 'test_type', 'p_value', 'significant', 'pairwise' (if ANOVA)
+            dict with 'test_type', 'p_value', 'significant', 'effect_size',
+            'effect_size_type', and optionally 'pairwise'
         """
         from scipy import stats
-        
+
         if not self.enable_stats_var.get():
             return None
-        
+
         # Get data as lists
         groups = [data_by_treatment[t] for t in treatments]
-        
+
         # Remove empty groups
-        groups = [g for g in groups if len(g) > 0]
-        
-        if len(groups) < 2:
+        valid = [(t, g) for t, g in zip(treatments, groups) if len(g) > 0]
+        if len(valid) < 2:
             return None
-        
+        treatments_valid = [v[0] for v in valid]
+        groups = [v[1] for v in valid]
+
         alpha = self.stats_alpha_var.get()
         test_type = self.stats_test_var.get()
-        
+        paradigm = self.stats_paradigm_var.get() if hasattr(self, 'stats_paradigm_var') else 'parametric'
+
+        # Decide parametric vs non-parametric
+        use_parametric = True
+        if paradigm == 'nonparametric':
+            use_parametric = False
+        elif paradigm == 'auto':
+            # Shapiro-Wilk on each group; if any fails, go non-parametric
+            use_parametric = True
+            for g in groups:
+                if len(g) >= 3:
+                    _, sw_p = stats.shapiro(g)
+                    if sw_p < 0.05:
+                        use_parametric = False
+                        break
+
         # Auto-select test
         if test_type == 'auto':
             test_type = 'ttest' if len(groups) == 2 else 'anova'
-        
+
         results = {'alpha': alpha}
-        
-        if test_type == 'ttest' and len(groups) == 2:
-            # Unpaired t-test
-            t_stat, p_val = stats.ttest_ind(groups[0], groups[1])
-            results['test_type'] = 't-test'
+
+        if (test_type == 'ttest' or len(groups) == 2) and len(groups) == 2:
+            if use_parametric:
+                t_stat, p_val = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+                results['test_type'] = "Welch's t-test"
+            else:
+                t_stat, p_val = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+                results['test_type'] = 'Mann-Whitney U'
             results['p_value'] = p_val
             results['significant'] = p_val < alpha
-            results['comparison'] = f"{treatments[0]} vs {treatments[1]}"
-            
+            results['comparison'] = f"{treatments_valid[0]} vs {treatments_valid[1]}"
+
+            # Cohen's d
+            n1, n2 = len(groups[0]), len(groups[1])
+            var1, var2 = np.var(groups[0], ddof=1), np.var(groups[1], ddof=1)
+            pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+            if pooled_std > 0:
+                cohens_d = abs(np.mean(groups[0]) - np.mean(groups[1])) / pooled_std
+            else:
+                cohens_d = 0.0
+            results['effect_size'] = cohens_d
+            results['effect_size_type'] = "Cohen's d"
+
         elif test_type == 'anova' or len(groups) > 2:
-            # One-way ANOVA
-            f_stat, p_val = stats.f_oneway(*groups)
-            results['test_type'] = 'ANOVA'
+            if use_parametric:
+                f_stat, p_val = stats.f_oneway(*groups)
+                results['test_type'] = 'ANOVA'
+            else:
+                f_stat, p_val = stats.kruskal(*groups)
+                results['test_type'] = 'Kruskal-Wallis'
             results['p_value'] = p_val
             results['significant'] = p_val < alpha
-            
+
+            # Eta-squared
+            all_data = np.concatenate(groups)
+            grand_mean = np.mean(all_data)
+            ss_between = sum(len(g) * (np.mean(g) - grand_mean) ** 2 for g in groups)
+            ss_total = np.sum((all_data - grand_mean) ** 2)
+            eta_sq = ss_between / ss_total if ss_total > 0 else 0.0
+            results['effect_size'] = eta_sq
+            results['effect_size_type'] = 'eta-squared'
+
             # If significant, do pairwise comparisons
             if p_val < alpha:
                 pairwise = {}
-                for i in range(len(treatments)):
-                    for j in range(i+1, len(treatments)):
-                        t_stat, p_pairwise = stats.ttest_ind(groups[i], groups[j])
-                        pairwise[f"{treatments[i]}_vs_{treatments[j]}"] = {
+                for i in range(len(treatments_valid)):
+                    for j in range(i + 1, len(treatments_valid)):
+                        if use_parametric:
+                            _, p_pairwise = stats.ttest_ind(groups[i], groups[j], equal_var=False)
+                        else:
+                            _, p_pairwise = stats.mannwhitneyu(groups[i], groups[j], alternative='two-sided')
+                        pairwise[f"{treatments_valid[i]}_vs_{treatments_valid[j]}"] = {
                             'p_value': p_pairwise,
                             'significant': p_pairwise < alpha
                         }
                 results['pairwise'] = pairwise
-        
+
         return results
     
     def add_significance_markers(self, ax, x_positions, stats_results, treatments, y_max):
@@ -4033,13 +4251,16 @@ class AnalysisTab(ttk.Frame):
         # Position for significance marker
         y_pos = y_max * 1.1
         
-        if stats_results['test_type'] == 't-test':
+        if stats_results['test_type'] in ("Welch's t-test", 't-test', 'Mann-Whitney U'):
             # Simple line between two groups
             x1, x2 = x_positions[0], x_positions[1]
             ax.plot([x1, x2], [y_pos, y_pos], 'k-', linewidth=1.5)
             ax.text((x1 + x2) / 2, y_pos, marker, ha='center', va='bottom', fontsize=12, fontweight='bold')
-            
-        elif stats_results['test_type'] == 'ANOVA' and 'pairwise' in stats_results:
+            if 'effect_size' in stats_results:
+                es_label = f"{stats_results['effect_size_type']}={stats_results['effect_size']:.2f}"
+                ax.text((x1 + x2) / 2, y_pos * 1.15, es_label, ha='center', va='bottom', fontsize=8, color='gray')
+
+        elif stats_results['test_type'] in ('ANOVA', 'Kruskal-Wallis') and 'pairwise' in stats_results:
             # Add pairwise comparison brackets
             pairwise = stats_results['pairwise']
             bracket_height = y_max * 0.05
@@ -4075,8 +4296,14 @@ class AnalysisTab(ttk.Frame):
                                    ha='center', va='bottom', fontsize=10, fontweight='bold')
                             
                             current_y += bracket_height * 2.5
-    
-    
+
+            # Show overall effect size for multi-group
+            if 'effect_size' in stats_results:
+                es_label = f"{stats_results['effect_size_type']}={stats_results['effect_size']:.2f}"
+                ax.text(np.mean(x_positions), current_y, es_label,
+                        ha='center', va='bottom', fontsize=8, color='gray')
+
+
     def export_timecourse_data(self, behavior_name=""):
         """Export time course data to CSV"""
         from tkinter import filedialog
