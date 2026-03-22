@@ -709,10 +709,13 @@ class ProjectSetupWizard(tk.Toplevel):
         self.root.deiconify()
 
     def _on_close(self):
-        """User closed the wizard — shut down the app."""
+        """User closed the wizard — exit at startup, return to main window mid-session."""
         self.grab_release()
         self.destroy()
-        self.root.destroy()
+        if self.root.winfo_viewable():
+            self.root.deiconify()   # mid-session: just go back to main window
+        else:
+            self.root.destroy()     # startup: exit the app
 
 
 # ---------------------------------------------------------------------------

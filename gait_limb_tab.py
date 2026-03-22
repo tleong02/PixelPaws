@@ -20,12 +20,18 @@ Metrics computed per session (and per time bin when requested):
 
 Gait timing metrics (per paw):
   stance_dur, swing_dur, stride_dur, duty_cycle, cadence, n_strides
+  swing_speed (stride_len / swing_dur), stride_cv (coefficient of variation)
+
+Locomotion metrics:
+  body_speed_mean, body_speed_loco
 
 Gait spatial metrics:
   stride_len (per paw), step_len_hind/fore, step_width_hind/fore
 
 Interlimb coordination (if all 4 paws mapped):
-  phase_HL_HR, phase_diagonal
+  phase_HL_HR, phase_diagonal, phase_FL_FR, phase_HL_FL, phase_HR_FR, phase_HL_FR
+  regularity_index, print_position_L/R
+  support_0paw_pct .. support_4paw_pct
 
 Gait symmetry:
   stance_SI_hind, stride_len_SI_hind
@@ -112,13 +118,22 @@ class _ToolTip:
 # Module-level graph helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _p_label(p: float) -> str:
+_SIG_STYLES = {
+    'asterisk': ('*', '**', '***'),
+    'hash':     ('#', '##', '###'),
+    'dagger':   ('\u2020', '\u2020\u2020', '\u2020\u2020\u2020'),
+    'letters':  ('a', 'b', 'c'),
+}
+
+
+def _p_label(p: float, style: str = 'asterisk') -> str:
+    syms = _SIG_STYLES.get(style, _SIG_STYLES['asterisk'])
     if p < 0.001:
-        return '***'
+        return syms[2]
     if p < 0.01:
-        return '**'
+        return syms[1]
     if p < 0.05:
-        return '*'
+        return syms[0]
     return ''
 
 
@@ -168,14 +183,15 @@ class GaitLimbTab(ttk.Frame):
         self._use_likelihood_var = tk.BooleanVar(value=False)
         self._loco_filter_var    = tk.BooleanVar(value=False)
         self._loco_thresh_var    = tk.DoubleVar(value=20.0)
-        self._paw_contour_var    = tk.BooleanVar(value=False)
+        self._paw_contour_var    = tk.BooleanVar(value=True)
         self._contour_forelimbs_var = tk.BooleanVar(value=False)
+        self._min_stance_ms_var  = tk.IntVar(value=100)
         self._fit_thread: threading.Thread = None
         self._cancel_flag = threading.Event()
         self._bodyparts: list = []
         self._last_graph_cfg = None
         self._session_intermediates = {}
-        self._pawlike_thresholds = {'solidity': 0.88, 'aspect_ratio': 5.0, 'circularity': 0.10}
+        self._pawlike_thresholds = {'solidity': 1.00, 'aspect_ratio': 1.6, 'circularity': 0.10}
 
         self._build_ui()
 
@@ -275,13 +291,6 @@ class GaitLimbTab(ttk.Frame):
                                       command=self._cancel_analysis,
                                       state='disabled')
         self._cancel_btn.pack(side='left', padx=2)
-
-        self._progress = ttk.Progressbar(parent, mode='determinate')
-        self._progress.pack(fill='x', padx=2, pady=(0, 2))
-        self._sub_progress = ttk.Progressbar(parent, mode='determinate', length=100)
-        self._sub_progress.pack(fill='x', padx=2, pady=(0, 2))
-        self._sub_progress_label = ttk.Label(parent, text="", font=('TkDefaultFont', 8))
-        self._sub_progress_label.pack(fill='x', padx=2)
 
         # ── Settings notebook ─────────────────────────────────────
         settings_nb = ttk.Notebook(parent)
@@ -576,6 +585,18 @@ class GaitLimbTab(ttk.Frame):
         ttk.Label(cd_lf, text="Min bout (ms):").grid(row=3, column=0, sticky='w', pady=2)
         ttk.Spinbox(cd_lf, from_=0, to=500, textvariable=self._min_bout_var,
                     width=8).grid(row=3, column=1, sticky='w', padx=4, pady=2)
+
+        _msd_lbl = ttk.Label(cd_lf, text="Min stance dur (ms):")
+        _msd_lbl.grid(row=4, column=0, sticky='w', pady=2)
+        _msd_sb = ttk.Spinbox(cd_lf, from_=0, to=500,
+                               textvariable=self._min_stance_ms_var, width=8)
+        _msd_sb.grid(row=4, column=1, sticky='w', padx=4, pady=2)
+        _msd_tip = ("Minimum stance bout duration for gait metrics.\n"
+                     "Stance bouts shorter than this are discarded as\n"
+                     "physiologically implausible (noise).\n"
+                     "Default 100 ms. Set 0 to disable.")
+        self._tip(_msd_lbl, _msd_tip)
+        self._tip(_msd_sb, _msd_tip)
 
         # DLC Confidence Filter
         dlc_lf = ttk.LabelFrame(detect_inner, text="DLC Confidence Filter", padding=5)
@@ -2294,8 +2315,9 @@ class GaitLimbTab(ttk.Frame):
         win.resizable(True, True)
 
         if not per_session:
+            dirs_str = '\n'.join(wb_dirs)
             msg = ("No sessions were found that have BOTH brightness and contour "
-                   f"cache files under:\n{wb_dir}\n\n"
+                   f"cache files under:\n{dirs_str}\n\n"
                    "Use the individual 'Detect cached brightness…' or "
                    "'Detect cached contour…' buttons for sessions with only one type.")
             ttk.Label(win, text=msg, wraplength=860,
@@ -2548,6 +2570,14 @@ class GaitLimbTab(ttk.Frame):
             command=self._open_contact_adjustment, state='disabled')
         self._adjust_contact_btn.pack(side='left', padx=2)
 
+        # ── Key Metrics Summary ───────────────────────────────────
+        self._summary_frame = ttk.LabelFrame(parent, text="Summary", padding=5)
+        self._summary_frame.pack(fill='x', padx=4, pady=(0, 4))
+        self._summary_placeholder = ttk.Label(
+            self._summary_frame, text="No results yet",
+            foreground='grey', font=('TkDefaultFont', 9))
+        self._summary_placeholder.pack(anchor='w')
+
         # Results treeview
         res_lf = ttk.LabelFrame(parent, text="Results", padding=3)
         res_lf.pack(fill='both', expand=True, padx=4, pady=(0, 2))
@@ -2662,14 +2692,95 @@ class GaitLimbTab(ttk.Frame):
 
         # Log
         log_lf = ttk.LabelFrame(parent, text="Log", padding=3)
-        log_lf.pack(fill='x', padx=4, pady=(0, 4))
-        self._log_text = tk.Text(log_lf, height=5, wrap='word',
+        log_lf.pack(fill='x', padx=4, pady=(0, 2))
+        self._log_text = tk.Text(log_lf, height=3, wrap='word',
                                  state='disabled', font=('Consolas', 8))
         log_sb = ttk.Scrollbar(log_lf, orient='vertical',
                                command=self._log_text.yview)
         self._log_text.config(yscrollcommand=log_sb.set)
         self._log_text.pack(side='left', fill='both', expand=True)
         log_sb.pack(side='right', fill='y')
+
+        # ── Progress bar (hidden until analysis runs) ─────────────
+        self._progress_frame = ttk.Frame(parent)
+        # not packed yet — shown/hidden by _start_analysis / _on_analysis_complete
+        self._progress = ttk.Progressbar(self._progress_frame, mode='determinate')
+        self._progress.pack(fill='x', padx=4, pady=(0, 1))
+        self._sub_progress_label = ttk.Label(
+            self._progress_frame, text="", font=('TkDefaultFont', 8))
+        self._sub_progress_label.pack(fill='x', padx=4, pady=(0, 2))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Summary panel refresh
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _refresh_summary_panel(self):
+        """Populate the summary frame with key metrics (mean +/- SEM)."""
+        for w in self._summary_frame.winfo_children():
+            w.destroy()
+
+        if self._summary_df is None or self._summary_df.empty:
+            ttk.Label(self._summary_frame, text="No results yet",
+                      foreground='grey', font=('TkDefaultFont', 9)).pack(anchor='w')
+            return
+
+        df = self._summary_df
+        metrics = [
+            ('WBI hind',   'WBI_hind',              '50 = sym'),
+            ('SI hind',    'SI_hind',                '0 = sym'),
+            ('WBI fore',   'WBI_fore',              '50 = sym'),
+            ('SI fore',    'SI_fore',                '0 = sym'),
+            ('Contact HL', 'contact_pct_HL',         '%'),
+            ('Contact HR', 'contact_pct_HR',         '%'),
+            ('Brt ratio',  'brightness_ratio_HL_HR', '1.0 = sym'),
+        ]
+
+        has_treatment = ('treatment' in df.columns
+                         and df['treatment'].notna().any()
+                         and df['treatment'].ne('').any())
+        if has_treatment:
+            groups = [(t, df[df['treatment'] == t])
+                      for t in df['treatment'].dropna().unique()
+                      if str(t).strip()]
+        else:
+            groups = [('All', df)]
+
+        row_idx = 0
+        # Header row
+        ttk.Label(self._summary_frame, text="Metric",
+                  font=('TkDefaultFont', 8, 'bold')).grid(
+            row=row_idx, column=0, sticky='w', padx=(0, 8))
+        for ci, (gname, _) in enumerate(groups):
+            ttk.Label(self._summary_frame, text=str(gname),
+                      font=('TkDefaultFont', 8, 'bold')).grid(
+                row=row_idx, column=ci + 1, sticky='e', padx=(4, 8))
+        row_idx += 1
+
+        ttk.Separator(self._summary_frame, orient='horizontal').grid(
+            row=row_idx, column=0, columnspan=len(groups) + 1,
+            sticky='ew', pady=2)
+        row_idx += 1
+
+        for label, col, ref in metrics:
+            if col not in df.columns:
+                continue
+            ttk.Label(self._summary_frame, text=label,
+                      font=('TkDefaultFont', 8)).grid(
+                row=row_idx, column=0, sticky='w', padx=(0, 8))
+            for ci, (_, gdf) in enumerate(groups):
+                vals = gdf[col].dropna()
+                if len(vals) == 0:
+                    txt = '--'
+                elif len(vals) == 1:
+                    txt = f'{vals.iloc[0]:.1f}'
+                else:
+                    m = vals.mean()
+                    sem = (vals.std(ddof=1) / np.sqrt(len(vals)))
+                    txt = f'{m:.1f} \u00b1 {sem:.1f}'
+                ttk.Label(self._summary_frame, text=txt,
+                          font=('TkDefaultFont', 8)).grid(
+                    row=row_idx, column=ci + 1, sticky='e', padx=(4, 8))
+            row_idx += 1
 
     # ═══════════════════════════════════════════════════════════════════════
     # Tooltip helper
@@ -3062,6 +3173,7 @@ class GaitLimbTab(ttk.Frame):
             'speed_threshold':    speed_thresh,
             'median_filter_ms':   self._median_filter_var.get(),
             'min_bout_ms':        self._min_bout_var.get(),
+            'min_stance_ms':      self._min_stance_ms_var.get(),
             'use_likelihood':     self._use_likelihood_var.get(),
             'likelihood_threshold': self._likelihood_thresh_var.get(),
             'loco_filter':        self._loco_filter_var.get(),
@@ -3076,8 +3188,8 @@ class GaitLimbTab(ttk.Frame):
         self._run_btn.config(state='disabled')
         self._cancel_btn.config(state='normal')
         self._progress.config(maximum=max(len(sessions), 1), value=0)
-        self._sub_progress.config(maximum=100, value=0)
         self._sub_progress_label.config(text='')
+        self._progress_frame.pack(fill='x', padx=4, pady=(0, 4))
         self._export_sum_btn.config(state='disabled')
         self._export_bin_btn.config(state='disabled')
         self._graphs_btn.config(state='disabled')
@@ -3202,8 +3314,15 @@ class GaitLimbTab(ttk.Frame):
     # ═══════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _gait_bouts(mask, fps):
+    def _gait_bouts(mask, fps, min_stride_ms=0):
         """Find onset/offset of stance (True) and swing (False) runs.
+
+        Parameters
+        ----------
+        mask : array-like of bool — per-frame contact mask
+        fps : float — frames per second
+        min_stride_ms : float — minimum stance bout duration in ms;
+            bouts shorter than this are discarded as noise (default 0 = no filter)
 
         Returns
         -------
@@ -3216,31 +3335,148 @@ class GaitLimbTab(ttk.Frame):
             return [], [], []
         m = np.asarray(mask, dtype=bool)
         d = np.diff(m.astype(int), prepend=int(~m[0]))
-        stance_onsets = np.where(d == 1)[0]   # swing→stance transitions
-        stance_offsets = np.where(d == -1)[0]  # stance→swing transitions
+        raw_stance_onsets = np.where(d == 1)[0]   # swing→stance transitions
+        stance_offsets = np.where(d == -1)[0]      # stance→swing transitions
 
         # Ensure balanced pairs
-        if len(stance_onsets) == 0:
+        if len(raw_stance_onsets) == 0:
             # All stance or all swing
             if m[0]:
                 return [n / fps], [], [0]
             else:
                 return [], [n / fps], []
 
+        min_frames = max(1, round(min_stride_ms / 1000.0 * fps)) if min_stride_ms > 0 else 0
+
+        # Build stance bouts and filter by minimum duration
+        stance_onsets = []
         stance_durs = []
-        for i, on in enumerate(stance_onsets):
+        for i, on in enumerate(raw_stance_onsets):
             idx = np.searchsorted(stance_offsets, on, side='right')
             off = int(stance_offsets[idx]) if idx < len(stance_offsets) else n
-            stance_durs.append((off - on) / fps)
+            bout_len = off - on
+            if min_frames > 0 and bout_len < min_frames:
+                continue
+            stance_onsets.append(int(on))
+            stance_durs.append(bout_len / fps)
 
+        if not stance_onsets:
+            return [], [], []
+
+        # Swing durations: gap between end of one stance and start of the next
         swing_durs = []
-        swing_onsets = stance_offsets  # stance→swing = swing onset
-        for i, on in enumerate(swing_onsets):
-            idx = np.searchsorted(stance_onsets, on, side='right')
-            off = int(stance_onsets[idx]) if idx < len(stance_onsets) else n
-            swing_durs.append((off - on) / fps)
+        stance_onsets_arr = np.array(stance_onsets)
+        for i in range(len(stance_onsets) - 1):
+            # Find the offset of the current stance bout
+            idx = np.searchsorted(stance_offsets, stance_onsets[i], side='right')
+            off = int(stance_offsets[idx]) if idx < len(stance_offsets) else n
+            swing_dur = (stance_onsets[i + 1] - off) / fps
+            if swing_dur > 0:
+                swing_durs.append(swing_dur)
 
-        return stance_durs, swing_durs, stance_onsets.tolist()
+        return stance_durs, swing_durs, stance_onsets
+
+    @staticmethod
+    def _regularity_index(masks, fps, frame_slice, loco_filter_mask,
+                          confidence_mask, min_stance_ms=0):
+        """Compute regularity index (RI) — percentage of normal step sequences.
+
+        RI = (NSSP × 4 / total_paw_placements) × 100
+        where NSSP = number of normal step-sequence patterns.
+        Normal patterns: any cycle of 4 consecutive paw placements where
+        all 4 paws appear exactly once.
+
+        Returns float or None if insufficient data.
+        """
+        if not all(r in masks for r in ('HL', 'HR', 'FL', 'FR')):
+            return None
+
+        # Get stance onsets for all 4 paws
+        all_onsets = []
+        for role in ('HL', 'HR', 'FL', 'FR'):
+            mask_arr = (masks[role].values.astype(bool) if hasattr(masks[role], 'values')
+                        else np.asarray(masks[role], dtype=bool))
+            if loco_filter_mask is not None:
+                lm = loco_filter_mask[frame_slice] if frame_slice is not None else loco_filter_mask
+                mask_arr = mask_arr & lm[:len(mask_arr)]
+            if confidence_mask is not None:
+                cm = confidence_mask[frame_slice] if frame_slice is not None else confidence_mask
+                mask_arr = mask_arr & cm[:len(mask_arr)]
+            _, _, onsets = GaitLimbTab._gait_bouts(mask_arr, fps, min_stance_ms)
+            for o in onsets:
+                all_onsets.append((o, role))
+
+        if len(all_onsets) < 8:
+            return None
+
+        # Sort by frame
+        all_onsets.sort(key=lambda x: x[0])
+        total_placements = len(all_onsets)
+
+        # Slide a window of 4 and check if all 4 paws are represented
+        nssp = 0
+        for i in range(0, len(all_onsets) - 3, 4):
+            group_roles = {all_onsets[i + k][1] for k in range(4)}
+            if len(group_roles) == 4:
+                nssp += 1
+
+        if total_placements < 4:
+            return None
+
+        ri = round(nssp * 4 / total_placements * 100, 2)
+        return ri
+
+    @staticmethod
+    def _print_position(masks, paw_xy, hind_role, fore_role, fps, frame_slice,
+                        loco_filter_mask, confidence_mask, min_stance_ms=0):
+        """Compute print position — distance between hind paw strike and
+        most recent ipsilateral fore paw strike position (px).
+
+        Returns float (mean distance in px) or NaN.
+        """
+        # Get stance onsets for hind and fore paw
+        for role in (hind_role, fore_role):
+            if role not in masks or role not in paw_xy:
+                return float('nan')
+
+        def _get_onsets(role):
+            mask_arr = (masks[role].values.astype(bool) if hasattr(masks[role], 'values')
+                        else np.asarray(masks[role], dtype=bool))
+            if loco_filter_mask is not None:
+                lm = loco_filter_mask[frame_slice] if frame_slice is not None else loco_filter_mask
+                mask_arr = mask_arr & lm[:len(mask_arr)]
+            if confidence_mask is not None:
+                cm = confidence_mask[frame_slice] if frame_slice is not None else confidence_mask
+                mask_arr = mask_arr & cm[:len(mask_arr)]
+            _, _, onsets = GaitLimbTab._gait_bouts(mask_arr, fps, min_stance_ms)
+            return onsets
+
+        hind_onsets = _get_onsets(hind_role)
+        fore_onsets = _get_onsets(fore_role)
+
+        if len(fore_onsets) < 2 or len(hind_onsets) < 1:
+            return float('nan')
+
+        hpx, hpy = paw_xy[hind_role]
+        fpx, fpy = paw_xy[fore_role]
+        sl_start = (frame_slice.start or 0) if frame_slice is not None else 0
+
+        fore_arr = np.array(fore_onsets)
+        dists = []
+        for ho in hind_onsets:
+            abs_ho = sl_start + ho
+            # Find the most recent fore onset before this hind onset
+            idx = np.searchsorted(fore_arr, ho, side='left') - 1
+            if idx < 0:
+                continue
+            fo = fore_onsets[idx]
+            abs_fo = sl_start + fo
+            if abs_ho < len(hpx) and abs_fo < len(fpx):
+                d = np.sqrt((hpx[abs_ho] - fpx[abs_fo])**2 +
+                            (hpy[abs_ho] - fpy[abs_fo])**2)
+                dists.append(d)
+
+        return round(float(np.mean(dists)), 2) if dists else float('nan')
 
     # ═══════════════════════════════════════════════════════════════════════
     # Analysis: per-session core
@@ -3577,8 +3813,6 @@ class GaitLimbTab(ttk.Frame):
                         # Sub-progress setup
                         _stride_val = max(1, params.get('extraction_stride', 1))
                         total_contour_frames = len(range(0, n_frames, _stride_val))
-                        self.app.root.after(0, self._sub_progress.config,
-                                            {'maximum': total_contour_frames, 'value': 0})
                         self.app.root.after(0, self._sub_progress_label.config,
                                             {'text': 'Contour extraction: 0%'})
                         _contour_update_interval = max(1, total_contour_frames // 20)
@@ -3611,6 +3845,8 @@ class GaitLimbTab(ttk.Frame):
                                     continue
                                 best = max(contours, key=lambda c: cv2.contourArea(c))
                                 area = cv2.contourArea(best)
+                                if area < 4:
+                                    continue
                                 if area > 0:
                                     paw_contour_data[role]['areas'][i_frame] = area
                                     x_b, y_b, w_b, h_b = cv2.boundingRect(best)
@@ -3644,7 +3880,6 @@ class GaitLimbTab(ttk.Frame):
                             frame_idx = i_frame // _stride_val
                             if frame_idx % _contour_update_interval == 0:
                                 pct = int(100 * frame_idx / total_contour_frames)
-                                self.app.root.after(0, self._sub_progress.config, {'value': frame_idx})
                                 self.app.root.after(0, self._sub_progress_label.config,
                                                     {'text': f'Contour extraction: {pct}%'})
 
@@ -3694,7 +3929,7 @@ class GaitLimbTab(ttk.Frame):
                             contour_cols = {}
                             for role, arrays in paw_contour_data.items():
                                 for metric_name, arr in arrays.items():
-                                    if metric_name == 'contour_shapes':
+                                    if metric_name in ('contour_shapes', 'contour_solidities'):
                                         continue  # not cacheable as CSV column
                                     contour_cols[f'{metric_name}_{role}'] = arr
                             pd.DataFrame(contour_cols).to_csv(contour_cache_path, index=False)
@@ -3718,7 +3953,6 @@ class GaitLimbTab(ttk.Frame):
                             pass
                     # Clean up contour progress if callback was used
                     if contour_callback is not None:
-                        self.app.root.after(0, self._sub_progress.config, {'value': 0})
                         self.app.root.after(0, self._sub_progress_label.config, {'text': ''})
                         self._log("  Paw contour extraction complete (during brightness pass).")
                 except Exception as e:
@@ -3786,8 +4020,6 @@ class GaitLimbTab(ttk.Frame):
                         }
 
                     total_contour_frames = len(range(0, n_frames, stride))
-                    self.app.root.after(0, self._sub_progress.config,
-                                        {'maximum': total_contour_frames, 'value': 0})
                     self.app.root.after(0, self._sub_progress_label.config,
                                         {'text': 'Contour extraction: 0%'})
                     _update_interval = max(1, total_contour_frames // 20)
@@ -3809,7 +4041,6 @@ class GaitLimbTab(ttk.Frame):
                         # Progress update
                         if frame_idx % _update_interval == 0:
                             pct = int(100 * frame_idx / total_contour_frames)
-                            self.app.root.after(0, self._sub_progress.config, {'value': frame_idx})
                             self.app.root.after(0, self._sub_progress_label.config,
                                                 {'text': f'Contour extraction: {pct}%'})
 
@@ -3878,7 +4109,6 @@ class GaitLimbTab(ttk.Frame):
                         frame_idx += 1
 
                     # Reset sub-progress
-                    self.app.root.after(0, self._sub_progress.config, {'value': 0})
                     self.app.root.after(0, self._sub_progress_label.config, {'text': ''})
 
                     cap.release()
@@ -3889,7 +4119,7 @@ class GaitLimbTab(ttk.Frame):
                             contour_cols = {}
                             for role, arrays in paw_contour_data.items():
                                 for metric_name, arr in arrays.items():
-                                    if metric_name == 'contour_shapes':
+                                    if metric_name in ('contour_shapes', 'contour_solidities'):
                                         continue  # not cacheable as CSV column
                                     contour_cols[f'{metric_name}_{role}'] = arr
                             pd.DataFrame(contour_cols).to_csv(contour_cache_path, index=False)
@@ -4003,6 +4233,30 @@ class GaitLimbTab(ttk.Frame):
                     m['time_moving_s'] = round(float(lm_sl.sum()) / fps, 2) if fps > 0 else 0.0
                     m['time_moving_pct'] = round(float(lm_sl.mean()) * 100, 2)
 
+            # ── Body speed mean ───────────────────────────────────────────
+            if body_speed is not None:
+                bs_sl = body_speed[frame_slice] if frame_slice is not None else body_speed
+                m['body_speed_mean'] = round(float(np.nanmean(bs_sl)), 2)
+                if loco_mask is not None:
+                    lm_sl = loco_mask[frame_slice] if frame_slice is not None else loco_mask
+                    lm_sl = lm_sl[:len(bs_sl)]
+                    loco_bs = bs_sl[lm_sl]
+                    m['body_speed_loco'] = round(float(np.nanmean(loco_bs)), 2) if len(loco_bs) > 0 else float('nan')
+
+            # ── Support patterns (paw count per frame during locomotion) ──
+            if len(masks) >= 4 and loco_mask is not None:
+                lm_sl = loco_mask[frame_slice] if frame_slice is not None else loco_mask
+                all_contact = np.zeros(n, dtype=int)
+                for role_sp, mask_sp in masks.items():
+                    ma = mask_sp.values.astype(bool) if hasattr(mask_sp, 'values') else np.asarray(mask_sp, dtype=bool)
+                    all_contact[:len(ma)] += ma[:n].astype(int)
+                lm_frames = lm_sl[:n]
+                n_loco_frames = int(lm_frames.sum())
+                if n_loco_frames > 0:
+                    for npaws in range(5):
+                        cnt = int(((all_contact == npaws) & lm_frames).sum())
+                        m[f'support_{npaws}paw_pct'] = round(cnt / n_loco_frames * 100, 2)
+
             # ── Gait metrics (dual: all frames + locomotion only) ─────────
             def _gait_block(m, masks, loco_filter_mask, prefix=''):
                 """Compute gait timing, spatial, phase, symmetry metrics with optional prefix."""
@@ -4023,8 +4277,9 @@ class GaitLimbTab(ttk.Frame):
                     # Mask out invalid frames for gait analysis
                     gait_contact = mask_arr & gait_valid
 
+                    _min_stance = params.get('min_stance_ms', 0)
                     stance_durs, swing_durs, stance_onsets = GaitLimbTab._gait_bouts(
-                        gait_contact, fps)
+                        gait_contact, fps, min_stride_ms=_min_stance)
 
                     if stance_durs:
                         m[f'{prefix}stance_dur_{role}'] = round(float(np.mean(stance_durs)), 4)
@@ -4073,6 +4328,28 @@ class GaitLimbTab(ttk.Frame):
                     else:
                         m[f'{prefix}stride_len_{role}'] = float('nan')
 
+                    # Swing speed = stride_length / swing_duration
+                    sl_key = f'{prefix}stride_len_{role}'
+                    sw_key = f'{prefix}swing_dur_{role}'
+                    if (sl_key in m and sw_key in m
+                            and not np.isnan(m[sl_key]) and not np.isnan(m[sw_key])
+                            and m[sw_key] > 0):
+                        m[f'{prefix}swing_speed_{role}'] = round(m[sl_key] / m[sw_key], 2)
+                    else:
+                        m[f'{prefix}swing_speed_{role}'] = float('nan')
+
+                    # Stride-to-stride CV (coefficient of variation of stance durations)
+                    if len(stance_durs) >= 3:
+                        sd_arr = np.array(stance_durs)
+                        sd_mean = np.mean(sd_arr)
+                        if sd_mean > 0:
+                            m[f'{prefix}stride_cv_{role}'] = round(
+                                float(np.std(sd_arr, ddof=1) / sd_mean * 100), 2)
+                        else:
+                            m[f'{prefix}stride_cv_{role}'] = float('nan')
+                    else:
+                        m[f'{prefix}stride_cv_{role}'] = float('nan')
+
                 # ── Step length / width (contralateral) ──────────────────
                 for pair_name, left_role, right_role in [('hind', 'HL', 'HR'), ('fore', 'FL', 'FR')]:
                     if left_role not in masks or right_role not in masks:
@@ -4091,8 +4368,8 @@ class GaitLimbTab(ttk.Frame):
                         l_mask = l_mask & cm_slice[:len(l_mask)]
                         r_mask = r_mask & cm_slice[:len(r_mask)]
 
-                    _, _, l_onsets = GaitLimbTab._gait_bouts(l_mask, fps)
-                    _, _, r_onsets = GaitLimbTab._gait_bouts(r_mask, fps)
+                    _, _, l_onsets = GaitLimbTab._gait_bouts(l_mask, fps, _min_stance)
+                    _, _, r_onsets = GaitLimbTab._gait_bouts(r_mask, fps, _min_stance)
 
                     if (left_role in paw_xy and right_role in paw_xy
                             and l_onsets and r_onsets):
@@ -4160,9 +4437,9 @@ class GaitLimbTab(ttk.Frame):
                             ref_mask_arr = ref_mask_arr & cm_slice[:len(ref_mask_arr)]
                             tst_mask_arr = tst_mask_arr & cm_slice[:len(tst_mask_arr)]
 
-                        _, _, ref_on = GaitLimbTab._gait_bouts(ref_mask_arr, fps)
-                        _, _, tst_on = GaitLimbTab._gait_bouts(tst_mask_arr, fps)
-                        if len(ref_on) < 2 or not tst_on:
+                        _, _, ref_on = GaitLimbTab._gait_bouts(ref_mask_arr, fps, _min_stance)
+                        _, _, tst_on = GaitLimbTab._gait_bouts(tst_mask_arr, fps, _min_stance)
+                        if len(ref_on) < 3 or not tst_on:
                             return float('nan')
                         phases = []
                         tst_arr = np.array(tst_on)
@@ -4179,6 +4456,28 @@ class GaitLimbTab(ttk.Frame):
 
                     m[f'{prefix}phase_HL_HR'] = _phase('HR', 'HL')
                     m[f'{prefix}phase_diagonal'] = _phase('HR', 'FL')  # HR-FL diagonal pair
+                    m[f'{prefix}phase_FL_FR'] = _phase('FR', 'FL')
+                    m[f'{prefix}phase_HL_FL'] = _phase('FL', 'HL')
+                    m[f'{prefix}phase_HR_FR'] = _phase('FR', 'HR')
+                    m[f'{prefix}phase_HL_FR'] = _phase('FR', 'HL')
+
+                # ── Regularity index ──────────────────────────────────────
+                if all(r in masks for r in ('HL', 'HR', 'FL', 'FR')):
+                    ri = GaitLimbTab._regularity_index(masks, fps, frame_slice,
+                                                        loco_filter_mask, confidence_mask,
+                                                        params.get('min_stance_ms', 0))
+                    if ri is not None:
+                        m[f'{prefix}regularity_index'] = ri
+
+                # ── Print position (hind-fore overlap) ────────────────────
+                if all(r in masks for r in ('HL', 'HR', 'FL', 'FR')):
+                    for side_lbl, hind_r, fore_r in [('L', 'HL', 'FL'), ('R', 'HR', 'FR')]:
+                        if hind_r in paw_xy and fore_r in paw_xy:
+                            pp = GaitLimbTab._print_position(
+                                masks, paw_xy, hind_r, fore_r, fps, frame_slice,
+                                loco_filter_mask, confidence_mask,
+                                params.get('min_stance_ms', 0))
+                            m[f'{prefix}print_position_{side_lbl}'] = pp
 
                 # ── Gait symmetry indices ────────────────────────────────
                 if f'{prefix}stance_dur_HL' in m and f'{prefix}stance_dur_HR' in m:
@@ -4244,11 +4543,17 @@ class GaitLimbTab(ttk.Frame):
                         m[f'paw_aspect_ratio_{role}'] = round(float(np.nanmean(ar_sl[:len(mask_sl)][valid])), 4) if valid.any() else float('nan')
                         m[f'paw_circularity_{role}'] = round(float(np.nanmean(circ_sl[:len(mask_sl)][valid])), 4) if valid.any() else float('nan')
 
-                    # ── Paw-like filtered (solidity ≤ threshold) ──
-                    PAWLIKE_SOL = self._pawlike_thresholds.get('solidity', 0.88)
+                    # ── Paw-like filtered (solidity + AR + circularity) ──
+                    PAWLIKE_SOL = self._pawlike_thresholds.get('solidity', 1.00)
+                    PAWLIKE_AR = self._pawlike_thresholds.get('aspect_ratio', 1.6)
+                    PAWLIKE_CIRC = self._pawlike_thresholds.get('circularity', 0.10)
                     if solidities_sl is not None:
                         sol_arr = solidities_sl[:len(mask_sl)]
                         valid_paw = valid & (sol_arr <= PAWLIKE_SOL)
+                        if ar_sl is not None:
+                            valid_paw = valid_paw & (ar_sl[:len(mask_sl)] <= PAWLIKE_AR)
+                        if circ_sl is not None:
+                            valid_paw = valid_paw & (circ_sl[:len(mask_sl)] >= PAWLIKE_CIRC)
                         _pca = areas_sl[:len(mask_sl)][valid_paw]
                         m[f'pawlike_area_{role}'] = round(float(np.nanmean(_pca)), 2) if len(_pca) > 0 else float('nan')
                         _pcs = spreads_sl[:len(mask_sl)][valid_paw]
@@ -4344,6 +4649,7 @@ class GaitLimbTab(ttk.Frame):
             '_used_fallback_fps': _used_fallback_fps,
             'n_frames': n_frames,
             'active_paws': active_paws,
+            'contact_masks': contact_masks,
             'paw_xy': paw_xy,
             'brightness_series': brightness_series,
             'paw_contour_data': paw_contour_data,
@@ -4363,7 +4669,7 @@ class GaitLimbTab(ttk.Frame):
     def _on_analysis_complete(self, summary_rows, bin_rows):
         self._run_btn.config(state='normal')
         self._cancel_btn.config(state='disabled')
-        self._sub_progress.config(maximum=100, value=0)
+        self._progress_frame.pack_forget()
         self._sub_progress_label.config(text='')
 
         if not summary_rows:
@@ -4374,6 +4680,7 @@ class GaitLimbTab(ttk.Frame):
         self._bins_df    = pd.DataFrame(bin_rows) if bin_rows else pd.DataFrame()
 
         self._refresh_results_table()
+        self._refresh_summary_panel()
         self._export_sum_btn.config(state='normal')
         if not self._bins_df.empty:
             self._export_bin_btn.config(state='normal')
@@ -4590,6 +4897,9 @@ class GaitLimbTab(ttk.Frame):
                                 + brt_weight * b_score)
                     contact_masks[role] = pd.Series(combined > 0.5, dtype=bool)
 
+            # Update stored intermediates with new contact masks
+            inter['contact_masks'] = contact_masks
+
             # Metric computation (mirrors _metrics in _analyze_session)
             def _metrics(frame_slice=None,
                          _cm=contact_masks, _nf=n_frames, _fps=fps,
@@ -4680,6 +4990,30 @@ class GaitLimbTab(ttk.Frame):
                         m['time_moving_s'] = round(float(lm_sl.sum()) / _fps, 2) if _fps > 0 else 0.0
                         m['time_moving_pct'] = round(float(lm_sl.mean()) * 100, 2)
 
+                # ── Body speed mean ───────────────────────────────────────
+                if _bs_spd is not None:
+                    bs_sl = _bs_spd[frame_slice] if frame_slice is not None else _bs_spd
+                    m['body_speed_mean'] = round(float(np.nanmean(bs_sl)), 2)
+                    if _loco is not None:
+                        lm_sl = _loco[frame_slice] if frame_slice is not None else _loco
+                        lm_sl = lm_sl[:len(bs_sl)]
+                        loco_bs = bs_sl[lm_sl]
+                        m['body_speed_loco'] = round(float(np.nanmean(loco_bs)), 2) if len(loco_bs) > 0 else float('nan')
+
+                # ── Support patterns ──────────────────────────────────────
+                if len(masks) >= 4 and _loco is not None:
+                    lm_sl = _loco[frame_slice] if frame_slice is not None else _loco
+                    all_contact = np.zeros(n, dtype=int)
+                    for role_sp, mask_sp in masks.items():
+                        ma = mask_sp.values.astype(bool) if hasattr(mask_sp, 'values') else np.asarray(mask_sp, dtype=bool)
+                        all_contact[:len(ma)] += ma[:n].astype(int)
+                    lm_frames = lm_sl[:n]
+                    n_loco_frames = int(lm_frames.sum())
+                    if n_loco_frames > 0:
+                        for npaws in range(5):
+                            cnt = int(((all_contact == npaws) & lm_frames).sum())
+                            m[f'support_{npaws}paw_pct'] = round(cnt / n_loco_frames * 100, 2)
+
                 # ── Gait metrics (dual: all frames + locomotion only) ─────
                 def _gait_block(m, masks, loco_filter_mask, prefix=''):
                     """Compute gait timing, spatial, phase, symmetry metrics with optional prefix."""
@@ -4703,8 +5037,10 @@ class GaitLimbTab(ttk.Frame):
                         # Mask out invalid frames for gait analysis
                         gait_contact = mask_arr & gait_valid
 
+                        _min_stance_r = params.get('min_stance_ms', 0)
                         stance_durs, swing_durs, stance_onsets = (
-                            GaitLimbTab._gait_bouts(gait_contact, _fps))
+                            GaitLimbTab._gait_bouts(gait_contact, _fps,
+                                                     min_stride_ms=_min_stance_r))
 
                         if stance_durs:
                             m[f'{prefix}stance_dur_{role}'] = round(
@@ -4759,6 +5095,28 @@ class GaitLimbTab(ttk.Frame):
                         else:
                             m[f'{prefix}stride_len_{role}'] = float('nan')
 
+                        # Swing speed = stride_length / swing_duration
+                        sl_key = f'{prefix}stride_len_{role}'
+                        sw_key = f'{prefix}swing_dur_{role}'
+                        if (sl_key in m and sw_key in m
+                                and not np.isnan(m[sl_key]) and not np.isnan(m[sw_key])
+                                and m[sw_key] > 0):
+                            m[f'{prefix}swing_speed_{role}'] = round(m[sl_key] / m[sw_key], 2)
+                        else:
+                            m[f'{prefix}swing_speed_{role}'] = float('nan')
+
+                        # Stride-to-stride CV
+                        if len(stance_durs) >= 3:
+                            sd_arr = np.array(stance_durs)
+                            sd_mean = np.mean(sd_arr)
+                            if sd_mean > 0:
+                                m[f'{prefix}stride_cv_{role}'] = round(
+                                    float(np.std(sd_arr, ddof=1) / sd_mean * 100), 2)
+                            else:
+                                m[f'{prefix}stride_cv_{role}'] = float('nan')
+                        else:
+                            m[f'{prefix}stride_cv_{role}'] = float('nan')
+
                     # ── Step length / width (contralateral) ──────────────
                     for pair_name, left_role, right_role in [
                             ('hind', 'HL', 'HR'), ('fore', 'FL', 'FR')]:
@@ -4783,8 +5141,8 @@ class GaitLimbTab(ttk.Frame):
                             l_mask = l_mask & cm_slice[:len(l_mask)]
                             r_mask = r_mask & cm_slice[:len(r_mask)]
 
-                        _, _, l_onsets = GaitLimbTab._gait_bouts(l_mask, _fps)
-                        _, _, r_onsets = GaitLimbTab._gait_bouts(r_mask, _fps)
+                        _, _, l_onsets = GaitLimbTab._gait_bouts(l_mask, _fps, _min_stance_r)
+                        _, _, r_onsets = GaitLimbTab._gait_bouts(r_mask, _fps, _min_stance_r)
 
                         if (left_role in _pxy and right_role in _pxy
                                 and l_onsets and r_onsets):
@@ -4855,10 +5213,10 @@ class GaitLimbTab(ttk.Frame):
                                 tst_arr = tst_arr & cm_slice[:len(tst_arr)]
 
                             _, _, ref_on = GaitLimbTab._gait_bouts(
-                                ref_arr, _fps)
+                                ref_arr, _fps, _min_stance_r)
                             _, _, tst_on = GaitLimbTab._gait_bouts(
-                                tst_arr, _fps)
-                            if len(ref_on) < 2 or not tst_on:
+                                tst_arr, _fps, _min_stance_r)
+                            if len(ref_on) < 3 or not tst_on:
                                 return float('nan')
                             phases = []
                             for i in range(len(ref_on) - 1):
@@ -4873,6 +5231,27 @@ class GaitLimbTab(ttk.Frame):
                                     if phases else float('nan'))
                         m[f'{prefix}phase_HL_HR'] = _phase('HR', 'HL')
                         m[f'{prefix}phase_diagonal'] = _phase('HR', 'FL')
+                        m[f'{prefix}phase_FL_FR'] = _phase('FR', 'FL')
+                        m[f'{prefix}phase_HL_FL'] = _phase('FL', 'HL')
+                        m[f'{prefix}phase_HR_FR'] = _phase('FR', 'HR')
+                        m[f'{prefix}phase_HL_FR'] = _phase('FR', 'HL')
+
+                    # ── Regularity index ──────────────────────────────────
+                    if all(r in masks for r in ('HL', 'HR', 'FL', 'FR')):
+                        ri = GaitLimbTab._regularity_index(
+                            masks, _fps, frame_slice,
+                            loco_filter_mask, _conf, _min_stance_r)
+                        if ri is not None:
+                            m[f'{prefix}regularity_index'] = ri
+
+                    # ── Print position ────────────────────────────────────
+                    if all(r in masks for r in ('HL', 'HR', 'FL', 'FR')):
+                        for side_lbl, hind_r, fore_r in [('L', 'HL', 'FL'), ('R', 'HR', 'FR')]:
+                            if hind_r in _pxy and fore_r in _pxy:
+                                pp = GaitLimbTab._print_position(
+                                    masks, _pxy, hind_r, fore_r, _fps, frame_slice,
+                                    loco_filter_mask, _conf, _min_stance_r)
+                                m[f'{prefix}print_position_{side_lbl}'] = pp
 
                     # ── Gait symmetry indices ────────────────────────────
                     if f'{prefix}stance_dur_HL' in m and f'{prefix}stance_dur_HR' in m:
@@ -4963,6 +5342,29 @@ class GaitLimbTab(ttk.Frame):
                                 m[f'paw_aspect_ratio_stance_{role}'] = round(float(np.nanmean(ar_sl[:_ml][stance_valid])), 4) if stance_valid.any() else float('nan')
                                 m[f'paw_circularity_stance_{role}'] = round(float(np.nanmean(circ_sl[:_ml][stance_valid])), 4) if stance_valid.any() else float('nan')
 
+                        # ── Paw-like filtered (solidity + AR + circularity) ──
+                        PAWLIKE_SOL = self._pawlike_thresholds.get('solidity', 1.00)
+                        PAWLIKE_AR = self._pawlike_thresholds.get('aspect_ratio', 1.6)
+                        PAWLIKE_CIRC = self._pawlike_thresholds.get('circularity', 0.10)
+                        if solidities_sl is not None:
+                            sol_arr = solidities_sl[:len(mask_sl)]
+                            valid_paw = valid & (sol_arr <= PAWLIKE_SOL)
+                            if ar_sl is not None:
+                                valid_paw = valid_paw & (ar_sl[:len(mask_sl)] <= PAWLIKE_AR)
+                            if circ_sl is not None:
+                                valid_paw = valid_paw & (circ_sl[:len(mask_sl)] >= PAWLIKE_CIRC)
+                            _pca = areas_sl[:len(mask_sl)][valid_paw]
+                            m[f'pawlike_area_{role}'] = round(float(np.nanmean(_pca)), 2) if len(_pca) > 0 else float('nan')
+                            _pcs = spreads_sl[:len(mask_sl)][valid_paw]
+                            m[f'pawlike_spread_{role}'] = round(float(np.nanmean(_pcs)), 2) if len(_pcs) > 0 else float('nan')
+                            _pci = ints_sl[:len(mask_sl)][valid_paw]
+                            m[f'pawlike_intensity_{role}'] = round(float(np.nanmean(_pci)), 2) if len(_pci) > 0 else float('nan')
+                            if widths_sl is not None:
+                                m[f'pawlike_width_{role}'] = round(float(np.nanmean(widths_sl[:len(mask_sl)][valid_paw])), 2) if valid_paw.any() else float('nan')
+                                m[f'pawlike_solidity_{role}'] = round(float(np.nanmean(sol_arr[valid_paw])), 4) if valid_paw.any() else float('nan')
+                                m[f'pawlike_aspect_ratio_{role}'] = round(float(np.nanmean(ar_sl[:len(mask_sl)][valid_paw])), 4) if valid_paw.any() else float('nan')
+                                m[f'pawlike_circularity_{role}'] = round(float(np.nanmean(circ_sl[:len(mask_sl)][valid_paw])), 4) if valid_paw.any() else float('nan')
+
                     # Area ratios (regular)
                     if 'paw_area_HL' in m and 'paw_area_HR' in m:
                         aHL, aHR = m['paw_area_HL'], m['paw_area_HR']
@@ -4983,6 +5385,16 @@ class GaitLimbTab(ttk.Frame):
                         iHL_s, iHR_s = m['contact_intensity_stance_HL'], m['contact_intensity_stance_HR']
                         if not (np.isnan(iHL_s) or np.isnan(iHR_s)) and iHR_s > 0:
                             m['contact_intensity_ratio_stance_hind'] = round(iHL_s / iHR_s, 4)
+                    # Area ratios (paw-like)
+                    if 'pawlike_area_HL' in m and 'pawlike_area_HR' in m:
+                        aHL_p, aHR_p = m['pawlike_area_HL'], m['pawlike_area_HR']
+                        if not (np.isnan(aHL_p) or np.isnan(aHR_p)) and aHR_p > 0:
+                            m['pawlike_area_ratio_hind'] = round(aHL_p / aHR_p, 4)
+                    # Intensity ratios (paw-like)
+                    if 'pawlike_intensity_HL' in m and 'pawlike_intensity_HR' in m:
+                        iHL_p, iHR_p = m['pawlike_intensity_HL'], m['pawlike_intensity_HR']
+                        if not (np.isnan(iHL_p) or np.isnan(iHR_p)) and iHR_p > 0:
+                            m['pawlike_intensity_ratio_hind'] = round(iHL_p / iHR_p, 4)
 
                 return m
 
@@ -5290,6 +5702,190 @@ class GaitLimbTab(ttk.Frame):
         if nb.tabs():
             nb.event_generate('<<NotebookTabChanged>>')
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # Live recomputation of Filtered Contour tab
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _recompute_pawlike_metrics(self):
+        """Recompute pawlike columns in _summary_df and _bins_df using current thresholds."""
+        if self._summary_df is None:
+            return
+        PAWLIKE_SOL = self._pawlike_thresholds.get('solidity', 1.00)
+        PAWLIKE_AR = self._pawlike_thresholds.get('aspect_ratio', 1.6)
+        PAWLIKE_CIRC = self._pawlike_thresholds.get('circularity', 0.10)
+
+        for idx, row in self._summary_df.iterrows():
+            sess_name = row.get('session')
+            if sess_name not in self._session_intermediates:
+                continue
+            inter = self._session_intermediates[sess_name]
+            pcd = inter.get('paw_contour_data', {})
+            if not pcd:
+                continue
+            fps = inter.get('fps', 30)
+            n_frames = inter.get('n_frames', 0)
+            contact_masks = inter.get('contact_masks', {})
+
+            for role in list(pcd.keys()):
+                areas = pcd[role]['areas']
+                spreads = pcd[role]['spreads']
+                intensities = pcd[role]['intensities']
+                cm = contact_masks.get(role)
+                if cm is not None:
+                    mask_arr = cm.values.astype(bool) if hasattr(cm, 'values') else np.asarray(cm, dtype=bool)
+                else:
+                    mask_arr = np.ones(n_frames, dtype=bool)
+
+                widths = pcd[role].get('widths')
+                solidities = pcd[role].get('solidities')
+                aspect_ratios = pcd[role].get('aspect_ratios')
+                circularities = pcd[role].get('circularities')
+
+                valid = mask_arr[:len(areas)] & (areas[:len(mask_arr)] > 0)
+                if solidities is not None:
+                    sol_arr = solidities[:len(mask_arr)]
+                    valid_paw = valid & (sol_arr <= PAWLIKE_SOL)
+                    if aspect_ratios is not None:
+                        valid_paw = valid_paw & (aspect_ratios[:len(mask_arr)] <= PAWLIKE_AR)
+                    if circularities is not None:
+                        valid_paw = valid_paw & (circularities[:len(mask_arr)] >= PAWLIKE_CIRC)
+
+                    _pca = areas[:len(mask_arr)][valid_paw]
+                    self._summary_df.at[idx, f'pawlike_area_{role}'] = round(float(np.nanmean(_pca)), 2) if len(_pca) > 0 else float('nan')
+                    _pcs = spreads[:len(mask_arr)][valid_paw]
+                    self._summary_df.at[idx, f'pawlike_spread_{role}'] = round(float(np.nanmean(_pcs)), 2) if len(_pcs) > 0 else float('nan')
+                    _pci = intensities[:len(mask_arr)][valid_paw]
+                    self._summary_df.at[idx, f'pawlike_intensity_{role}'] = round(float(np.nanmean(_pci)), 2) if len(_pci) > 0 else float('nan')
+                    if widths is not None:
+                        self._summary_df.at[idx, f'pawlike_width_{role}'] = round(float(np.nanmean(widths[:len(mask_arr)][valid_paw])), 2) if valid_paw.any() else float('nan')
+                        self._summary_df.at[idx, f'pawlike_solidity_{role}'] = round(float(np.nanmean(sol_arr[valid_paw])), 4) if valid_paw.any() else float('nan')
+                        self._summary_df.at[idx, f'pawlike_aspect_ratio_{role}'] = round(float(np.nanmean(aspect_ratios[:len(mask_arr)][valid_paw])), 4) if valid_paw.any() else float('nan')
+                        self._summary_df.at[idx, f'pawlike_circularity_{role}'] = round(float(np.nanmean(circularities[:len(mask_arr)][valid_paw])), 4) if valid_paw.any() else float('nan')
+
+            # Recompute ratios
+            df = self._summary_df
+            if f'pawlike_area_HL' in df.columns and f'pawlike_area_HR' in df.columns:
+                aHL, aHR = df.at[idx, 'pawlike_area_HL'], df.at[idx, 'pawlike_area_HR']
+                if not (np.isnan(aHL) or np.isnan(aHR)) and aHR > 0:
+                    df.at[idx, 'pawlike_area_ratio_hind'] = round(aHL / aHR, 4)
+                else:
+                    df.at[idx, 'pawlike_area_ratio_hind'] = float('nan')
+            if f'pawlike_intensity_HL' in df.columns and f'pawlike_intensity_HR' in df.columns:
+                iHL, iHR = df.at[idx, 'pawlike_intensity_HL'], df.at[idx, 'pawlike_intensity_HR']
+                if not (np.isnan(iHL) or np.isnan(iHR)) and iHR > 0:
+                    df.at[idx, 'pawlike_intensity_ratio_hind'] = round(iHL / iHR, 4)
+                else:
+                    df.at[idx, 'pawlike_intensity_ratio_hind'] = float('nan')
+
+        # Recompute bins
+        if self._bins_df is not None and not self._bins_df.empty:
+            for bidx, brow in self._bins_df.iterrows():
+                sess_name = brow.get('session')
+                if sess_name not in self._session_intermediates:
+                    continue
+                inter = self._session_intermediates[sess_name]
+                pcd = inter.get('paw_contour_data', {})
+                if not pcd:
+                    continue
+                fps = inter.get('fps', 30)
+                n_frames = inter.get('n_frames', 0)
+                contact_masks = inter.get('contact_masks', {})
+                bin_start_s = brow.get('bin_start_s', 0)
+                bin_end_s = brow.get('bin_end_s', 0)
+                start_f = int(round(bin_start_s * fps))
+                end_f = int(round(bin_end_s * fps))
+                frame_slice = slice(start_f, end_f)
+
+                for role in list(pcd.keys()):
+                    areas_full = pcd[role]['areas']
+                    spreads_full = pcd[role]['spreads']
+                    ints_full = pcd[role]['intensities']
+                    cm = contact_masks.get(role)
+                    if cm is not None:
+                        mask_full = cm.values.astype(bool) if hasattr(cm, 'values') else np.asarray(cm, dtype=bool)
+                    else:
+                        mask_full = np.ones(n_frames, dtype=bool)
+                    mask_arr = mask_full[frame_slice]
+                    areas_sl = areas_full[frame_slice]
+                    spreads_sl = spreads_full[frame_slice]
+                    ints_sl = ints_full[frame_slice]
+
+                    widths_full = pcd[role].get('widths')
+                    solidities_full = pcd[role].get('solidities')
+                    ar_full = pcd[role].get('aspect_ratios')
+                    circ_full = pcd[role].get('circularities')
+                    widths_sl = widths_full[frame_slice] if widths_full is not None else None
+                    solidities_sl = solidities_full[frame_slice] if solidities_full is not None else None
+                    ar_sl = ar_full[frame_slice] if ar_full is not None else None
+                    circ_sl = circ_full[frame_slice] if circ_full is not None else None
+
+                    valid = mask_arr[:len(areas_sl)] & (areas_sl[:len(mask_arr)] > 0)
+                    if solidities_sl is not None:
+                        sol_arr = solidities_sl[:len(mask_arr)]
+                        valid_paw = valid & (sol_arr <= PAWLIKE_SOL)
+                        if ar_sl is not None:
+                            valid_paw = valid_paw & (ar_sl[:len(mask_arr)] <= PAWLIKE_AR)
+                        if circ_sl is not None:
+                            valid_paw = valid_paw & (circ_sl[:len(mask_arr)] >= PAWLIKE_CIRC)
+
+                        _pca = areas_sl[:len(mask_arr)][valid_paw]
+                        self._bins_df.at[bidx, f'pawlike_area_{role}'] = round(float(np.nanmean(_pca)), 2) if len(_pca) > 0 else float('nan')
+                        _pcs = spreads_sl[:len(mask_arr)][valid_paw]
+                        self._bins_df.at[bidx, f'pawlike_spread_{role}'] = round(float(np.nanmean(_pcs)), 2) if len(_pcs) > 0 else float('nan')
+                        _pci = ints_sl[:len(mask_arr)][valid_paw]
+                        self._bins_df.at[bidx, f'pawlike_intensity_{role}'] = round(float(np.nanmean(_pci)), 2) if len(_pci) > 0 else float('nan')
+                        if widths_sl is not None:
+                            self._bins_df.at[bidx, f'pawlike_width_{role}'] = round(float(np.nanmean(widths_sl[:len(mask_arr)][valid_paw])), 2) if valid_paw.any() else float('nan')
+                            self._bins_df.at[bidx, f'pawlike_solidity_{role}'] = round(float(np.nanmean(sol_arr[valid_paw])), 4) if valid_paw.any() else float('nan')
+                            self._bins_df.at[bidx, f'pawlike_aspect_ratio_{role}'] = round(float(np.nanmean(ar_sl[:len(mask_arr)][valid_paw])), 4) if valid_paw.any() else float('nan')
+                            self._bins_df.at[bidx, f'pawlike_circularity_{role}'] = round(float(np.nanmean(circ_sl[:len(mask_arr)][valid_paw])), 4) if valid_paw.any() else float('nan')
+
+                # Recompute bin ratios
+                bdf = self._bins_df
+                if 'pawlike_area_HL' in bdf.columns and 'pawlike_area_HR' in bdf.columns:
+                    aHL, aHR = bdf.at[bidx, 'pawlike_area_HL'], bdf.at[bidx, 'pawlike_area_HR']
+                    if not (np.isnan(aHL) or np.isnan(aHR)) and aHR > 0:
+                        bdf.at[bidx, 'pawlike_area_ratio_hind'] = round(aHL / aHR, 4)
+                    else:
+                        bdf.at[bidx, 'pawlike_area_ratio_hind'] = float('nan')
+                if 'pawlike_intensity_HL' in bdf.columns and 'pawlike_intensity_HR' in bdf.columns:
+                    iHL, iHR = bdf.at[bidx, 'pawlike_intensity_HL'], bdf.at[bidx, 'pawlike_intensity_HR']
+                    if not (np.isnan(iHL) or np.isnan(iHR)) and iHR > 0:
+                        bdf.at[bidx, 'pawlike_intensity_ratio_hind'] = round(iHL / iHR, 4)
+                    else:
+                        bdf.at[bidx, 'pawlike_intensity_ratio_hind'] = float('nan')
+
+    def _rebuild_filtered_contour_tab(self):
+        """Recompute pawlike metrics and rebuild the Filtered Contour tab."""
+        self._recompute_pawlike_metrics()
+
+        nb = getattr(self, '_contour_pawlike_nb', None)
+        build_fn = getattr(self, '_contour_build_fn', None)
+        metrics = getattr(self, '_contour_pawlike_metrics', None)
+        if nb is None or build_fn is None or metrics is None:
+            return
+
+        # Close any matplotlib figures in existing tab contents
+        try:
+            import matplotlib.pyplot as plt
+            for tab_id in nb.tabs():
+                w = nb.nametowidget(tab_id)
+                for child in w.winfo_children():
+                    child.destroy()
+                w.destroy()
+            # Remove all tabs
+            for tab_id in list(nb.tabs()):
+                nb.forget(tab_id)
+        except Exception:
+            pass
+
+        # Rebuild with updated data
+        df = self._summary_df
+        bdf = self._bins_df if self._bins_df is not None and not self._bins_df.empty else None
+        build_fn(nb, metrics, False, df, bdf,
+                 'pawlike_area_ratio_hind', 'pawlike_intensity_ratio_hind',
+                 filter_paw=True)
+
     def _open_graphs(self):
         if not _PLOT_OK:
             messagebox.showerror("Missing deps",
@@ -5318,6 +5914,7 @@ class GaitLimbTab(ttk.Frame):
             return
         self._last_graph_cfg = graph_cfg
         self._enable_stats_var.set(graph_cfg['show_stats'])
+        self._log("Building graphs…")
 
         win = tk.Toplevel(self)
         win.title("Gait & Limb Use Graphs")
@@ -5332,9 +5929,27 @@ class GaitLimbTab(ttk.Frame):
 
         _tab_descs = {}
 
-        def _make_category(name):
+        # ── Graph set selection from settings ────────────────────────────
+        _sets = graph_cfg.get('graph_sets', {})
+        show_wb       = _sets.get('weight_bearing', True)
+        show_gait     = _sets.get('gait', True)
+        show_movement = _sets.get('movement', True)
+        show_contour  = _sets.get('paw_contour', True)
+        show_stats    = _sets.get('statistics', True)
+
+        def _make_group(name):
+            """Create a top-level group tab containing a notebook."""
             f = ttk.Frame(outer_nb)
             outer_nb.add(f, text=name)
+            group_nb = ttk.Notebook(f)
+            group_nb.pack(fill='both', expand=True)
+            return group_nb
+
+        def _make_category(name, parent=None):
+            """Create a category tab (inner notebook) under the given parent."""
+            target = parent if parent is not None else outer_nb
+            f = ttk.Frame(target)
+            target.add(f, text=name)
             inner = ttk.Notebook(f)
             inner.pack(fill='both', expand=True)
             return inner
@@ -5350,378 +5965,483 @@ class GaitLimbTab(ttk.Frame):
             ('SBI_fore' in df.columns and df['SBI_fore'].notna().any())
         )
 
-        hind_nb    = _make_category("Hind Paw")
-        fore_nb    = _make_category("Fore Paw") if has_fore else None
-        contact_nb = _make_category("Contact %")
-        bright_nb  = _make_category("Brightness")
+        # ── Lazy group helper ──────────────────────────────────────────────
+        _deferred_builds = {}  # outer_nb tab_id -> (build_fn, built_flag)
 
-        # Gait categories — only show if gait metrics exist
+        def _register_deferred(group_frame, build_fn):
+            """Register a build function to run when this group tab is first selected."""
+            _deferred_builds[str(group_frame)] = [build_fn, False]
+
+        def _check_deferred(evt=None):
+            """Build deferred group content on first view."""
+            try:
+                sel = outer_nb.select()
+                if not sel:
+                    return
+                key = sel
+            except Exception:
+                return
+            entry = _deferred_builds.get(key)
+            if entry and not entry[1]:
+                entry[1] = True
+                tab_name = outer_nb.tab(sel, 'text')
+                self._log(f"  Building {tab_name} graphs…")
+                try:
+                    win.config(cursor='watch')
+                    win.update_idletasks()
+                except Exception:
+                    pass
+                entry[0]()
+                try:
+                    win.config(cursor='')
+                    win.update_idletasks()
+                except Exception:
+                    pass
+
+        outer_nb.bind('<<NotebookTabChanged>>', _check_deferred, add='+')
+
+        # ── Limb Use group ────────────────────────────────────────────────
+        wb_group   = _make_group("Limb Use") if show_wb else None
+        hind_sel    = (self._make_metric_selector(wb_group, "Hind Paw",
+                       desc_lbl, _tab_descs) if show_wb else None)
+        fore_sel    = (self._make_metric_selector(wb_group, "Fore Paw",
+                       desc_lbl, _tab_descs)
+                      if show_wb and has_fore else None)
+        contact_sel = (self._make_metric_selector(wb_group, "Contact %",
+                       desc_lbl, _tab_descs) if show_wb else None)
+        bright_sel  = (self._make_metric_selector(wb_group, "Brightness",
+                       desc_lbl, _tab_descs) if show_wb else None)
+
+        _tab_descs['Limb Use'] = (
+            'Limb use indices, paw contact percentages, and brightness ratios.')
+
+        # ── Gait group ───────────────────────────────────────────────────
         has_gait_timing = any(f'stance_dur_{r}' in df.columns and df[f'stance_dur_{r}'].notna().any()
                               for r in self.ROLES)
         has_gait_spatial = any(f'stride_len_{r}' in df.columns and df[f'stride_len_{r}'].notna().any()
                                for r in self.ROLES)
         has_gait_sym = ('stance_SI_hind' in df.columns and df['stance_SI_hind'].notna().any()) or \
                        ('stride_len_SI_hind' in df.columns and df['stride_len_SI_hind'].notna().any())
+        has_any_gait = show_gait and (has_gait_timing or has_gait_spatial or has_gait_sym)
 
-        gait_timing_nb  = _make_category("Gait Timing") if has_gait_timing else None
-        gait_spatial_nb = _make_category("Gait Spatial") if has_gait_spatial else None
-        gait_sym_nb     = _make_category("Gait Symmetry") if has_gait_sym else None
+        gait_group      = _make_group("Gait") if has_any_gait else None
+        gait_timing_sel = (self._make_metric_selector(
+                               gait_group, "Timing", desc_lbl, _tab_descs)
+                           if has_any_gait and has_gait_timing else None)
+        gait_spatial_sel = (self._make_metric_selector(
+                                gait_group, "Spatial", desc_lbl, _tab_descs)
+                            if has_any_gait and has_gait_spatial else None)
+        gait_sym_sel    = (self._make_metric_selector(
+                               gait_group, "Symmetry", desc_lbl, _tab_descs)
+                           if has_any_gait and has_gait_sym else None)
 
-        # Locomotion category — only show if locomotion metrics exist
+        _tab_descs['Gait'] = (
+            'Gait timing, spatial parameters, and symmetry indices.')
+
+        # ── Movement group ───────────────────────────────────────────────
         has_loco = ('total_distance' in df.columns and df['total_distance'].notna().any())
-        loco_nb = _make_category("Locomotion") if has_loco else None
+        has_coord = any(c in df.columns and df[c].notna().any()
+                        for c in ['regularity_index', 'print_position_L',
+                                  'support_0paw_pct', 'phase_FL_FR'])
+        has_any_movement = show_movement and (has_loco or has_coord)
+
+        movement_group = _make_group("Movement") if has_any_movement else None
+        loco_sel  = (self._make_metric_selector(
+                         movement_group, "Locomotion", desc_lbl, _tab_descs)
+                     if has_any_movement and has_loco else None)
+        coord_sel = (self._make_metric_selector(
+                         movement_group, "Coordination", desc_lbl, _tab_descs)
+                     if has_any_movement and has_coord else None)
+
+        _tab_descs['Movement'] = (
+            'Locomotion distance and speed, coordination and support patterns.')
 
         # ── Hind Paw ──────────────────────────────────────────────────────
-        if 'WBI_hind' in df.columns:
-            self._add_bar_tab(hind_nb, df, 'WBI_hind', 'WBI Hind',
-                              reference=50.0,
-                              y_label='Weight Bearing Index — hind (%)',
-                              graph_cfg=graph_cfg)
-            _tab_descs['WBI Hind'] = (
-                'HL / (HL+HR) × 100.  Reference 50 = symmetric.  '
-                '>50 = more stance on left hind.')
-
-        if 'SI_hind' in df.columns:
-            self._add_box_tab(hind_nb, df, 'SI_hind', 'SI Hind',
-                              reference=0.0,
-                              y_label='Symmetry Index — hind (%)',
-                              graph_cfg=graph_cfg)
-            _tab_descs['SI Hind'] = (
-                '(HL−HR) / (HL+HR) × 100.  Reference 0 = symmetric.  '
-                'Positive = left bias.')
-            self._add_violin_tab(hind_nb, df, 'SI_hind', 'SI Hind (Violin)',
-                                 reference=0.0,
-                                 y_label='Symmetry Index — hind (%)',
-                                 graph_cfg=graph_cfg)
-
-        if 'SBI_hind' in df.columns and df['SBI_hind'].notna().any():
-            self._add_bar_tab(hind_nb, df, 'SBI_hind', 'SBI Hind',
-                              reference=0.0,
-                              y_label='Symmetry Balance Index — hind (%)',
-                              graph_cfg=graph_cfg)
-            _tab_descs['SBI Hind'] = (
-                '2 × |HL−HR| / (HL+HR) × 100.  Always ≥ 0.  '
-                '0 = perfect symmetry; larger = greater hind asymmetry regardless of direction.')
-
-        if (bdf is not None
-                and 'SI_hind' in bdf.columns
-                and 'bin_start_s' in bdf.columns):
-            self._add_timecourse_tab(hind_nb, bdf, 'SI_hind',
-                                     'SI Hind — Time Course',
-                                     graph_cfg=graph_cfg)
-            _tab_descs['SI Hind — Time Course'] = (
-                'SI hind across time bins (mean ± SEM).  Dashed line = 0 (symmetric).')
-
-        if bdf is not None:
-            for col, lbl, ref, ylbl, desc in [
-                ('WBI_hind', 'WBI Hind — Time Course', 50.0,
-                 'Weight Bearing Index — hind (%)',
-                 'WBI hind across time bins (mean ± SEM). Reference 50 = symmetric.'),
-                ('SBI_hind', 'SBI Hind — Time Course',  0.0,
-                 'Symmetry Balance Index — hind (%)',
-                 'SBI hind across time bins. 0 = perfect symmetry.'),
-            ]:
-                if col in bdf.columns and bdf[col].notna().any():
-                    self._add_timecourse_tab(hind_nb, bdf, col, lbl,
-                                             reference=ref, y_label=ylbl,
-                                             graph_cfg=graph_cfg)
-                    _tab_descs[lbl] = desc
-
-        # ── Fore Paw ──────────────────────────────────────────────────────
-        if fore_nb is not None:
-            if 'WBI_fore' in df.columns and df['WBI_fore'].notna().any():
-                self._add_bar_tab(fore_nb, df, 'WBI_fore', 'WBI Fore',
-                                  reference=50.0,
-                                  y_label='Weight Bearing Index — fore (%)',
-                                  graph_cfg=graph_cfg)
-                _tab_descs['WBI Fore'] = (
-                    'FL / (FL+FR) × 100.  Reference 50 = symmetric.')
-
-            if 'SI_fore' in df.columns and df['SI_fore'].notna().any():
-                self._add_box_tab(fore_nb, df, 'SI_fore', 'SI Fore',
-                                  reference=0.0,
-                                  y_label='Symmetry Index — fore (%)',
-                                  graph_cfg=graph_cfg)
-                _tab_descs['SI Fore'] = (
-                    '(FL−FR) / (FL+FR) × 100.  Reference 0.')
-                self._add_violin_tab(fore_nb, df, 'SI_fore', 'SI Fore (Violin)',
-                                     reference=0.0,
-                                     y_label='Symmetry Index — fore (%)',
-                                     graph_cfg=graph_cfg)
-
-            if 'SBI_fore' in df.columns and df['SBI_fore'].notna().any():
-                self._add_bar_tab(fore_nb, df, 'SBI_fore', 'SBI Fore',
-                                  reference=0.0,
-                                  y_label='Symmetry Balance Index — fore (%)',
-                                  graph_cfg=graph_cfg)
-                _tab_descs['SBI Fore'] = (
-                    '2 × |FL−FR| / (FL+FR) × 100.  Always ≥ 0.  '
-                    'Directional sign is lost; pair with SI Fore.')
-
+        if show_wb:
+            self._log("  Registering Limb Use metrics…")
+        if hind_sel is not None:
+            _reg = self._register_metric
+            if 'WBI_hind' in df.columns:
+                _reg(hind_sel, 'WBI Hind', 'bar', df, 'WBI_hind',
+                     reference=50.0, y_label='Weight Bearing Index — hind (%)',
+                     graph_cfg=graph_cfg,
+                     description='HL / (HL+HR) \u00d7 100.  Reference 50 = symmetric.  >50 = more stance on left hind.')
+            if 'SI_hind' in df.columns:
+                _reg(hind_sel, 'SI Hind (Box)', 'box', df, 'SI_hind',
+                     reference=0.0, y_label='Symmetry Index — hind (%)',
+                     graph_cfg=graph_cfg,
+                     description='(HL\u2212HR) / (HL+HR) \u00d7 100.  Reference 0 = symmetric.  Positive = left bias.')
+                _reg(hind_sel, 'SI Hind (Violin)', 'violin', df, 'SI_hind',
+                     reference=0.0, y_label='Symmetry Index — hind (%)',
+                     graph_cfg=graph_cfg,
+                     description='(HL\u2212HR) / (HL+HR) \u00d7 100.  Reference 0 = symmetric.  Positive = left bias.')
+            if 'SBI_hind' in df.columns and df['SBI_hind'].notna().any():
+                _reg(hind_sel, 'SBI Hind', 'bar', df, 'SBI_hind',
+                     reference=0.0, y_label='Symmetry Balance Index — hind (%)',
+                     graph_cfg=graph_cfg,
+                     description='2 \u00d7 |HL\u2212HR| / (HL+HR) \u00d7 100.  Always \u2265 0.  0 = perfect symmetry.')
             if bdf is not None:
                 for col, lbl, ref, ylbl, desc in [
-                    ('WBI_fore', 'WBI Fore — Time Course', 50.0,
-                     'Weight Bearing Index — fore (%)',
-                     'WBI fore across time bins (mean ± SEM). Reference 50 = symmetric.'),
-                    ('SI_fore',  'SI Fore — Time Course',   0.0,
-                     'Symmetry Index — fore (%)',
+                    ('SI_hind', 'SI Hind \u2014 TC', None,
+                     'Symmetry Index \u2014 hind (%)',
+                     'SI hind across time bins (mean \u00b1 SEM).  Dashed line = 0 (symmetric).'),
+                    ('WBI_hind', 'WBI Hind \u2014 TC', 50.0,
+                     'Weight Bearing Index \u2014 hind (%)',
+                     'WBI hind across time bins. Reference 50 = symmetric.'),
+                    ('SBI_hind', 'SBI Hind \u2014 TC', 0.0,
+                     'Symmetry Balance Index \u2014 hind (%)',
+                     'SBI hind across time bins. 0 = perfect symmetry.'),
+                ]:
+                    if col in bdf.columns and bdf[col].notna().any():
+                        _reg(hind_sel, lbl, 'timecourse', bdf, col,
+                             reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
+                             description=desc)
+            if hind_sel['registry']:
+                hind_sel['show'](0)
+
+        # ── Fore Paw ──────────────────────────────────────────────────────
+        if fore_sel is not None:
+            _reg = self._register_metric
+            if 'WBI_fore' in df.columns and df['WBI_fore'].notna().any():
+                _reg(fore_sel, 'WBI Fore', 'bar', df, 'WBI_fore',
+                     reference=50.0, y_label='Weight Bearing Index \u2014 fore (%)',
+                     graph_cfg=graph_cfg,
+                     description='FL / (FL+FR) \u00d7 100.  Reference 50 = symmetric.')
+            if 'SI_fore' in df.columns and df['SI_fore'].notna().any():
+                _reg(fore_sel, 'SI Fore (Box)', 'box', df, 'SI_fore',
+                     reference=0.0, y_label='Symmetry Index \u2014 fore (%)',
+                     graph_cfg=graph_cfg,
+                     description='(FL\u2212FR) / (FL+FR) \u00d7 100.  Reference 0.')
+                _reg(fore_sel, 'SI Fore (Violin)', 'violin', df, 'SI_fore',
+                     reference=0.0, y_label='Symmetry Index \u2014 fore (%)',
+                     graph_cfg=graph_cfg)
+            if 'SBI_fore' in df.columns and df['SBI_fore'].notna().any():
+                _reg(fore_sel, 'SBI Fore', 'bar', df, 'SBI_fore',
+                     reference=0.0, y_label='Symmetry Balance Index \u2014 fore (%)',
+                     graph_cfg=graph_cfg,
+                     description='2 \u00d7 |FL\u2212FR| / (FL+FR) \u00d7 100.  Always \u2265 0.')
+            if bdf is not None:
+                for col, lbl, ref, ylbl, desc in [
+                    ('WBI_fore', 'WBI Fore \u2014 TC', 50.0,
+                     'Weight Bearing Index \u2014 fore (%)',
+                     'WBI fore across time bins. Reference 50 = symmetric.'),
+                    ('SI_fore', 'SI Fore \u2014 TC', 0.0,
+                     'Symmetry Index \u2014 fore (%)',
                      'SI fore across time bins. Reference 0 = symmetric.'),
-                    ('SBI_fore', 'SBI Fore — Time Course',  0.0,
-                     'Symmetry Balance Index — fore (%)',
+                    ('SBI_fore', 'SBI Fore \u2014 TC', 0.0,
+                     'Symmetry Balance Index \u2014 fore (%)',
                      'SBI fore across time bins. 0 = perfect symmetry.'),
                 ]:
                     if col in bdf.columns and bdf[col].notna().any():
-                        self._add_timecourse_tab(fore_nb, bdf, col, lbl,
-                                                 reference=ref, y_label=ylbl,
-                                                 graph_cfg=graph_cfg)
-                        _tab_descs[lbl] = desc
+                        _reg(fore_sel, lbl, 'timecourse', bdf, col,
+                             reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
+                             description=desc)
+            if fore_sel['registry']:
+                fore_sel['show'](0)
 
         # ── Contact % ─────────────────────────────────────────────────────
-        self._add_paw_contact_bar_tab(contact_nb, df, graph_cfg=graph_cfg)
-        _tab_descs['Contact %'] = (
-            'Percentage of frames each paw is in contact with the surface, grouped by treatment. '
-            'Higher values indicate more time spent in stance phase.')
-
-        for role in self.ROLES:
-            col = f'contact_pct_{role}'
-            if (bdf is not None
-                    and col in bdf.columns
-                    and 'bin_start_s' in bdf.columns):
-                self._add_timecourse_tab(contact_nb, bdf, col,
-                                         f'Contact % {role}',
-                                         reference=None,
-                                         y_label=f'Contact % — {role}',
-                                         graph_cfg=graph_cfg)
-                _tab_descs[f'Contact % {role}'] = (
-                    f'Percentage of frames {role} paw contacts the surface across time bins. '
-                    f'Decreased contact may indicate pain avoidance or guarding behavior.')
-
-        if (bdf is not None
-                and 'hind_fore_ratio' in bdf.columns
-                and bdf['hind_fore_ratio'].notna().any()):
-            self._add_timecourse_tab(contact_nb, bdf, 'hind_fore_ratio',
-                                     'Hind/Fore Ratio — Time Course',
-                                     reference=None,
-                                     y_label='Mean hind / mean fore contact %',
-                                     graph_cfg=graph_cfg)
-            _tab_descs['Hind/Fore Ratio — Time Course'] = (
-                'Ratio of mean hind paw contact to mean fore paw contact across time bins. '
-                'Values near 1 indicate balanced hind/fore usage.')
+        if contact_sel is not None:
+            _reg = self._register_metric
+            # Grouped bar chart as custom entry
+            _reg(contact_sel, 'Contact % (All Paws)', 'custom', None, None,
+                 graph_cfg=graph_cfg,
+                 description='Percentage of frames each paw is in contact with the surface.',
+                 create_fn=lambda f, _df=df, _gc=graph_cfg:
+                     self._add_paw_contact_bar_tab(f, _df, graph_cfg=_gc,
+                                                   as_frame=True))
+            for role in self.ROLES:
+                col = f'contact_pct_{role}'
+                if (bdf is not None and col in bdf.columns
+                        and 'bin_start_s' in bdf.columns):
+                    _reg(contact_sel, f'Contact % {role}', 'timecourse',
+                         bdf, col, reference=None,
+                         y_label=f'Contact % \u2014 {role}',
+                         graph_cfg=graph_cfg,
+                         description=f'{role} paw contact % across time bins.')
+            if (bdf is not None and 'hind_fore_ratio' in bdf.columns
+                    and bdf['hind_fore_ratio'].notna().any()):
+                _reg(contact_sel, 'Hind/Fore Ratio \u2014 TC', 'timecourse',
+                     bdf, 'hind_fore_ratio', reference=None,
+                     y_label='Mean hind / mean fore contact %',
+                     graph_cfg=graph_cfg,
+                     description='Ratio of mean hind to mean fore contact % across time bins.')
+            if contact_sel['registry']:
+                contact_sel['show'](0)
 
         # ── Brightness ────────────────────────────────────────────────────
-        if ('brightness_ratio_HL_HR' in df.columns
-                and df['brightness_ratio_HL_HR'].notna().any()):
-            self._add_bar_tab(bright_nb, df, 'brightness_ratio_HL_HR',
-                              'Brightness Ratio',
-                              reference=1.0,
-                              y_label='HL / HR brightness (contact frames)',
-                              graph_cfg=graph_cfg)
-            _tab_descs['Brightness Ratio'] = (
-                'Ratio of mean pixel brightness in the HL ROI to HR ROI during contact frames. '
-                'Reference 1.0 = equal brightness. Values >1 indicate greater HL paw-surface contact signal.')
-
-        if bdf is not None:
-            for col, lbl, ref, ylbl, desc in [
-                ('brightness_HL',          'Brightness HL — Time Course',   None,
-                 'Mean brightness — HL',
-                 'Mean pixel brightness within the HL ROI during contact frames. '
-                 'Higher brightness typically indicates greater paw-surface contact area or pressure.'),
-                ('brightness_HR',          'Brightness HR — Time Course',   None,
-                 'Mean brightness — HR',
-                 'Mean pixel brightness within the HR ROI during contact frames. '
-                 'Higher brightness typically indicates greater paw-surface contact area or pressure.'),
-                ('brightness_FL',          'Brightness FL — Time Course',   None,
-                 'Mean brightness — FL',
-                 'Mean pixel brightness within the FL ROI during contact frames. '
-                 'Higher brightness typically indicates greater paw-surface contact area or pressure.'),
-                ('brightness_FR',          'Brightness FR — Time Course',   None,
-                 'Mean brightness — FR',
-                 'Mean pixel brightness within the FR ROI during contact frames. '
-                 'Higher brightness typically indicates greater paw-surface contact area or pressure.'),
-                ('brightness_ratio_HL_HR', 'Brightness Ratio — Time Course', 1.0,
-                 'HL / HR brightness',
-                 'HL/HR brightness ratio across time bins. Tracks left-right asymmetry in '
-                 'paw-surface contact signal over time. Reference 1.0 = equal.'),
-            ]:
-                if col in bdf.columns and bdf[col].notna().any():
-                    self._add_timecourse_tab(bright_nb, bdf, col, lbl,
-                                             reference=ref, y_label=ylbl,
-                                             graph_cfg=graph_cfg)
-                    _tab_descs[lbl] = desc
-
-        # ── Gait Timing graphs ────────────────────────────────────────────
-        if gait_timing_nb is not None:
-            for role in self.ROLES:
-                for metric, lbl_suffix, ref, ylbl in [
-                    (f'stance_dur_{role}', f'Stance Dur {role}', None, f'Stance duration (s) — {role}'),
-                    (f'swing_dur_{role}',  f'Swing Dur {role}',  None, f'Swing duration (s) — {role}'),
-                    (f'duty_cycle_{role}', f'Duty Cycle {role}', None, f'Duty cycle (%) — {role}'),
-                ]:
-                    if metric in df.columns and df[metric].notna().any():
-                        self._add_bar_tab(gait_timing_nb, df, metric, lbl_suffix,
-                                          reference=ref, y_label=ylbl, graph_cfg=graph_cfg)
-                _tab_descs[f'Stance Dur {role}'] = (
-                    f'Mean stance duration (seconds) for {role} paw \u2014 the time each paw spends on the '
-                    f'ground per stride cycle. Increased stance duration may indicate guarding or '
-                    f'compensatory weight-shifting.')
-                _tab_descs[f'Swing Dur {role}'] = (
-                    f'Mean swing duration (seconds) for {role} paw \u2014 the time each paw spends in the '
-                    f'air per stride. Shorter swing may indicate reluctance to load the contralateral limb.')
-                _tab_descs[f'Duty Cycle {role}'] = (
-                    f'Duty cycle (%) for {role} \u2014 stance duration as a percentage of the full stride '
-                    f'cycle. Values >50% indicate more time in stance than swing. Increased duty cycle '
-                    f'can reflect slower, cautious gait.')
-
-            # Timecourse for gait timing
+        if bright_sel is not None:
+            _reg = self._register_metric
+            if ('brightness_ratio_HL_HR' in df.columns
+                    and df['brightness_ratio_HL_HR'].notna().any()):
+                _reg(bright_sel, 'Brightness Ratio', 'bar', df,
+                     'brightness_ratio_HL_HR', reference=1.0,
+                     y_label='HL / HR brightness (contact frames)',
+                     graph_cfg=graph_cfg,
+                     description='HL/HR brightness ratio. Reference 1.0 = equal.')
             if bdf is not None:
+                for col, lbl, ref, ylbl, desc in [
+                    ('brightness_HL', 'Brightness HL \u2014 TC', None,
+                     'Mean brightness \u2014 HL',
+                     'Mean brightness in HL ROI during contact frames.'),
+                    ('brightness_HR', 'Brightness HR \u2014 TC', None,
+                     'Mean brightness \u2014 HR',
+                     'Mean brightness in HR ROI during contact frames.'),
+                    ('brightness_FL', 'Brightness FL \u2014 TC', None,
+                     'Mean brightness \u2014 FL',
+                     'Mean brightness in FL ROI during contact frames.'),
+                    ('brightness_FR', 'Brightness FR \u2014 TC', None,
+                     'Mean brightness \u2014 FR',
+                     'Mean brightness in FR ROI during contact frames.'),
+                    ('brightness_ratio_HL_HR', 'Brightness Ratio \u2014 TC', 1.0,
+                     'HL / HR brightness',
+                     'HL/HR brightness ratio across time bins. Reference 1.0 = equal.'),
+                ]:
+                    if col in bdf.columns and bdf[col].notna().any():
+                        _reg(bright_sel, lbl, 'timecourse', bdf, col,
+                             reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
+                             description=desc)
+            if bright_sel['registry']:
+                bright_sel['show'](0)
+
+        # ── Gait graphs (deferred) ────────────────────────────────────
+        def _build_gait():
+            self._log("  Registering Gait metrics…")
+            _reg = self._register_metric
+            if gait_timing_sel is not None:
                 for role in self.ROLES:
-                    for col, lbl, ylbl in [
-                        (f'stance_dur_{role}', f'Stance {role} — TC', f'Stance dur (s) — {role}'),
-                        (f'duty_cycle_{role}', f'Duty {role} — TC',   f'Duty cycle (%) — {role}'),
-                        (f'cadence_{role}',    f'Cadence {role} — TC', f'Cadence (strides/min) — {role}'),
+                    for col, lbl, ref, ylbl, desc in [
+                        (f'stance_dur_{role}', f'Stance Dur {role}', None,
+                         f'Stance duration (s) \u2014 {role}',
+                         f'Mean stance duration (s) for {role}.'),
+                        (f'swing_dur_{role}', f'Swing Dur {role}', None,
+                         f'Swing duration (s) \u2014 {role}',
+                         f'Mean swing duration (s) for {role}.'),
+                        (f'duty_cycle_{role}', f'Duty Cycle {role}', None,
+                         f'Duty cycle (%) \u2014 {role}',
+                         f'Duty cycle (%) for {role}. >50% = more stance than swing.'),
                     ]:
-                        if col in bdf.columns and bdf[col].notna().any():
-                            self._add_timecourse_tab(gait_timing_nb, bdf, col, lbl,
-                                                     reference=None, y_label=ylbl,
-                                                     graph_cfg=graph_cfg)
-                    _tab_descs[f'Stance {role} — TC'] = (
-                        f'Stance duration for {role} across time bins.')
-                    _tab_descs[f'Duty {role} — TC'] = (
-                        f'Duty cycle for {role} across time bins.')
-                    _tab_descs[f'Cadence {role} — TC'] = (
-                        f'Stride cadence (strides/min) for {role} across time bins. '
-                        f'Lower cadence indicates slower stepping frequency.')
+                        if col in df.columns and df[col].notna().any():
+                            _reg(gait_timing_sel, lbl, 'bar', df, col,
+                                 reference=ref, y_label=ylbl,
+                                 graph_cfg=graph_cfg, description=desc)
+                    for col, lbl, ylbl, desc in [
+                        (f'swing_speed_{role}', f'Swing Speed {role}',
+                         f'Swing speed (px/s) \u2014 {role}',
+                         f'Mean swing speed for {role}. Injured animals swing slower on affected side.'),
+                    ]:
+                        if col in df.columns and df[col].notna().any():
+                            _reg(gait_timing_sel, lbl, 'bar', df, col,
+                                 reference=None, y_label=ylbl,
+                                 graph_cfg=graph_cfg, description=desc)
+                if bdf is not None:
+                    for role in self.ROLES:
+                        for col, lbl, ylbl, desc in [
+                            (f'stance_dur_{role}', f'Stance {role} \u2014 TC',
+                             f'Stance dur (s) \u2014 {role}',
+                             f'Stance duration for {role} across time bins.'),
+                            (f'duty_cycle_{role}', f'Duty {role} \u2014 TC',
+                             f'Duty cycle (%) \u2014 {role}',
+                             f'Duty cycle for {role} across time bins.'),
+                            (f'cadence_{role}', f'Cadence {role} \u2014 TC',
+                             f'Cadence (strides/min) \u2014 {role}',
+                             f'Stride cadence for {role} across time bins.'),
+                            (f'swing_speed_{role}', f'Swing Spd {role} \u2014 TC',
+                             f'Swing speed (px/s) \u2014 {role}',
+                             f'Swing speed for {role} across time bins.'),
+                        ]:
+                            if col in bdf.columns and bdf[col].notna().any():
+                                _reg(gait_timing_sel, lbl, 'timecourse',
+                                     bdf, col, reference=None, y_label=ylbl,
+                                     graph_cfg=graph_cfg, description=desc)
+                if gait_timing_sel['registry']:
+                    gait_timing_sel['show'](0)
 
-        # ── Gait Spatial graphs ──────────────────────────────────────────
-        if gait_spatial_nb is not None:
-            for role in self.ROLES:
-                metric = f'stride_len_{role}'
-                if metric in df.columns and df[metric].notna().any():
-                    lbl = f'Stride Len {role}'
-                    self._add_bar_tab(gait_spatial_nb, df, metric, lbl,
-                                      reference=None, y_label=f'Stride length (px) — {role}',
-                                      graph_cfg=graph_cfg)
-                    _tab_descs[lbl] = (
-                        f'Mean stride length (px) for {role} \u2014 distance between consecutive '
-                        f'foot-strikes of the same paw. Shorter strides may indicate '
-                        f'pain-related gait adaptation.')
-
-            for pair_name in ['hind', 'fore']:
-                for metric, lbl, ylbl in [
-                    (f'step_len_{pair_name}',   f'Step Len {pair_name}',   f'Step length (px) — {pair_name}'),
-                    (f'step_width_{pair_name}',  f'Step Width {pair_name}', f'Step width (px) — {pair_name}'),
-                ]:
-                    if metric in df.columns and df[metric].notna().any():
-                        self._add_bar_tab(gait_spatial_nb, df, metric, lbl,
-                                          reference=None, y_label=ylbl, graph_cfg=graph_cfg)
-                _tab_descs[f'Step Len {pair_name}'] = (
-                    f'Step length (px) for {pair_name} paws \u2014 distance between alternating '
-                    f'left-right foot-strikes. Asymmetric step lengths suggest unilateral impairment.')
-                _tab_descs[f'Step Width {pair_name}'] = (
-                    f'Step width (px) for {pair_name} paws \u2014 lateral distance between left and right '
-                    f'paw placements. Wider steps may indicate instability or balance compensation.')
-
-            if bdf is not None:
+            if gait_spatial_sel is not None:
                 for role in self.ROLES:
                     col = f'stride_len_{role}'
-                    if col in bdf.columns and bdf[col].notna().any():
-                        lbl = f'Stride Len {role} — TC'
-                        self._add_timecourse_tab(gait_spatial_nb, bdf, col, lbl,
-                                                 reference=None, y_label=f'Stride length (px) — {role}',
-                                                 graph_cfg=graph_cfg)
-                        _tab_descs[lbl] = f'Stride length for {role} across time bins.'
+                    if col in df.columns and df[col].notna().any():
+                        _reg(gait_spatial_sel, f'Stride Len {role}', 'bar',
+                             df, col, reference=None,
+                             y_label=f'Stride length (px) \u2014 {role}',
+                             graph_cfg=graph_cfg,
+                             description=f'Mean stride length (px) for {role}.')
+                for pair in ['hind', 'fore']:
+                    for col, lbl, ylbl in [
+                        (f'step_len_{pair}', f'Step Len {pair}',
+                         f'Step length (px) \u2014 {pair}'),
+                        (f'step_width_{pair}', f'Step Width {pair}',
+                         f'Step width (px) \u2014 {pair}'),
+                    ]:
+                        if col in df.columns and df[col].notna().any():
+                            _reg(gait_spatial_sel, lbl, 'bar', df, col,
+                                 reference=None, y_label=ylbl,
+                                 graph_cfg=graph_cfg, description=ylbl)
+                if bdf is not None:
+                    for role in self.ROLES:
+                        col = f'stride_len_{role}'
+                        if col in bdf.columns and bdf[col].notna().any():
+                            _reg(gait_spatial_sel,
+                                 f'Stride Len {role} \u2014 TC', 'timecourse',
+                                 bdf, col, reference=None,
+                                 y_label=f'Stride length (px) \u2014 {role}',
+                                 graph_cfg=graph_cfg,
+                                 description=f'Stride length for {role} across time bins.')
+                if gait_spatial_sel['registry']:
+                    gait_spatial_sel['show'](0)
 
-        # ── Gait Symmetry graphs ─────────────────────────────────────────
-        if gait_sym_nb is not None:
-            for metric, lbl, ref, ylbl in [
-                ('stance_SI_hind',      'Stance SI Hind',      0.0, 'Stance Symmetry Index (%)'),
-                ('stride_len_SI_hind',  'Stride Len SI Hind',  0.0, 'Stride Length Symmetry Index (%)'),
-            ]:
-                if metric in df.columns and df[metric].notna().any():
-                    self._add_bar_tab(gait_sym_nb, df, metric, lbl,
-                                      reference=ref, y_label=ylbl, graph_cfg=graph_cfg)
-                    self._add_box_tab(gait_sym_nb, df, metric, f'{lbl} (Box)',
-                                      reference=ref, y_label=ylbl, graph_cfg=graph_cfg)
-            _tab_descs['Stance SI Hind'] = (
-                'Stance Symmetry Index (%) for hind paws \u2014 (HL\u2212HR)/(HL+HR)\u00d7100. '
-                'Reference 0 = symmetric stance duration. Positive = longer HL stance.')
-            _tab_descs['Stance SI Hind (Box)'] = (
-                'Stance Symmetry Index (%) for hind paws \u2014 box plot showing distribution.')
-            _tab_descs['Stride Len SI Hind'] = (
-                'Stride Length Symmetry Index (%) for hind paws. Reference 0 = equal stride lengths. '
-                'Deviation indicates asymmetric gait pattern.')
-            _tab_descs['Stride Len SI Hind (Box)'] = (
-                'Stride Length Symmetry Index (%) for hind paws \u2014 box plot showing distribution.')
-
-            # Interlimb phase
-            for metric, lbl, ylbl in [
-                ('phase_HL_HR',   'Phase HL-HR',   'HL-HR phase (0.5 = alternating)'),
-                ('phase_diagonal', 'Phase Diagonal', 'HR-FL diagonal phase'),
-            ]:
-                if metric in df.columns and df[metric].notna().any():
-                    self._add_bar_tab(gait_sym_nb, df, metric, lbl,
-                                      reference=0.5, y_label=ylbl, graph_cfg=graph_cfg)
-            _tab_descs['Phase HL-HR'] = (
-                'Interlimb phase between hind left and hind right paws. Reference 0.5 = perfect '
-                'alternation (normal gait). Values near 0 or 1 indicate synchronous (hopping) gait.')
-            _tab_descs['Phase Diagonal'] = (
-                'Diagonal phase coupling (HR-FL). Reference 0.5 = alternating diagonal pattern '
-                '(normal trot). Deviation suggests coordination impairment.')
-
-            if bdf is not None:
-                for col, lbl, ylbl in [
-                    ('stance_SI_hind',     'Stance SI — TC',     'Stance SI (%)'),
-                    ('stride_len_SI_hind', 'Stride Len SI — TC', 'Stride Len SI (%)'),
+            if gait_sym_sel is not None:
+                for col, lbl, ref, ylbl in [
+                    ('stance_SI_hind', 'Stance SI Hind', 0.0,
+                     'Stance Symmetry Index (%)'),
+                    ('stride_len_SI_hind', 'Stride Len SI Hind', 0.0,
+                     'Stride Length Symmetry Index (%)'),
                 ]:
-                    if col in bdf.columns and bdf[col].notna().any():
-                        self._add_timecourse_tab(gait_sym_nb, bdf, col, lbl,
-                                                 reference=0.0, y_label=ylbl,
-                                                 graph_cfg=graph_cfg)
-                _tab_descs['Stance SI — TC'] = (
-                    'Stance Symmetry Index across time bins. Tracks left-right stance asymmetry over time.')
-                _tab_descs['Stride Len SI — TC'] = (
-                    'Stride Length Symmetry Index across time bins. Tracks stride length asymmetry over time.')
-
-        # ── Locomotion graphs ─────────────────────────────────────────
-        if loco_nb is not None:
-            for col, lbl, ylbl in [
-                ('total_distance',      'Total Distance',    'Distance (px)'),
-                ('loco_total_distance', 'Distance (Moving)', 'Distance (px) — locomotion only'),
-                ('time_moving_s',       'Time Moving',       'Time moving (s)'),
-                ('time_moving_pct',     'Time Moving %',     'Time in locomotion (%)'),
-            ]:
-                if col in df.columns and df[col].notna().any():
-                    self._add_bar_tab(loco_nb, df, col, lbl,
-                                      y_label=ylbl, graph_cfg=graph_cfg)
-            _tab_descs['Total Distance'] = (
-                'Total displacement of the body centre across the entire session (px).')
-            _tab_descs['Distance (Moving)'] = (
-                'Total displacement accumulated only during locomotion bouts (px).')
-            _tab_descs['Time Moving'] = (
-                'Total time the animal was in locomotion (seconds).')
-            _tab_descs['Time Moving %'] = (
-                'Percentage of the session spent in locomotion.')
-
-            if bdf is not None:
+                    if col in df.columns and df[col].notna().any():
+                        _reg(gait_sym_sel, lbl, 'bar', df, col,
+                             reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
+                             description=f'{ylbl}. Reference 0 = symmetric.')
+                        _reg(gait_sym_sel, f'{lbl} (Box)', 'box', df, col,
+                             reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
+                             description=f'{ylbl} \u2014 box plot distribution.')
+                for role in self.ROLES:
+                    col = f'stride_cv_{role}'
+                    if col in df.columns and df[col].notna().any():
+                        _reg(gait_sym_sel, f'Stride CV {role}', 'bar',
+                             df, col, reference=None,
+                             y_label=f'Stride CV (%) \u2014 {role}',
+                             graph_cfg=graph_cfg,
+                             description=f'Stride-to-stride CV for {role}. Higher = less rhythmic.')
                 for col, lbl, ylbl in [
-                    ('total_distance',      'Distance — TC',          'Distance (px)'),
-                    ('loco_total_distance', 'Distance (Moving) — TC', 'Distance (px) — locomotion'),
-                    ('time_moving_s',       'Time Moving — TC',       'Time moving (s)'),
-                    ('time_moving_pct',     'Time Moving % — TC',     'Time in locomotion (%)'),
+                    ('phase_HL_HR', 'Phase HL-HR',
+                     'HL-HR phase (0.5 = alternating)'),
+                    ('phase_diagonal', 'Phase Diagonal',
+                     'HR-FL diagonal phase'),
                 ]:
-                    if col in bdf.columns and bdf[col].notna().any():
-                        self._add_timecourse_tab(loco_nb, bdf, col, lbl,
-                                                 y_label=ylbl, graph_cfg=graph_cfg)
-                _tab_descs['Distance — TC'] = (
-                    'Total body displacement per time bin.')
-                _tab_descs['Distance (Moving) — TC'] = (
-                    'Body displacement during locomotion bouts per time bin.')
-                _tab_descs['Time Moving — TC'] = (
-                    'Time spent in locomotion per time bin (seconds).')
-                _tab_descs['Time Moving % — TC'] = (
-                    'Percentage of each time bin spent in locomotion.')
+                    if col in df.columns and df[col].notna().any():
+                        _reg(gait_sym_sel, lbl, 'bar', df, col,
+                             reference=0.5, y_label=ylbl,
+                             graph_cfg=graph_cfg,
+                             description=f'{ylbl}. Reference 0.5 = alternating.')
+                if bdf is not None:
+                    for col, lbl, ylbl, desc in [
+                        ('stance_SI_hind', 'Stance SI \u2014 TC',
+                         'Stance SI (%)',
+                         'Stance Symmetry Index across time bins.'),
+                        ('stride_len_SI_hind', 'Stride Len SI \u2014 TC',
+                         'Stride Len SI (%)',
+                         'Stride Length SI across time bins.'),
+                    ]:
+                        if col in bdf.columns and bdf[col].notna().any():
+                            _reg(gait_sym_sel, lbl, 'timecourse', bdf, col,
+                                 reference=0.0, y_label=ylbl,
+                                 graph_cfg=graph_cfg, description=desc)
+                if gait_sym_sel['registry']:
+                    gait_sym_sel['show'](0)
 
-        # ── Paw Contour graphs ──────────────────────────────────────────
+        if has_any_gait:
+            _register_deferred(gait_group.master, _build_gait)
+
+        # ── Movement graphs (deferred) ─────────────────────────────────
+        def _build_movement():
+            self._log("  Registering Movement metrics…")
+            _reg = self._register_metric
+            if loco_sel is not None:
+                for col, lbl, ylbl, desc in [
+                    ('total_distance', 'Total Distance', 'Distance (px)',
+                     'Total body displacement across the session.'),
+                    ('loco_total_distance', 'Distance (Moving)',
+                     'Distance (px) \u2014 locomotion only',
+                     'Displacement during locomotion bouts only.'),
+                    ('time_moving_s', 'Time Moving', 'Time moving (s)',
+                     'Total time in locomotion (seconds).'),
+                    ('time_moving_pct', 'Time Moving %',
+                     'Time in locomotion (%)',
+                     'Percentage of session spent in locomotion.'),
+                    ('body_speed_mean', 'Body Speed Mean',
+                     'Body speed (px/s)',
+                     'Mean body centroid speed across all frames.'),
+                    ('body_speed_loco', 'Body Speed (Loco)',
+                     'Body speed (px/s) \u2014 locomotion',
+                     'Mean body speed during locomotion bouts only.'),
+                ]:
+                    if col in df.columns and df[col].notna().any():
+                        _reg(loco_sel, lbl, 'bar', df, col,
+                             y_label=ylbl, graph_cfg=graph_cfg,
+                             description=desc)
+                if bdf is not None:
+                    for col, lbl, ylbl, desc in [
+                        ('total_distance', 'Distance \u2014 TC',
+                         'Distance (px)',
+                         'Total body displacement per time bin.'),
+                        ('loco_total_distance', 'Distance (Moving) \u2014 TC',
+                         'Distance (px) \u2014 locomotion',
+                         'Displacement during locomotion per time bin.'),
+                        ('time_moving_s', 'Time Moving \u2014 TC',
+                         'Time moving (s)',
+                         'Time in locomotion per time bin.'),
+                        ('time_moving_pct', 'Time Moving % \u2014 TC',
+                         'Time in locomotion (%)',
+                         'Percentage of each time bin in locomotion.'),
+                        ('body_speed_mean', 'Body Speed \u2014 TC',
+                         'Body speed (px/s)',
+                         'Mean body speed per time bin.'),
+                        ('body_speed_loco', 'Body Speed Loco \u2014 TC',
+                         'Body speed (px/s) \u2014 loco',
+                         'Body speed during locomotion per time bin.'),
+                    ]:
+                        if col in bdf.columns and bdf[col].notna().any():
+                            _reg(loco_sel, lbl, 'timecourse', bdf, col,
+                                 y_label=ylbl, graph_cfg=graph_cfg,
+                                 description=desc)
+                if loco_sel['registry']:
+                    loco_sel['show'](0)
+
+            if coord_sel is not None:
+                if ('regularity_index' in df.columns
+                        and df['regularity_index'].notna().any()):
+                    _reg(coord_sel, 'Regularity Index', 'bar', df,
+                         'regularity_index', reference=100.0,
+                         y_label='Regularity Index (%)',
+                         graph_cfg=graph_cfg,
+                         description='% of steps following normal 4-paw pattern. 100% = perfect.')
+                for side in ['L', 'R']:
+                    col = f'print_position_{side}'
+                    if col in df.columns and df[col].notna().any():
+                        _reg(coord_sel, f'Print Position {side}', 'bar',
+                             df, col, reference=None,
+                             y_label=f'Print position (px) \u2014 {side}',
+                             graph_cfg=graph_cfg,
+                             description=f'Hind-fore paw overlap distance ({side}). Smaller = better.')
+                support_cols = [f'support_{n}paw_pct' for n in range(5)]
+                if all(c in df.columns for c in support_cols[:3]):
+                    _reg(coord_sel, 'Support Patterns', 'custom', None, None,
+                         graph_cfg=graph_cfg,
+                         description='Distribution of paw support during locomotion.',
+                         create_fn=lambda f, _df=df, _gc=graph_cfg:
+                             self._add_support_pattern_tab(f, _df,
+                                                           graph_cfg=_gc,
+                                                           as_frame=True))
+                for col, lbl, ylbl in [
+                    ('phase_HL_HR', 'Phase HL-HR', 'HL-HR phase'),
+                    ('phase_diagonal', 'Phase Diagonal',
+                     'HR-FL diagonal phase'),
+                    ('phase_FL_FR', 'Phase FL-FR', 'FL-FR phase'),
+                    ('phase_HL_FL', 'Phase HL-FL', 'HL-FL phase'),
+                    ('phase_HR_FR', 'Phase HR-FR', 'HR-FR phase'),
+                    ('phase_HL_FR', 'Phase HL-FR', 'HL-FR phase'),
+                ]:
+                    if col in df.columns and df[col].notna().any():
+                        _reg(coord_sel, lbl, 'bar', df, col,
+                             reference=0.5, y_label=ylbl,
+                             graph_cfg=graph_cfg,
+                             description=f'{ylbl}. 0.5 = alternating (normal).')
+                if coord_sel['registry']:
+                    coord_sel['show'](0)
+
+        if has_any_movement:
+            _register_deferred(movement_group.master, _build_movement)
+
+        # ── Paw Contour graphs (deferred) ───────────────────────────────
         _contour_metrics = [
             ('paw_area',          'Area',         'Paw area (px\u00b2) \u2014 {}'),
             ('paw_spread',        'Spread',       'Paw spread (px) \u2014 {}'),
@@ -5731,12 +6451,10 @@ class GaitLimbTab(ttk.Frame):
             ('paw_aspect_ratio',  'Aspect Ratio', 'Aspect ratio \u2014 {}'),
             ('paw_circularity',   'Circularity',  'Circularity \u2014 {}'),
         ]
-        # Check for regular contour data
         has_contour = any(
             f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
             for mk, _, _ in _contour_metrics for role in self.ROLES
         ) or ('paw_area_ratio_hind' in df.columns and df['paw_area_ratio_hind'].notna().any()) or ('contact_intensity_ratio_hind' in df.columns and df['contact_intensity_ratio_hind'].notna().any())
-        # Stance contour metrics (full-stance variant)
         _contour_stance_metrics = [
             ('paw_area_stance',          'Area',         'Paw area (px\u00b2) \u2014 {}'),
             ('paw_spread_stance',        'Spread',       'Paw spread (px) \u2014 {}'),
@@ -5750,194 +6468,256 @@ class GaitLimbTab(ttk.Frame):
             f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
             for mk, _, _ in _contour_stance_metrics for role in self.ROLES
         )
-        # Paw-like contour metrics (solidity-filtered)
         _contour_pawlike_metrics = [
-            ('pawlike_area',          'Area',         'Paw area (px²) — {}'),
-            ('pawlike_spread',        'Spread',       'Paw spread (px) — {}'),
-            ('pawlike_intensity',     'Intensity',    'Contact intensity — {}'),
-            ('pawlike_width',         'Width',        'Paw width (px) — {}'),
-            ('pawlike_solidity',      'Solidity',     'Paw solidity — {}'),
-            ('pawlike_aspect_ratio',  'Aspect Ratio', 'Aspect ratio — {}'),
-            ('pawlike_circularity',   'Circularity',  'Circularity — {}'),
+            ('pawlike_area',          'Area',         'Paw area (px\u00b2) \u2014 {}'),
+            ('pawlike_spread',        'Spread',       'Paw spread (px) \u2014 {}'),
+            ('pawlike_intensity',     'Intensity',    'Contact intensity \u2014 {}'),
+            ('pawlike_width',         'Width',        'Paw width (px) \u2014 {}'),
+            ('pawlike_solidity',      'Solidity',     'Paw solidity \u2014 {}'),
+            ('pawlike_aspect_ratio',  'Aspect Ratio', 'Aspect ratio \u2014 {}'),
+            ('pawlike_circularity',   'Circularity',  'Circularity \u2014 {}'),
         ]
         has_pawlike_contour = any(
             f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
             for mk, _, _ in _contour_pawlike_metrics for role in self.ROLES
         )
 
-        contour_nb = _make_category("Paw Contour") if (has_contour or has_stance_contour or has_pawlike_contour) else None
+        contour_nb = (_make_group("Paw Contour")
+                      if show_contour and (has_contour or has_stance_contour or has_pawlike_contour)
+                      else None)
         contour_all_nb = None
         contour_stance_nb = None
+        _contour_paw_nbs = []
 
-        _contour_paw_nbs = []  # track dynamically created notebooks for tab-change binding
+        def _build_contour():
+            self._log("  Building Paw Contour graphs…")
+            if contour_nb is not None:
+                _paw_labels = {'HL': 'Hind Left', 'HR': 'Hind Right',
+                               'FL': 'Fore Left', 'FR': 'Fore Right'}
+
+                def _build_contour_paw_tabs(parent_nb, metrics_list, stance_suffix, df_src, bdf_src,
+                                            ratio_key, intensity_ratio_key, filter_paw=False):
+                    """Build per-paw metric selectors inside parent_nb."""
+                    _reg = self._register_metric
+                    for role in self.ROLES:
+                        has_paw = any(
+                            f'{mk}_{role}' in df_src.columns and df_src[f'{mk}_{role}'].notna().any()
+                            for mk, _, _ in metrics_list
+                        )
+                        if not has_paw:
+                            continue
+                        paw_label = _paw_labels.get(role, role)
+                        paw_sel = self._make_metric_selector(
+                            parent_nb, paw_label, desc_lbl, _tab_descs)
+
+                        # Shape (custom)
+                        _reg(paw_sel, 'Shape', 'custom', None, None,
+                             description='Mean paw contour shape.',
+                             create_fn=lambda f, _r=role, _fp=filter_paw:
+                                 self._add_contour_shape_tab(
+                                     f, df_src, self._session_intermediates,
+                                     _r, tab_name='Shape', graph_cfg=graph_cfg,
+                                     filter_paw=_fp, as_frame=True))
+                        # Prints
+                        _reg(paw_sel, 'Print (Single)', 'custom', None, None,
+                             description='Single representative paw print.',
+                             create_fn=lambda f, _r=role, _fp=filter_paw:
+                                 self._add_contour_print_tab(
+                                     f, df_src, self._session_intermediates,
+                                     _r, tab_name='Single', graph_cfg=graph_cfg,
+                                     n_prints=1, filter_paw=_fp, as_frame=True))
+                        _reg(paw_sel, 'Prints (Multi 5)', 'custom', None, None,
+                             description='Five representative paw prints.',
+                             create_fn=lambda f, _r=role, _fp=filter_paw:
+                                 self._add_contour_print_tab(
+                                     f, df_src, self._session_intermediates,
+                                     _r, tab_name='Multi (5)', graph_cfg=graph_cfg,
+                                     n_prints=5, filter_paw=_fp, as_frame=True))
+                        # All contour metrics
+                        for metric_key, tab_prefix, ylbl_template in metrics_list:
+                            col = f'{metric_key}_{role}'
+                            ylbl = ylbl_template.format(paw_label)
+                            if col in df_src.columns and df_src[col].notna().any():
+                                _reg(paw_sel, tab_prefix, 'bar', df_src, col,
+                                     y_label=ylbl, graph_cfg=graph_cfg,
+                                     description=ylbl)
+                            if (bdf_src is not None and col in bdf_src.columns
+                                    and bdf_src[col].notna().any()):
+                                _reg(paw_sel, f'{tab_prefix} \u2014 TC',
+                                     'timecourse', bdf_src, col,
+                                     y_label=ylbl, graph_cfg=graph_cfg,
+                                     description=f'{ylbl} across time bins.')
+                        if paw_sel['registry']:
+                            paw_sel['show'](0)
+
+                    # Ratios
+                    has_ratios = False
+                    for rk in [ratio_key, intensity_ratio_key]:
+                        if rk in df_src.columns and df_src[rk].notna().any():
+                            has_ratios = True
+                        if (bdf_src is not None and rk in bdf_src.columns
+                                and bdf_src[rk].notna().any()):
+                            has_ratios = True
+                    if has_ratios:
+                        ratio_sel = self._make_metric_selector(
+                            parent_nb, 'Ratios', desc_lbl, _tab_descs)
+                        ylbl_sfx = ' (stance)' if stance_suffix else ''
+                        if ratio_key in df_src.columns and df_src[ratio_key].notna().any():
+                            _reg(ratio_sel, 'Area Ratio Hind', 'bar',
+                                 df_src, ratio_key, reference=1.0,
+                                 y_label=f'Paw area ratio HL/HR{ylbl_sfx}',
+                                 graph_cfg=graph_cfg,
+                                 description='HL/HR paw area ratio. 1.0 = equal.')
+                        if (intensity_ratio_key in df_src.columns
+                                and df_src[intensity_ratio_key].notna().any()):
+                            _reg(ratio_sel, 'Intensity Ratio Hind', 'bar',
+                                 df_src, intensity_ratio_key, reference=1.0,
+                                 y_label=f'Intensity ratio HL/HR{ylbl_sfx}',
+                                 graph_cfg=graph_cfg,
+                                 description='HL/HR intensity ratio. 1.0 = equal.')
+                        if bdf_src is not None:
+                            if (ratio_key in bdf_src.columns
+                                    and bdf_src[ratio_key].notna().any()):
+                                _reg(ratio_sel, 'Area Ratio \u2014 TC',
+                                     'timecourse', bdf_src, ratio_key,
+                                     reference=1.0,
+                                     y_label=f'Paw area ratio HL/HR{ylbl_sfx}',
+                                     graph_cfg=graph_cfg,
+                                     description='HL/HR area ratio across time bins.')
+                            if (intensity_ratio_key in bdf_src.columns
+                                    and bdf_src[intensity_ratio_key].notna().any()):
+                                _reg(ratio_sel, 'Intensity Ratio \u2014 TC',
+                                     'timecourse', bdf_src,
+                                     intensity_ratio_key, reference=1.0,
+                                     y_label=f'Intensity ratio HL/HR{ylbl_sfx}',
+                                     graph_cfg=graph_cfg,
+                                     description='HL/HR intensity ratio across time bins.')
+                        if ratio_sel['registry']:
+                            ratio_sel['show'](0)
+
+                # ── All Frames (default / first tab) ──
+                if has_contour:
+                    contour_all_nb = ttk.Notebook(contour_nb)
+                    contour_nb.add(contour_all_nb, text='All Frames')
+                    _contour_paw_nbs.append(contour_all_nb)
+                    _build_contour_paw_tabs(
+                        contour_all_nb, _contour_metrics, False, df, bdf,
+                        'paw_area_ratio_hind', 'contact_intensity_ratio_hind')
+
+                # ── Filter Preview ──
+                if has_pawlike_contour:
+                    contour_nb_frame = ttk.Frame(contour_nb)
+                    contour_nb.add(contour_nb_frame, text='Filter Preview')
+
+                    # Sync Left/Right checkbox
+                    self._filter_sync_lr_var = tk.BooleanVar(value=True)
+                    self._filter_slider_vars = {}  # role -> (sol_var, ar_var, circ_var)
+                    sync_frame = ttk.Frame(contour_nb_frame, padding=(6, 4, 6, 0))
+                    sync_frame.pack(side='top', fill='x')
+                    ttk.Checkbutton(sync_frame, text="Sync Left/Right thresholds",
+                                    variable=self._filter_sync_lr_var).pack(anchor='w')
+
+                    filter_nb = ttk.Notebook(contour_nb_frame)
+                    filter_nb.pack(fill='both', expand=True)
+                    _contour_paw_nbs.append(filter_nb)
+                    for role in self.ROLES:
+                        has_paw = any(
+                            f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
+                            for mk, _, _ in _contour_pawlike_metrics
+                        )
+                        if has_paw:
+                            self._add_contour_filter_preview_tab(
+                                filter_nb, df, self._session_intermediates,
+                                role, tab_name=_paw_labels.get(role, role),
+                                graph_cfg=graph_cfg)
+                    _tab_descs['Filter Preview'] = (
+                        'Interactive preview of the paw-like contour filter. '
+                        'Adjust solidity, aspect ratio, and circularity thresholds '
+                        'to see which paw shapes are included or excluded.')
+
+                # ── Full Stance (optional) ──
+                show_full_stance = _sets.get('full_stance', False)
+                if has_stance_contour and show_full_stance:
+                    contour_stance_nb = ttk.Notebook(contour_nb)
+                    contour_nb.add(contour_stance_nb, text='Full Stance')
+                    _contour_paw_nbs.append(contour_stance_nb)
+                    _build_contour_paw_tabs(
+                        contour_stance_nb, _contour_stance_metrics, True, df, bdf,
+                        'paw_area_ratio_stance_hind', 'contact_intensity_ratio_stance_hind')
+
+                # ── Filtered Contour (renamed from Paw-like) ──
+                if has_pawlike_contour:
+                    contour_pawlike_nb = ttk.Notebook(contour_nb)
+                    contour_nb.add(contour_pawlike_nb, text='Filtered Contour')
+                    _contour_paw_nbs.append(contour_pawlike_nb)
+                    self._contour_pawlike_nb = contour_pawlike_nb
+                    self._contour_nb = contour_nb
+                    self._contour_pawlike_metrics = _contour_pawlike_metrics
+                    self._contour_graph_cfg = graph_cfg
+                    self._contour_build_fn = _build_contour_paw_tabs
+                    _build_contour_paw_tabs(
+                        contour_pawlike_nb, _contour_pawlike_metrics, False, df, bdf,
+                        'pawlike_area_ratio_hind', 'pawlike_intensity_ratio_hind',
+                        filter_paw=True)
+
+                # Paw contour descriptions
+                _contour_descs = {
+                    'Area':         ('Mean paw contour area (px\u00b2) during contact frames. '
+                                     'Larger area indicates greater paw-surface contact, which may '
+                                     'reflect normal weight-bearing.'),
+                    'Spread':       ('Maximum dimension (px) of paw contour bounding box. '
+                                     'Larger spread indicates more toe-spreading or a flatter paw placement.'),
+                    'Intensity':    ('Mean pixel brightness within paw contour shape during contact. '
+                                     'Higher intensity indicates stronger paw-surface contact signal.'),
+                    'Width':        ('Minimum dimension (px) of paw contour bounding box. '
+                                     'Represents the narrower axis of the paw print.'),
+                    'Solidity':     ('Solidity of paw contour \u2014 ratio of contour area to convex hull area. '
+                                     'Values near 1.0 indicate a solid, compact paw print; lower values suggest '
+                                     'irregular or fragmented contact.'),
+                    'Aspect Ratio': ('Aspect ratio of paw contour bounding box (max/min dimension). '
+                                     'Higher values indicate an elongated paw print; values near 1.0 indicate '
+                                     'a round print.'),
+                    'Circularity':  ('Circularity of paw contour \u2014 4\u03c0\u00d7area/perimeter\u00b2. '
+                                     'Values near 1.0 indicate a circular shape; lower values indicate '
+                                     'irregular or elongated contours.'),
+                }
+                for tab_prefix, desc in _contour_descs.items():
+                    _tab_descs[tab_prefix] = desc
+                    _tab_descs[f'{tab_prefix} — TC'] = desc + ' Shown across time bins.'
+
+                for pl in _paw_labels.values():
+                    _tab_descs[pl] = f'Contour metrics for {pl} paw.'
+                _tab_descs['All Frames'] = 'Contour metrics computed on all contact frames (per-paw stance detection).'
+                _tab_descs['Full Stance'] = 'Contour metrics restricted to frames where ALL contour paws are simultaneously in ground contact.'
+                _tab_descs['Filtered Contour'] = ('Contour metrics filtered by solidity, aspect ratio, and circularity thresholds. '
+                                                  'Adjust thresholds in Filter Preview and click Apply to update.')
+                _tab_descs['Ratios'] = 'Left/Right paw contour ratios (HL/HR). Reference 1.0 = equal between sides.'
+                _tab_descs['Shape'] = ('Mean paw contour outline averaged across contact frames. '
+                                       'Normalized by contour area for size-independent shape comparison. '
+                                       '\u00b11 SD envelope shown as shaded region.')
+                _tab_descs['Area Ratio Hind'] = (
+                    'Ratio of HL to HR paw contour area. Reference 1.0 = equal area. '
+                    'Values >1 indicate larger left hind contact area.')
+                _tab_descs['Area Ratio Hind — TC'] = (
+                    'Ratio of HL to HR paw contour area across time bins. Reference 1.0 = equal area.')
+                _tab_descs['Intensity Ratio Hind'] = (
+                    'Ratio of HL to HR paw contour intensity. Reference 1.0 = equal intensity. '
+                    'Values >1 indicate brighter left hind contact.')
+                _tab_descs['Intensity Ratio Hind — TC'] = (
+                    'Ratio of HL to HR paw contour intensity across time bins. Reference 1.0 = equal intensity.')
+
+                # Bind tab-change handler to dynamically created inner notebooks
+                for _nb in [contour_nb] + _contour_paw_nbs:
+                    if _nb is not None:
+                        _nb.bind('<<NotebookTabChanged>>', _on_tab_change)
 
         if contour_nb is not None:
-            _paw_labels = {'HL': 'Hind Left', 'HR': 'Hind Right',
-                           'FL': 'Fore Left', 'FR': 'Fore Right'}
-
-            def _build_contour_paw_tabs(parent_nb, metrics_list, stance_suffix, df_src, bdf_src,
-                                        ratio_key, intensity_ratio_key, filter_paw=False):
-                """Build per-paw sub-tabs with metric sub-sub-tabs inside each paw."""
-                for role in self.ROLES:
-                    # Check if this paw has any data
-                    has_paw = any(
-                        f'{mk}_{role}' in df_src.columns and df_src[f'{mk}_{role}'].notna().any()
-                        for mk, _, _ in metrics_list
-                    )
-                    if not has_paw:
-                        continue
-                    paw_label = _paw_labels.get(role, role)
-                    paw_nb = ttk.Notebook(parent_nb)
-                    parent_nb.add(paw_nb, text=paw_label)
-                    _contour_paw_nbs.append(paw_nb)
-
-                    # Mean contour shape tab (first, as visual overview)
-                    self._add_contour_shape_tab(
-                        paw_nb, df_src, self._session_intermediates,
-                        role, tab_name='Shape', graph_cfg=graph_cfg)
-
-                    # Single representative paw print per treatment
-                    self._add_contour_print_tab(
-                        paw_nb, df_src, self._session_intermediates,
-                        role, tab_name='Paw Print', graph_cfg=graph_cfg,
-                        n_prints=1, filter_paw=filter_paw)
-
-                    # 5 representative prints per treatment (variability cloud)
-                    self._add_contour_print_tab(
-                        paw_nb, df_src, self._session_intermediates,
-                        role, tab_name='Paw Print \u2014 5', graph_cfg=graph_cfg,
-                        n_prints=5, filter_paw=filter_paw)
-
-                    # Per-subject single paw print
-                    self._add_contour_print_tab(
-                        paw_nb, df_src, self._session_intermediates,
-                        role, tab_name='Paw Print \u2014 Subjects', graph_cfg=graph_cfg,
-                        n_prints=1, group_by='subject', filter_paw=filter_paw)
-
-                    # Interactive filter preview tab (only for paw-like variant)
-                    if filter_paw:
-                        self._add_contour_filter_preview_tab(
-                            paw_nb, df_src, self._session_intermediates,
-                            role, tab_name='Filter Preview', graph_cfg=graph_cfg)
-
-                    for metric_key, tab_prefix, ylbl_template in metrics_list:
-                        col = f'{metric_key}_{role}'
-                        if col in df_src.columns and df_src[col].notna().any():
-                            self._add_bar_tab(
-                                paw_nb, df_src, col, tab_prefix,
-                                y_label=ylbl_template.format(paw_label),
-                                graph_cfg=graph_cfg)
-                        if bdf_src is not None and col in bdf_src.columns and bdf_src[col].notna().any():
-                            self._add_timecourse_tab(
-                                paw_nb, bdf_src, col, f'{tab_prefix} — TC',
-                                y_label=ylbl_template.format(paw_label),
-                                graph_cfg=graph_cfg)
-
-                # Ratios tab (HL/HR)
-                has_ratios = False
-                for rk in [ratio_key, intensity_ratio_key]:
-                    if rk in df_src.columns and df_src[rk].notna().any():
-                        has_ratios = True
-                    if bdf_src is not None and rk in bdf_src.columns and bdf_src[rk].notna().any():
-                        has_ratios = True
-                if has_ratios:
-                    ratio_nb = ttk.Notebook(parent_nb)
-                    parent_nb.add(ratio_nb, text='Ratios')
-                    _contour_paw_nbs.append(ratio_nb)
-                    ylbl_suffix = ' (stance)' if stance_suffix else ''
-                    if ratio_key in df_src.columns and df_src[ratio_key].notna().any():
-                        self._add_bar_tab(ratio_nb, df_src, ratio_key,
-                                          'Area Ratio Hind', reference=1.0,
-                                          y_label=f'Paw area ratio HL/HR{ylbl_suffix}',
-                                          graph_cfg=graph_cfg)
-                    if intensity_ratio_key in df_src.columns and df_src[intensity_ratio_key].notna().any():
-                        self._add_bar_tab(ratio_nb, df_src, intensity_ratio_key,
-                                          'Intensity Ratio Hind', reference=1.0,
-                                          y_label=f'Intensity ratio HL/HR{ylbl_suffix}',
-                                          graph_cfg=graph_cfg)
-                    if bdf_src is not None:
-                        if ratio_key in bdf_src.columns and bdf_src[ratio_key].notna().any():
-                            self._add_timecourse_tab(ratio_nb, bdf_src, ratio_key,
-                                                     'Area Ratio Hind — TC', reference=1.0,
-                                                     y_label=f'Paw area ratio HL/HR{ylbl_suffix}',
-                                                     graph_cfg=graph_cfg)
-                        if intensity_ratio_key in bdf_src.columns and bdf_src[intensity_ratio_key].notna().any():
-                            self._add_timecourse_tab(ratio_nb, bdf_src, intensity_ratio_key,
-                                                     'Intensity Ratio Hind — TC', reference=1.0,
-                                                     y_label=f'Intensity ratio HL/HR{ylbl_suffix}',
-                                                     graph_cfg=graph_cfg)
-
-            if has_contour:
-                contour_all_nb = ttk.Notebook(contour_nb)
-                contour_nb.add(contour_all_nb, text='All Frames')
-                _contour_paw_nbs.append(contour_all_nb)
-                _build_contour_paw_tabs(
-                    contour_all_nb, _contour_metrics, False, df, bdf,
-                    'paw_area_ratio_hind', 'contact_intensity_ratio_hind')
-
-            if has_stance_contour:
-                contour_stance_nb = ttk.Notebook(contour_nb)
-                contour_nb.add(contour_stance_nb, text='Full Stance')
-                _contour_paw_nbs.append(contour_stance_nb)
-                _build_contour_paw_tabs(
-                    contour_stance_nb, _contour_stance_metrics, True, df, bdf,
-                    'paw_area_ratio_stance_hind', 'contact_intensity_ratio_stance_hind')
-
-            if has_pawlike_contour:
-                contour_pawlike_nb = ttk.Notebook(contour_nb)
-                contour_nb.add(contour_pawlike_nb, text='Paw-like')
-                _contour_paw_nbs.append(contour_pawlike_nb)
-                _build_contour_paw_tabs(
-                    contour_pawlike_nb, _contour_pawlike_metrics, False, df, bdf,
-                    'pawlike_area_ratio_hind', 'pawlike_intensity_ratio_hind',
-                    filter_paw=True)
-
-            # Paw contour descriptions
-            _contour_descs = {
-                'Area':         ('Mean paw contour area (px\u00b2) during contact frames. '
-                                 'Larger area indicates greater paw-surface contact, which may '
-                                 'reflect normal weight-bearing.'),
-                'Spread':       ('Maximum dimension (px) of paw contour bounding box. '
-                                 'Larger spread indicates more toe-spreading or a flatter paw placement.'),
-                'Intensity':    ('Mean pixel brightness within paw contour shape during contact. '
-                                 'Higher intensity indicates stronger paw-surface contact signal.'),
-                'Width':        ('Minimum dimension (px) of paw contour bounding box. '
-                                 'Represents the narrower axis of the paw print.'),
-                'Solidity':     ('Solidity of paw contour \u2014 ratio of contour area to convex hull area. '
-                                 'Values near 1.0 indicate a solid, compact paw print; lower values suggest '
-                                 'irregular or fragmented contact.'),
-                'Aspect Ratio': ('Aspect ratio of paw contour bounding box (max/min dimension). '
-                                 'Higher values indicate an elongated paw print; values near 1.0 indicate '
-                                 'a round print.'),
-                'Circularity':  ('Circularity of paw contour \u2014 4\u03c0\u00d7area/perimeter\u00b2. '
-                                 'Values near 1.0 indicate a circular shape; lower values indicate '
-                                 'irregular or elongated contours.'),
-            }
-            for tab_prefix, desc in _contour_descs.items():
-                _tab_descs[tab_prefix] = desc
-                _tab_descs[f'{tab_prefix} — TC'] = desc + ' Shown across time bins.'
-
-            for pl in _paw_labels.values():
-                _tab_descs[pl] = f'Contour metrics for {pl} paw.'
-            _tab_descs['All Frames'] = 'Contour metrics computed on all contact frames (per-paw stance detection).'
-            _tab_descs['Full Stance'] = 'Contour metrics restricted to frames where ALL contour paws are simultaneously in ground contact.'
-            _tab_descs['Ratios'] = 'Left/Right paw contour ratios (HL/HR). Reference 1.0 = equal between sides.'
-            _tab_descs['Shape'] = ('Mean paw contour outline averaged across contact frames. '
-                                   'Normalized by contour area for size-independent shape comparison. '
-                                   '\u00b11 SD envelope shown as shaded region.')
-            _tab_descs['Area Ratio Hind'] = (
-                'Ratio of HL to HR paw contour area. Reference 1.0 = equal area. '
-                'Values >1 indicate larger left hind contact area.')
-            _tab_descs['Area Ratio Hind — TC'] = (
-                'Ratio of HL to HR paw contour area across time bins. Reference 1.0 = equal area.')
-            _tab_descs['Intensity Ratio Hind'] = (
-                'Ratio of HL to HR paw contour intensity. Reference 1.0 = equal intensity. '
-                'Values >1 indicate brighter left hind contact.')
-            _tab_descs['Intensity Ratio Hind — TC'] = (
-                'Ratio of HL to HR paw contour intensity across time bins. Reference 1.0 = equal intensity.')
+            _register_deferred(contour_nb.master, _build_contour)
 
         # ── Statistics tab (added directly to outer notebook) ─────────────
-        if bdf is not None:
+        if show_stats:
+            self._log("  Building Statistics tables…")
+        if show_stats and bdf is not None:
             max_t = bdf['bin_start_s'].max() / 60.0
             self._create_wb_statistics_tab(
                 outer_nb, self._summary_df, bdf, treatments, max_t)
@@ -5950,12 +6730,13 @@ class GaitLimbTab(ttk.Frame):
             except Exception:
                 pass
 
-        outer_nb.bind('<<NotebookTabChanged>>', _on_tab_change)
-        for _inner in [hind_nb, fore_nb, contact_nb, bright_nb,
-                       gait_timing_nb, gait_spatial_nb, gait_sym_nb,
-                       contour_nb, contour_all_nb, contour_stance_nb] + _contour_paw_nbs:
+        outer_nb.bind('<<NotebookTabChanged>>', _on_tab_change, add='+')
+        for _inner in [wb_group, gait_group, movement_group,
+                       contour_nb, contour_all_nb,
+                       contour_stance_nb] + _contour_paw_nbs:
             if _inner is not None:
                 _inner.bind('<<NotebookTabChanged>>', _on_tab_change)
+        self._log("Graph window opened.")
 
     # ── Graph helpers ────────────────────────────────────────────────────────
 
@@ -5963,12 +6744,45 @@ class GaitLimbTab(ttk.Frame):
         """Show a graph settings dialog and return a config dict or None if cancelled."""
         dlg = tk.Toplevel(parent)
         dlg.title("Graph Settings")
-        dlg.resizable(False, False)
+        dlg.geometry('700x700')
+        dlg.resizable(False, True)
         dlg.grab_set()
         _prev = self._last_graph_cfg or {}
 
         ttk.Label(dlg, text="Graph Settings",
                   font=('Arial', 13, 'bold'), padding=(12, 8, 12, 4)).pack(anchor='w')
+
+        # ── Scrollable body ──────────────────────────────────────────────
+        _scroll_outer = ttk.Frame(dlg)
+        _scroll_outer.pack(fill='both', expand=True)
+        _scroll_canvas = tk.Canvas(_scroll_outer, highlightthickness=0)
+        _scroll_sb = ttk.Scrollbar(_scroll_outer, orient='vertical', command=_scroll_canvas.yview)
+        _scroll_body = ttk.Frame(_scroll_canvas)
+
+        _scroll_body.bind(
+            '<Configure>',
+            lambda e: _scroll_canvas.configure(scrollregion=_scroll_canvas.bbox('all')))
+        _scroll_win = _scroll_canvas.create_window((0, 0), window=_scroll_body, anchor='nw')
+        _scroll_canvas.configure(yscrollcommand=_scroll_sb.set)
+        _scroll_canvas.bind('<Configure>',
+            lambda e: _scroll_canvas.itemconfigure(_scroll_win, width=e.width))
+
+        _scroll_canvas.pack(side='left', fill='both', expand=True)
+        _scroll_sb.pack(side='right', fill='y')
+
+        def _on_mousewheel(event):
+            _scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        _scroll_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+        def _cleanup_mousewheel():
+            try:
+                _scroll_canvas.unbind_all('<MouseWheel>')
+            except Exception:
+                pass
+        dlg.bind('<Destroy>', lambda e: _cleanup_mousewheel() if e.widget is dlg else None)
+
+        # Redirect all section packing to _scroll_body instead of dlg
+        dlg_body = _scroll_body
 
         _sec = [0]  # mutable counter for dynamic section numbering
         def _next_sec():
@@ -5977,9 +6791,9 @@ class GaitLimbTab(ttk.Frame):
 
         # ── Treatment order (only if >1 treatment) ───────────────────────
         if len(treatments) > 1:
-            ttk.Label(dlg, text=f"{_next_sec()} Treatment Order  (drag to reorder)",
+            ttk.Label(dlg_body, text=f"{_next_sec()} Treatment Order  (drag to reorder)",
                       font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-            lb_frame = ttk.Frame(dlg, padding=(16, 0, 16, 4))
+            lb_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 4))
             lb_frame.pack(fill='x')
             listbox = tk.Listbox(lb_frame, font=('Arial', 10),
                                  height=min(len(treatments), 8), selectmode='single')
@@ -6013,9 +6827,9 @@ class GaitLimbTab(ttk.Frame):
             listbox = None
 
         # ── Treatment colors ──────────────────────────────────────────────
-        ttk.Label(dlg, text=f"{_next_sec()} Treatment Colors",
+        ttk.Label(dlg_body, text=f"{_next_sec()} Treatment Colors",
                   font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-        color_frame = ttk.Frame(dlg, padding=(16, 0, 16, 4))
+        color_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 4))
         color_frame.pack(fill='x')
 
         color_options = {
@@ -6059,8 +6873,12 @@ class GaitLimbTab(ttk.Frame):
             val = color_options.get(color_vars[t].get(), '#cccccc')
             return val if val != 'white_black' else 'white'
 
+        _preview_hooks = []  # filled after _update_marker_preview is defined
+
         def _update_swatch(t):
             swatch_labels[t].configure(bg=_swatch_color(t))
+            for _hook in _preview_hooks:
+                _hook()
 
         def _apply_preset(hex_list):
             non_veh = [t for t in treatments if not _is_veh(t)]
@@ -6080,14 +6898,76 @@ class GaitLimbTab(ttk.Frame):
             ttk.Button(preset_row, text=lbl, width=16,
                        command=lambda h=hexes: _apply_preset(h)).pack(side='left', padx=3)
 
+        # ── Per-treatment style option lists ──────────────────────────────
+        _LINESTYLE_OPTIONS = [
+            ("Solid \u2500",      "-"),
+            ("Dashed \u2504",     "--"),
+            ("Dotted \u00b7\u00b7\u00b7",   ":"),
+            ("Dash-dot \u2500\u00b7",  "-."),
+        ]
+        _ls_labels = [lbl for lbl, _ in _LINESTYLE_OPTIONS]
+        _ls_values = [val for _, val in _LINESTYLE_OPTIONS]
+
+        _MARKER_OPTIONS = [
+            ("None (line only)", "none"),
+            ("Circle \u25cf",   "o"),
+            ("Square \u25a0",   "s"),
+            ("Triangle \u25b2", "^"),
+            ("Diamond \u25c6",  "d"),
+            ("Plus +",          "+"),
+            ("X \u2715",        "x"),
+        ]
+        _mk_labels = [lbl for lbl, _ in _MARKER_OPTIONS]
+        _mk_values = [val for _, val in _MARKER_OPTIONS]
+
+        # Backward compat: migrate old global marker/line_style keys
+        if _prev.get('line_style') == 'markers' and 'marker_shape' not in _prev:
+            _prev['marker_shape'] = 'o'
+            _prev['marker_size'] = 4
+        if 'marker_shape' in _prev and 'marker_shapes' not in _prev:
+            _prev['marker_shapes'] = {t: _prev['marker_shape'] for t in treatments}
+            _prev['marker_sizes'] = {t: _prev.get('marker_size', 5) for t in treatments}
+
+        line_style_vars = {}
+        line_width_vars = {}
+        marker_shape_combos = {}
+        marker_fill_combos = {}
+        marker_size_vars = {}
+        opacity_vars = {}
+        marker_edge_combos = {}
+
+        _EDGE_OPTIONS = [
+            ("Auto",       "auto"),
+            ("Black",      "black"),
+            ("White",      "white"),
+            ("Match line", "match"),
+        ]
+        _edge_labels = [lbl for lbl, _ in _EDGE_OPTIONS]
+        _edge_values = [val for _, val in _EDGE_OPTIONS]
+
+        _FILL_OPTIONS = [
+            ("Filled",       "full"),
+            ("Open",         "none"),
+            ("Left half",    "left"),
+            ("Right half",   "right"),
+            ("Bottom half",  "bottom"),
+            ("Top half",     "top"),
+        ]
+        _fill_labels = [lbl for lbl, _ in _FILL_OPTIONS]
+        _fill_values = [val for _, val in _FILL_OPTIONS]
+
         _nv_idx = 0
-        for treat in treatments:
-            row = ttk.Frame(color_frame)
-            row.pack(fill='x', pady=2)
-            sw = tk.Label(row, width=2, bg='white', relief='solid', bd=1)
+        for _ti, treat in enumerate(treatments):
+            treat_frame = ttk.Frame(color_frame)
+            treat_frame.pack(fill='x', pady=(4, 2))
+
+            # Row 1: color swatch + name + color combo + custom button
+            row1 = ttk.Frame(treat_frame)
+            row1.pack(fill='x')
+            sw = tk.Label(row1, width=2, bg='white', relief='solid', bd=1)
             sw.pack(side='left', padx=(0, 5))
             swatch_labels[treat] = sw
-            ttk.Label(row, text=f"{treat}:", width=15, anchor='w').pack(side='left')
+            ttk.Label(row1, text=f"{treat}:", width=15, anchor='w').pack(side='left')
             if _is_veh(treat):
                 default = 'White (black outline)'
             else:
@@ -6095,7 +6975,7 @@ class GaitLimbTab(ttk.Frame):
                 _nv_idx += 1
             cv = tk.StringVar(value=default)
             color_vars[treat] = cv
-            cb = ttk.Combobox(row, textvariable=cv, values=list(color_options.keys()),
+            cb = ttk.Combobox(row1, textvariable=cv, values=list(color_options.keys()),
                               state='readonly', width=20)
             cb.pack(side='left', padx=5)
             cb.bind('<<ComboboxSelected>>',
@@ -6108,26 +6988,256 @@ class GaitLimbTab(ttk.Frame):
                 if res and res[1]:
                     picked_hex[t] = res[1]
                     _update_swatch(t)
-            ttk.Button(row, text="Custom\u2026", command=_pick_custom, width=8).pack(side='left', padx=2)
+            ttk.Button(row1, text="Custom\u2026", command=_pick_custom, width=8).pack(side='left', padx=2)
             _update_swatch(treat)
 
+            # Row 2: line style, width, marker shape, marker size, opacity
+            row2 = ttk.Frame(treat_frame)
+            row2.pack(fill='x', padx=(22, 0), pady=(1, 0))
+
+            ttk.Label(row2, text="Line:", font=('Arial', 9)).pack(side='left')
+            _prev_ls = _prev.get('line_styles', {}).get(treat, '-')
+            _ls_init = _ls_values.index(_prev_ls) if _prev_ls in _ls_values else 0
+            ls_combo = ttk.Combobox(row2, values=_ls_labels, state='readonly', width=14)
+            ls_combo.current(_ls_init)
+            ls_combo.pack(side='left', padx=(2, 6))
+            line_style_vars[treat] = ls_combo
+
+            ttk.Label(row2, text="W:", font=('Arial', 9)).pack(side='left')
+            _prev_lw = _prev.get('line_widths', {}).get(treat, 1.8)
+            lw_var = tk.DoubleVar(value=_prev_lw)
+            lw_spin = ttk.Spinbox(row2, from_=0.5, to=5.0, increment=0.5,
+                                  textvariable=lw_var, width=4)
+            lw_spin.pack(side='left', padx=(2, 6))
+            line_width_vars[treat] = lw_var
+
+            ttk.Label(row2, text="Marker:", font=('Arial', 9)).pack(side='left')
+            _prev_mk = _prev.get('marker_shapes', {}).get(treat, 'o')
+            _mk_init = _mk_values.index(_prev_mk) if _prev_mk in _mk_values else 0
+            mk_combo = ttk.Combobox(row2, values=_mk_labels, state='readonly', width=14)
+            mk_combo.current(_mk_init)
+            mk_combo.pack(side='left', padx=(2, 6))
+            marker_shape_combos[treat] = mk_combo
+
+            ttk.Label(row2, text="Fill:", font=('Arial', 9)).pack(side='left')
+            _prev_fill = _prev.get('marker_fills', {}).get(treat, 'full')
+            _fill_init = _fill_values.index(_prev_fill) if _prev_fill in _fill_values else 0
+            fill_combo = ttk.Combobox(row2, values=_fill_labels, state='readonly', width=10)
+            fill_combo.current(_fill_init)
+            fill_combo.pack(side='left', padx=(2, 6))
+            marker_fill_combos[treat] = fill_combo
+
+            ttk.Label(row2, text="Sz:", font=('Arial', 9)).pack(side='left')
+            _prev_ms = _prev.get('marker_sizes', {}).get(treat, 5)
+            ms_var = tk.IntVar(value=_prev_ms)
+            ms_spin = ttk.Spinbox(row2, from_=3, to=12, increment=1,
+                                  textvariable=ms_var, width=3)
+            ms_spin.pack(side='left', padx=(2, 6))
+            marker_size_vars[treat] = ms_var
+
+            ttk.Label(row2, text="\u03b1:", font=('Arial', 9)).pack(side='left')
+            _prev_op = _prev.get('opacities', {}).get(treat, 1.0)
+            op_var = tk.DoubleVar(value=_prev_op)
+            op_spin = ttk.Spinbox(row2, from_=0.1, to=1.0, increment=0.1,
+                                  textvariable=op_var, width=4)
+            op_spin.pack(side='left', padx=(2, 6))
+            opacity_vars[treat] = op_var
+
+            ttk.Label(row2, text="Edge:", font=('Arial', 9)).pack(side='left')
+            _prev_edge = _prev.get('marker_edge_colors', {}).get(treat, 'auto')
+            _edge_init = _edge_values.index(_prev_edge) if _prev_edge in _edge_values else 0
+            edge_combo = ttk.Combobox(row2, values=_edge_labels, state='readonly', width=10)
+            edge_combo.current(_edge_init)
+            edge_combo.pack(side='left', padx=(2, 0))
+            marker_edge_combos[treat] = edge_combo
+
         # ── Error bar type ────────────────────────────────────────────────
-        ttk.Label(dlg, text=f"{_next_sec()} Error Bar Type",
+        ttk.Label(dlg_body, text=f"{_next_sec()} Error Bar Type",
                   font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-        err_frame = ttk.Frame(dlg, padding=(16, 0, 16, 4))
+        err_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 4))
         err_frame.pack(fill='x')
         error_var = tk.StringVar(value=_prev.get('error_type', 'SEM'))
         ttk.Radiobutton(err_frame, text="SEM (Standard Error of the Mean)",
                         variable=error_var, value='SEM').pack(anchor='w')
         ttk.Radiobutton(err_frame, text="SD (Standard Deviation)",
                         variable=error_var, value='SD').pack(anchor='w')
-        ttk.Label(err_frame, text="SEM = SD / \u221an  (shows precision of the mean)",
+        ttk.Radiobutton(err_frame, text="95% CI (Confidence Interval)",
+                        variable=error_var, value='95CI').pack(anchor='w')
+        ttk.Label(err_frame, text="SEM = SD/\u221an    95% CI = t* \u00d7 SEM  (uses Student's t distribution)",
                   font=('Arial', 9), foreground='gray').pack(anchor='w', pady=(2, 0))
 
-        # ── Statistical Tests ────────────────────────────────────────────
-        ttk.Label(dlg, text=f"{_next_sec()} Statistical Tests",
+        ttk.Label(err_frame, text="Display style:", font=('Arial', 10),
+                  padding=(0, 6, 0, 0)).pack(anchor='w')
+        err_display_var = tk.StringVar(value=_prev.get('error_display', 'circles_caps'))
+        ttk.Radiobutton(err_frame, text="Shaded region",
+                        variable=err_display_var, value='shaded').pack(anchor='w')
+        ttk.Radiobutton(err_frame, text="Line with caps",
+                        variable=err_display_var, value='caps').pack(anchor='w')
+        ttk.Radiobutton(err_frame, text="Circles + capped error bars",
+                        variable=err_display_var, value='circles_caps').pack(anchor='w')
+
+        # ── Display Options (preview + individual traces) ───────────────
+        sig_style_var = tk.StringVar(value=_prev.get('sig_style', 'asterisk'))
+        ttk.Label(dlg_body, text=f"{_next_sec()} Display Options",
                   font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-        st_frame = ttk.Frame(dlg, padding=(16, 0, 16, 8))
+        disp_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 8))
+        disp_frame.pack(fill='x')
+        indiv_var = tk.BooleanVar(value=_prev.get('show_individual', False))
+        ttk.Checkbutton(disp_frame,
+                        text="Show individual animal traces on timecourse (spaghetti plot)",
+                        variable=indiv_var).pack(anchor='w')
+
+        # Live preview canvas
+        _preview_frame = ttk.Frame(disp_frame, padding=(12, 4, 12, 0))
+        _preview_frame.pack(anchor='w', fill='x')
+        _prev_fig, _prev_ax = plt.subplots(figsize=(3.5, 1.0))
+        _prev_fig.patch.set_facecolor('#f0f0f0')
+        _prev_canvas = FigureCanvasTkAgg(_prev_fig, master=_preview_frame)
+        _prev_canvas.get_tk_widget().pack(fill='x')
+
+        def _resolve_preview_colors():
+            """Get first two treatment colors + raw values from the picker."""
+            clrs = []
+            raws = []
+            for t in list(treatments)[:2]:
+                if t in picked_hex:
+                    c = picked_hex[t]
+                else:
+                    c = color_options.get(color_vars[t].get(), '#1f77b4')
+                raws.append(c)
+                clrs.append('black' if c == 'white_black' else c)
+            while len(clrs) < 2:
+                clrs.append('#1f77b4')
+                raws.append(None)
+            return clrs, raws
+
+        def _update_marker_preview(*_args):
+            _prev_ax.clear()
+            _prev_ax.set_xlim(-0.3, 4.8)
+            _prev_ax.set_ylim(-1.8, 2.0)
+            _prev_ax.axis('off')
+            _xp = np.linspace(0, 4, 7)
+            _yps = [np.sin(_xp * 1.1) * 0.7 + 0.3,
+                    np.cos(_xp * 1.1) * 0.5 - 0.2]
+            _errs = [np.abs(np.cos(_xp * 0.8)) * 0.3 + 0.15,
+                     np.abs(np.sin(_xp * 0.9)) * 0.25 + 0.12]
+            _pclrs, _raws = _resolve_preview_colors()
+            _disp_mode = err_display_var.get()
+            for _idx, treat in enumerate(list(treatments)[:2]):
+                _yp = _yps[_idx] if _idx < len(_yps) else _yps[0]
+                _er = _errs[_idx] if _idx < len(_errs) else _errs[0]
+                _clr = _pclrs[_idx] if _idx < len(_pclrs) else '#1f77b4'
+                _raw_c = _raws[_idx] if _idx < len(_raws) else None
+                _ls_cb = line_style_vars.get(treat)
+                _ls_idx = _ls_cb.current() if _ls_cb else 0
+                _ls_val = _ls_values[_ls_idx] if 0 <= _ls_idx < len(_ls_values) else '-'
+                _lw = line_width_vars.get(treat, tk.DoubleVar(value=1.8)).get()
+                _mk_cb = marker_shape_combos.get(treat)
+                _mk_idx = _mk_cb.current() if _mk_cb else 0
+                _mk_val = _mk_values[_mk_idx] if 0 <= _mk_idx < len(_mk_values) else 'o'
+                _fl_cb = marker_fill_combos.get(treat)
+                _fl_idx = _fl_cb.current() if _fl_cb else 0
+                _fl_val = _fill_values[_fl_idx] if 0 <= _fl_idx < len(_fill_values) else 'full'
+                _ms = marker_size_vars.get(treat, tk.IntVar(value=5)).get()
+                _op = opacity_vars.get(treat, tk.DoubleVar(value=1.0)).get()
+                pkw = dict(color=_clr, linewidth=_lw, linestyle=_ls_val, alpha=_op)
+                if _mk_val != 'none':
+                    pkw['marker'] = _mk_val
+                    pkw['markersize'] = _ms
+                    pkw['fillstyle'] = _fl_val
+                    if _fl_val == 'none':
+                        pkw['markeredgewidth'] = 1.2
+                    elif _fl_val in ('left', 'right', 'top', 'bottom'):
+                        pkw['markerfacecoloralt'] = 'white'
+                if _raw_c == 'white_black':
+                    pkw['markerfacecolor'] = 'white'
+                    pkw['markeredgecolor'] = 'black'
+                _ec_cb = marker_edge_combos.get(treat)
+                _ec_idx = _ec_cb.current() if _ec_cb else 0
+                _ec_val = _edge_values[_ec_idx] if 0 <= _ec_idx < len(_edge_values) else 'auto'
+                if _ec_val == 'black':
+                    pkw['markeredgecolor'] = 'black'
+                elif _ec_val == 'white':
+                    pkw['markeredgecolor'] = 'white'
+                elif _ec_val == 'match':
+                    pkw['markeredgecolor'] = _clr
+                if _disp_mode == 'circles_caps':
+                    _line_kw = {k: v for k, v in pkw.items()
+                                if k not in ('marker', 'markersize', 'fillstyle',
+                                             'markeredgewidth', 'markerfacecoloralt',
+                                             'markerfacecolor', 'markeredgecolor')}
+                    _prev_ax.plot(_xp, _yp, **_line_kw)
+                else:
+                    _prev_ax.plot(_xp, _yp, **pkw)
+                if _disp_mode == 'caps':
+                    _prev_ax.errorbar(_xp, _yp, yerr=_er, capsize=4,
+                                      capthick=1.5, fmt='none', alpha=0.6 * _op,
+                                      ecolor=_clr)
+                elif _disp_mode == 'circles_caps':
+                    _prev_ax.errorbar(_xp, _yp, yerr=_er, capsize=4,
+                                      capthick=1.5, fmt='none', alpha=0.6 * _op,
+                                      ecolor=_clr)
+                    _mkw = dict(linestyle='none', color=_clr,
+                                marker='o', markersize=_ms, alpha=_op,
+                                fillstyle=_fl_val)
+                    if _fl_val == 'none':
+                        _mkw['markeredgewidth'] = 1.2
+                    elif _fl_val in ('left', 'right', 'top', 'bottom'):
+                        _mkw['markerfacecoloralt'] = 'white'
+                    if _raw_c == 'white_black':
+                        _mkw['markerfacecolor'] = 'white'
+                        _mkw['markeredgecolor'] = 'black'
+                    if _ec_val == 'black':
+                        _mkw['markeredgecolor'] = 'black'
+                    elif _ec_val == 'white':
+                        _mkw['markeredgecolor'] = 'white'
+                    elif _ec_val == 'match':
+                        _mkw['markeredgecolor'] = _clr
+                    _prev_ax.plot(_xp, _yp, **_mkw)
+                else:
+                    _prev_ax.fill_between(_xp, _yp - _er, _yp + _er,
+                                          alpha=0.18 * _op, color=_clr)
+            # Sample significance marker
+            from matplotlib.transforms import blended_transform_factory
+            _ptrans = blended_transform_factory(_prev_ax.transData,
+                                                _prev_ax.transAxes)
+            _sig_sample = _SIG_STYLES.get(sig_style_var.get(), ('*',))[0]
+            _prev_ax.text(_xp[3], 0.95, _sig_sample, transform=_ptrans,
+                          ha='center', va='top', fontsize=10, color='black')
+            # Error type label
+            _edisp_lbl = f'{error_var.get()} ({err_display_var.get()})'
+            _prev_ax.text(0.99, 0.02, _edisp_lbl,
+                          transform=_prev_ax.transAxes, ha='right', va='bottom',
+                          fontsize=8, color='gray', fontstyle='italic')
+            _prev_fig.tight_layout(pad=0.2)
+            _prev_canvas.draw_idle()
+
+        # Bind per-treatment combos/spinboxes to preview update
+        for _t in treatments:
+            if _t in line_style_vars:
+                line_style_vars[_t].bind('<<ComboboxSelected>>', _update_marker_preview)
+            if _t in marker_shape_combos:
+                marker_shape_combos[_t].bind('<<ComboboxSelected>>', _update_marker_preview)
+            if _t in marker_fill_combos:
+                marker_fill_combos[_t].bind('<<ComboboxSelected>>', _update_marker_preview)
+            if _t in line_width_vars:
+                line_width_vars[_t].trace_add('write', _update_marker_preview)
+            if _t in marker_size_vars:
+                marker_size_vars[_t].trace_add('write', _update_marker_preview)
+            if _t in opacity_vars:
+                opacity_vars[_t].trace_add('write', _update_marker_preview)
+            if _t in marker_edge_combos:
+                marker_edge_combos[_t].bind('<<ComboboxSelected>>', _update_marker_preview)
+        error_var.trace_add('write', _update_marker_preview)
+        err_display_var.trace_add('write', _update_marker_preview)
+        sig_style_var.trace_add('write', _update_marker_preview)
+        _preview_hooks.append(_update_marker_preview)
+        _update_marker_preview()  # initial draw
+
+        # ── Statistical Tests ────────────────────────────────────────────
+        ttk.Label(dlg_body, text=f"{_next_sec()} Statistical Tests",
+                  font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
+        st_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 8))
         st_frame.pack(fill='x')
 
         stats_var = tk.BooleanVar(value=_prev.get('show_stats', self._enable_stats_var.get()))
@@ -6166,22 +7276,22 @@ class GaitLimbTab(ttk.Frame):
         ttk.Checkbutton(st_frame, text="Per-bin post-hoc on timecourse",
                         variable=dlg_posthoc_var).pack(anchor='w', pady=(2, 0))
 
-        # ── Display Options ──────────────────────────────────────────────
-        ttk.Label(dlg, text=f"{_next_sec()} Display Options",
-                  font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-        disp_frame = ttk.Frame(dlg, padding=(16, 0, 16, 8))
-        disp_frame.pack(fill='x')
-        indiv_var = tk.BooleanVar(value=_prev.get('show_individual', False))
-        ttk.Checkbutton(disp_frame,
-                        text="Show individual animal traces on timecourse (spaghetti plot)",
-                        variable=indiv_var).pack(anchor='w')
+        _sig_row = ttk.Frame(st_frame)
+        _sig_row.pack(fill='x', pady=(4, 0))
+        ttk.Label(_sig_row, text="Marker style:", width=12).pack(side='left')
+        for txt, val in [("Asterisk (* ** ***)", "asterisk"),
+                         ("Hash (# ## ###)", "hash"),
+                         ("Dagger (\u2020 \u2020\u2020 \u2020\u2020\u2020)", "dagger"),
+                         ("Letters (a b c)", "letters")]:
+            ttk.Radiobutton(_sig_row, text=txt, variable=sig_style_var,
+                            value=val).pack(side='left', padx=(0, 6))
 
         # ── Time window (only for bin graphs) ────────────────────────────
         time_var = None
         if max_time_min is not None:
-            ttk.Label(dlg, text=f"{_next_sec()} Time Window",
+            ttk.Label(dlg_body, text=f"{_next_sec()} Time Window",
                       font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-            tw_frame = ttk.Frame(dlg, padding=(16, 0, 16, 8))
+            tw_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 8))
             tw_frame.pack(fill='x')
             ttk.Label(tw_frame, text="Show data up to:").pack(side='left')
             time_var = tk.IntVar(value=int(max_time_min))
@@ -6192,9 +7302,9 @@ class GaitLimbTab(ttk.Frame):
         # ── Re-bin (aggregate bins for display) ──────────────────────────
         rebin_var = None
         if max_time_min is not None:
-            ttk.Label(dlg, text=f"{_next_sec()} Display Bin Size",
+            ttk.Label(dlg_body, text=f"{_next_sec()} Display Bin Size",
                       font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
-            rb_frame = ttk.Frame(dlg, padding=(16, 0, 16, 8))
+            rb_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 8))
             rb_frame.pack(fill='x')
             ttk.Label(rb_frame, text="Aggregate bins to:").pack(side='left')
             rebin_var = tk.DoubleVar(value=_prev.get('rebin_minutes', 0))
@@ -6202,6 +7312,46 @@ class GaitLimbTab(ttk.Frame):
                         increment=0.5,
                         textvariable=rebin_var, width=8).pack(side='left', padx=5)
             ttk.Label(rb_frame, text="minutes  (0 = use original bins)").pack(side='left')
+
+        # ── Graph Sets ─────────────────────────────────────────────────────
+        ttk.Label(dlg_body, text=f"{_next_sec()} Graph Sets to Show",
+                  font=('Arial', 11, 'bold'), padding=(12, 6, 12, 2)).pack(anchor='w')
+        gs_frame = ttk.Frame(dlg_body, padding=(16, 0, 16, 8))
+        gs_frame.pack(fill='x')
+
+        _graph_sets = [
+            ('weight_bearing', 'Limb Use',
+             'Hind/fore paw limb use indices, contact %, brightness ratios'),
+            ('gait', 'Gait',
+             'Stance/swing timing, stride/step lengths, symmetry indices'),
+            ('movement', 'Movement',
+             'Locomotion distance & speed, coordination & support patterns'),
+            ('paw_contour', 'Paw Contour',
+             'Paw print shape, area, spread, intensity, contour filter'),
+            ('statistics', 'Statistics',
+             'Summary statistics table and significance tests across metrics'),
+        ]
+
+        gs_vars = {}
+        prev_sets = _prev.get('graph_sets', {})
+        for key, label, desc in _graph_sets:
+            var = tk.BooleanVar(value=prev_sets.get(key, True))
+            gs_vars[key] = var
+            row_f = ttk.Frame(gs_frame)
+            row_f.pack(fill='x', pady=1)
+            ttk.Checkbutton(row_f, text=label, variable=var).pack(side='left')
+            ttk.Label(row_f, text=f"  \u2014 {desc}", foreground='gray',
+                      font=('Arial', 9)).pack(side='left')
+
+        # Sub-option for Full Stance under Paw Contour
+        fs_var = tk.BooleanVar(value=prev_sets.get('full_stance', False))
+        gs_vars['full_stance'] = fs_var
+        fs_row = ttk.Frame(gs_frame)
+        fs_row.pack(fill='x', pady=1, padx=(24, 0))
+        ttk.Checkbutton(fs_row, text="Include Full Stance metrics",
+                        variable=fs_var).pack(side='left')
+        ttk.Label(fs_row, text="  \u2014 Paw metrics only during frames where all 4 paws contact simultaneously",
+                  foreground='gray', font=('Arial', 9)).pack(side='left')
 
         # ── Buttons ───────────────────────────────────────────────────────
         result = [None]
@@ -6220,14 +7370,44 @@ class GaitLimbTab(ttk.Frame):
             self._stats_alpha_var.set(dlg_alpha_var.get())
             self._stats_paradigm_var.set(dlg_paradigm_var.get())
             self._timecourse_posthoc_var.set(dlg_posthoc_var.get())
+            # Build per-treatment style dicts
+            _ls_dict, _mk_dict, _mf_dict = {}, {}, {}
+            _ms_dict, _lw_dict, _op_dict = {}, {}, {}
+            _me_dict = {}
+            for t in treatments:
+                _lc = line_style_vars.get(t)
+                _li = _lc.current() if _lc else 0
+                _ls_dict[t] = _ls_values[_li] if 0 <= _li < len(_ls_values) else '-'
+                _mc = marker_shape_combos.get(t)
+                _mi = _mc.current() if _mc else 0
+                _mk_dict[t] = _mk_values[_mi] if 0 <= _mi < len(_mk_values) else 'o'
+                _fc = marker_fill_combos.get(t)
+                _fi = _fc.current() if _fc else 0
+                _mf_dict[t] = _fill_values[_fi] if 0 <= _fi < len(_fill_values) else 'full'
+                _ms_dict[t] = marker_size_vars.get(t, tk.IntVar(value=5)).get()
+                _lw_dict[t] = line_width_vars.get(t, tk.DoubleVar(value=1.8)).get()
+                _op_dict[t] = opacity_vars.get(t, tk.DoubleVar(value=1.0)).get()
+                _ec = marker_edge_combos.get(t)
+                _ei = _ec.current() if _ec else 0
+                _me_dict[t] = _edge_values[_ei] if 0 <= _ei < len(_edge_values) else 'auto'
             result[0] = {
                 'order':           order,
                 'colors':          colors,
                 'error_type':      error_var.get(),
+                'error_display':   err_display_var.get(),
                 'time_window':     int(time_var.get()) if time_var is not None else None,
                 'show_stats':      stats_var.get(),
                 'show_individual': indiv_var.get(),
+                'line_styles':     _ls_dict,
+                'marker_shapes':   _mk_dict,
+                'marker_fills':    _mf_dict,
+                'marker_sizes':    _ms_dict,
+                'line_widths':     _lw_dict,
+                'opacities':       _op_dict,
+                'marker_edge_colors': _me_dict,
                 'rebin_minutes':   float(rebin_var.get()) if rebin_var is not None else 0,
+                'sig_style':       sig_style_var.get(),
+                'graph_sets':      {k: v.get() for k, v in gs_vars.items()},
             }
             dlg.destroy()
 
@@ -6237,6 +7417,7 @@ class GaitLimbTab(ttk.Frame):
         ttk.Button(btn_bar, text="Cancel", command=dlg.destroy,   width=10).pack(side='right', padx=2)
 
         dlg.wait_window()
+        plt.close(_prev_fig)
         return result[0]
 
     def _treatment_groups(self, df: pd.DataFrame, metric: str) -> dict:
@@ -6253,6 +7434,11 @@ class GaitLimbTab(ttk.Frame):
                 return groups
         vals = df[metric].dropna().values
         return {'All sessions': vals} if len(vals) > 0 else {}
+
+    @property
+    def _sig_style(self):
+        cfg = self._last_graph_cfg or {}
+        return cfg.get('sig_style', 'asterisk')
 
     def _add_stat_annotation(self, ax, groups: dict, y_top: float):
         """Add significance bracket / ANOVA note."""
@@ -6278,7 +7464,7 @@ class GaitLimbTab(ttk.Frame):
                     _, p = _sp_stats.mannwhitneyu(vals[0], vals[1], alternative='two-sided')
                 else:
                     _, p = _sp_stats.ttest_ind(vals[0], vals[1], equal_var=False)
-                label = _p_label(p)
+                label = _p_label(p, self._sig_style)
                 if label:
                     _draw_bracket(ax, 0, 1, y_top * 1.05, label)
             else:
@@ -6288,18 +7474,78 @@ class GaitLimbTab(ttk.Frame):
                 else:
                     _, p = _sp_stats.f_oneway(*vals)
                     test_name = 'ANOVA'
-                label = _p_label(p)
+                label = _p_label(p, self._sig_style)
                 if label:
                     ax.text(0.5, 0.97,
                             f"{test_name}: {label}  (p = {p:.3f})",
                             transform=ax.transAxes, ha='center', va='top',
                             fontsize=11, color='darkred')
         except Exception as _stats_err:
-            print(f"Warning: statistical test failed in weight-bearing graph: {_stats_err}")
+            print(f"Warning: statistical test failed in limb use graph: {_stats_err}")
 
-    def _embed_figure(self, frame, fig):
+    def _embed_figure(self, frame, fig, ax=None):
         canvas = FigureCanvasTkAgg(fig, master=frame)
         canvas.draw()
+
+        # Pack bottom widgets first (side='bottom') so canvas can expand
+        if ax is not None:
+            axis_row = ttk.Frame(frame)
+            axis_row.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
+            ttk.Label(axis_row, text="Y:", font=('Arial', 9)).pack(side='left')
+            y_min_e = ttk.Entry(axis_row, width=6)
+            y_min_e.pack(side='left', padx=2)
+            ttk.Label(axis_row, text="to", font=('Arial', 9)).pack(side='left')
+            y_max_e = ttk.Entry(axis_row, width=6)
+            y_max_e.pack(side='left', padx=2)
+            ttk.Label(axis_row, text="   X:", font=('Arial', 9)).pack(side='left')
+            x_min_e = ttk.Entry(axis_row, width=6)
+            x_min_e.pack(side='left', padx=2)
+            ttk.Label(axis_row, text="to", font=('Arial', 9)).pack(side='left')
+            x_max_e = ttk.Entry(axis_row, width=6)
+            x_max_e.pack(side='left', padx=2)
+
+            # Store original limits for reset
+            _orig_ylim = ax.get_ylim()
+            _orig_xlim = ax.get_xlim()
+
+            def _apply_range():
+                try:
+                    yl = list(ax.get_ylim())
+                    if y_min_e.get().strip():
+                        yl[0] = float(y_min_e.get())
+                    if y_max_e.get().strip():
+                        yl[1] = float(y_max_e.get())
+                    ax.set_ylim(*yl)
+                except ValueError:
+                    pass
+                try:
+                    xl = list(ax.get_xlim())
+                    if x_min_e.get().strip():
+                        xl[0] = float(x_min_e.get())
+                    if x_max_e.get().strip():
+                        xl[1] = float(x_max_e.get())
+                    ax.set_xlim(*xl)
+                except ValueError:
+                    pass
+                canvas.draw_idle()
+
+            def _reset_range():
+                y_min_e.delete(0, 'end')
+                y_max_e.delete(0, 'end')
+                x_min_e.delete(0, 'end')
+                x_max_e.delete(0, 'end')
+                ax.set_ylim(*_orig_ylim)
+                ax.set_xlim(*_orig_xlim)
+                canvas.draw_idle()
+
+            ttk.Button(axis_row, text="Apply", command=_apply_range,
+                       width=6).pack(side='left', padx=(6, 2))
+            ttk.Button(axis_row, text="Reset", command=_reset_range,
+                       width=6).pack(side='left', padx=2)
+
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar = NavigationToolbar2Tk(canvas, frame)
+        toolbar.update()
         canvas.get_tk_widget().pack(fill='both', expand=True)
         plt.close(fig)
 
@@ -6316,17 +7562,181 @@ class GaitLimbTab(ttk.Frame):
         if title:
             ax.set_title(title, fontsize=13, fontweight='bold')
 
-    def _add_bar_tab(self, nb, df, metric, tab_name,
-                     reference=None, y_label='', graph_cfg=None):
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+    @staticmethod
+    def _calc_error(values, error_type):
+        """Compute error bar half-width for a 1-D array of values.
+
+        error_type: 'SEM', 'SD', or '95CI'.
+        Returns a single float.
+        """
+        v = np.asarray(values)
+        v = v[np.isfinite(v)]
+        n = len(v)
+        if n < 2:
+            return 0.0
+        sd = np.nanstd(v, ddof=1)
+        if error_type == 'SD':
+            return sd
+        sem = sd / np.sqrt(n)
+        if error_type == '95CI':
+            from scipy.stats import t as _t_dist
+            return _t_dist.ppf(0.975, df=n - 1) * sem
+        return sem  # default SEM
+
+    @staticmethod
+    def _error_label(error_type):
+        """Return a display string for the error type (e.g. 'mean \u00b1 SEM')."""
+        labels = {'SEM': 'mean \u00b1 SEM', 'SD': 'mean \u00b1 SD',
+                  '95CI': 'mean \u00b1 95% CI'}
+        return labels.get(error_type, 'mean \u00b1 SEM')
+
+    # ── Metric selector infrastructure ──────────────────────────────────
+
+    def _make_metric_selector(self, parent_nb, category_name,
+                              desc_lbl=None, tab_descs=None):
+        """Create a category tab with combobox metric selector + graph area.
+
+        Returns a dict with keys:
+            'frame'       – the ttk.Frame added to parent_nb
+            'combo'       – the ttk.Combobox widget
+            'graph_frame' – frame where the selected figure is rendered
+            'registry'    – list of metric entry dicts (append via _register_metric)
+            'show'        – callable(index) to display a metric by index
+            '_current_fig'– mutable list [fig_or_None] for cleanup
+        """
+        cat_frame = ttk.Frame(parent_nb)
+        parent_nb.add(cat_frame, text=category_name)
+
+        # --- selector row ---
+        sel_row = ttk.Frame(cat_frame)
+        sel_row.pack(side='top', fill='x', padx=6, pady=(4, 2))
+        ttk.Label(sel_row, text="Metric:", font=('Arial', 10)).pack(
+            side='left', padx=(0, 4))
+        combo = ttk.Combobox(sel_row, state='readonly', width=50,
+                             font=('Arial', 10))
+        combo.pack(side='left', fill='x', expand=True, padx=(0, 6))
+
+        registry = []
+        _current_fig = [None]  # track for cleanup
+
+        def _show(idx):
+            if idx < 0 or idx >= len(registry):
+                return
+            combo.current(idx)
+            entry = registry[idx]
+            # Clear previous figure contents
+            if _current_fig[0] is not None:
+                try:
+                    plt.close(_current_fig[0])
+                except Exception:
+                    pass
+                _current_fig[0] = None
+            for w in graph_frame.winfo_children():
+                w.destroy()
+            # Build the graph
+            if entry.get('create_fn'):
+                entry['create_fn'](graph_frame)
+            else:
+                gtype = entry['graph_type']
+                if gtype == 'bar':
+                    self._build_bar_graph(
+                        graph_frame, entry['data'], entry['column'],
+                        entry['display_name'], entry.get('reference'),
+                        entry.get('y_label', ''), entry.get('graph_cfg'))
+                elif gtype == 'box':
+                    self._build_box_graph(
+                        graph_frame, entry['data'], entry['column'],
+                        entry['display_name'], entry.get('reference'),
+                        entry.get('y_label', ''), entry.get('graph_cfg'))
+                elif gtype == 'violin':
+                    self._build_violin_graph(
+                        graph_frame, entry['data'], entry['column'],
+                        entry['display_name'], entry.get('reference'),
+                        entry.get('y_label', ''), entry.get('graph_cfg'))
+                elif gtype == 'timecourse':
+                    self._build_timecourse_graph(
+                        graph_frame, entry['data'], entry['column'],
+                        entry['display_name'], entry.get('reference'),
+                        entry.get('y_label', ''), entry.get('graph_cfg'))
+            # Find embedded figure for cleanup on next switch
+            for child in graph_frame.winfo_children():
+                fig_obj = getattr(child, 'figure', None)
+                if fig_obj is not None:
+                    _current_fig[0] = fig_obj
+                    break
+                for sub in getattr(child, 'winfo_children', lambda: [])():
+                    fig_obj = getattr(sub, 'figure', None)
+                    if fig_obj is not None:
+                        _current_fig[0] = fig_obj
+                        break
+            # Update description
+            if desc_lbl is not None and tab_descs is not None:
+                desc_lbl.config(text=entry.get('description', ''))
+
+        def _on_combo(event=None):
+            _show(combo.current())
+
+        def _prev():
+            idx = combo.current()
+            if idx > 0:
+                _show(idx - 1)
+
+        def _next():
+            idx = combo.current()
+            if idx < len(registry) - 1:
+                _show(idx + 1)
+
+        combo.bind('<<ComboboxSelected>>', _on_combo)
+        ttk.Button(sel_row, text="\u25c0", width=3,
+                   command=_prev).pack(side='left', padx=1)
+        ttk.Button(sel_row, text="\u25b6", width=3,
+                   command=_next).pack(side='left', padx=1)
+
+        # --- graph area ---
+        graph_frame = ttk.Frame(cat_frame)
+        graph_frame.pack(side='top', fill='both', expand=True)
+
+        return {
+            'frame': cat_frame,
+            'combo': combo,
+            'graph_frame': graph_frame,
+            'registry': registry,
+            'show': _show,
+            '_current_fig': _current_fig,
+        }
+
+    def _register_metric(self, selector, display_name, graph_type,
+                         data_source, column, reference=None,
+                         y_label='', graph_cfg=None, description='',
+                         create_fn=None):
+        """Register a metric in a selector's registry (no figure created)."""
+        entry = {
+            'display_name': display_name,
+            'graph_type': graph_type,
+            'data': data_source,
+            'column': column,
+            'reference': reference,
+            'y_label': y_label,
+            'graph_cfg': graph_cfg,
+            'description': description,
+            'create_fn': create_fn,
+        }
+        selector['registry'].append(entry)
+        # Update combobox values
+        selector['combo']['values'] = [
+            e['display_name'] for e in selector['registry']]
+
+    # ── Build-graph methods (figure creation into existing frame) ─────
+
+    def _build_bar_graph(self, frame, df, metric, tab_name,
+                         reference=None, y_label='', graph_cfg=None):
+        """Create a bar chart figure and embed it in the given frame."""
         fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center',
                     transform=ax.transAxes)
         else:
-            # Apply ordering from graph_cfg
             if graph_cfg and graph_cfg.get('order'):
                 ordered_keys = [t for t in graph_cfg['order'] if t in groups]
                 ordered_keys += [t for t in groups if t not in ordered_keys]
@@ -6334,18 +7744,12 @@ class GaitLimbTab(ttk.Frame):
                 ordered_keys = list(groups.keys())
             treatments = ordered_keys
             vals_list = [groups[t] for t in treatments]
-
-            # Error bar type
-            use_sd = graph_cfg and graph_cfg.get('error_type') == 'SD'
+            _err_type = graph_cfg.get('error_type', 'SEM') if graph_cfg else 'SEM'
             means = [np.nanmean(v) for v in vals_list]
-            errs  = [(np.nanstd(v, ddof=1) if use_sd else
-                      (_sp_stats.sem(v) if len(v) > 1 else 0))
-                     for v in vals_list]
-
+            errs  = [self._calc_error(v, _err_type) for v in vals_list]
             x_pos = np.arange(len(treatments))
             rng = np.random.default_rng(42)
             for xi, (t, vals) in enumerate(zip(treatments, vals_list)):
-                # Determine bar color
                 if graph_cfg and graph_cfg.get('colors') and t in graph_cfg['colors']:
                     raw = graph_cfg['colors'][t]
                 else:
@@ -6355,10 +7759,11 @@ class GaitLimbTab(ttk.Frame):
                 else:
                     bar_color, edge_color, txt_color = raw, 'black', 'black'
                 ax.bar(xi, means[xi], yerr=errs[xi], capsize=4,
-                       color=bar_color, alpha=0.85, edgecolor=edge_color, linewidth=0.9)
+                       color=bar_color, alpha=0.85, edgecolor=edge_color,
+                       linewidth=0.9)
                 jitter = rng.uniform(-0.18, 0.18, len(vals))
-                ax.scatter(xi + jitter, vals, color=txt_color, s=30, zorder=5, alpha=0.8)
-
+                ax.scatter(xi + jitter, vals, color=txt_color, s=30,
+                           zorder=5, alpha=0.8)
             if reference is not None:
                 ax.axhline(reference, color='crimson', linestyle='--',
                            linewidth=1.2, alpha=0.7,
@@ -6369,47 +7774,15 @@ class GaitLimbTab(ttk.Frame):
             self._style_ax(ax, title=tab_name, ylabel=y_label or metric)
             y_top = max(means) if means else 0
             if self._enable_stats_var.get():
-                self._add_stat_annotation(ax, {t: groups[t] for t in treatments}, y_top)
+                self._add_stat_annotation(
+                    ax, {t: groups[t] for t in treatments}, y_top)
+        self._add_export_buttons(frame, fig, groups, metric, tab_name,
+                                 graph_cfg=graph_cfg, data_type='summary')
+        self._embed_figure(frame, fig, ax=ax)
 
-        # -- export button bar --
-        btn_bar = ttk.Frame(frame)
-        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
-
-        def _exp_graph(f=fig, n=tab_name):
-            from tkinter import filedialog
-            path = filedialog.asksaveasfilename(
-                defaultextension='.png',
-                filetypes=[('PNG image', '*.png'), ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
-                initialfile=n.replace(' ', '_') + '.png',
-                parent=frame.winfo_toplevel())
-            if path:
-                f.savefig(path, dpi=300, bbox_inches='tight')
-
-        def _exp_data(g=groups, gc=graph_cfg, m=metric, n=tab_name):
-            from tkinter import filedialog
-            if not g:
-                return
-            ordered_keys = ([t for t in (gc or {}).get('order', []) if t in g]
-                            + [t for t in g if t not in (gc or {}).get('order', [])])
-            rows = [{'treatment': t, m: float(v)}
-                    for t in (ordered_keys or list(g.keys()))
-                    for v in g[t]]
-            path = filedialog.asksaveasfilename(
-                defaultextension='.csv', filetypes=[('CSV', '*.csv')],
-                initialfile=n.replace(' ', '_') + '_data.csv',
-                parent=frame.winfo_toplevel())
-            if path:
-                import pandas as _pd
-                _pd.DataFrame(rows).to_csv(path, index=False)
-
-        ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-        ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
-
-    def _add_box_tab(self, nb, df, metric, tab_name,
-                     reference=None, y_label='', graph_cfg=None):
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+    def _build_box_graph(self, frame, df, metric, tab_name,
+                         reference=None, y_label='', graph_cfg=None):
+        """Create a box plot figure and embed it in the given frame."""
         fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
@@ -6425,14 +7798,16 @@ class GaitLimbTab(ttk.Frame):
             data = [groups[t] for t in treatments]
             bp_dict = ax.boxplot(data, labels=treatments, patch_artist=True,
                                  medianprops=dict(color='black', linewidth=2))
-            fallback_colors = plt.cm.Set2.colors  # type: ignore
+            fallback_colors = plt.cm.Set2.colors
             for i, (patch, t) in enumerate(zip(bp_dict['boxes'], treatments)):
-                if graph_cfg and graph_cfg.get('colors') and t in graph_cfg['colors']:
+                if (graph_cfg and graph_cfg.get('colors')
+                        and t in graph_cfg['colors']):
                     raw = graph_cfg['colors'][t]
                     fc = 'white' if raw == 'white_black' else raw
                     patch.set_facecolor(fc)
                 else:
-                    patch.set_facecolor(fallback_colors[i % len(fallback_colors)])
+                    patch.set_facecolor(
+                        fallback_colors[i % len(fallback_colors)])
                 patch.set_alpha(0.7)
             rng = np.random.default_rng(42)
             for xi, vals in enumerate(data, 1):
@@ -6446,46 +7821,13 @@ class GaitLimbTab(ttk.Frame):
             y_top = max(np.nanmax(v) for v in data if len(v) > 0)
             if self._enable_stats_var.get():
                 self._add_stat_annotation(ax, groups, y_top)
+        self._add_export_buttons(frame, fig, groups, metric, tab_name,
+                                 graph_cfg=graph_cfg, data_type='summary')
+        self._embed_figure(frame, fig, ax=ax)
 
-        # -- export button bar --
-        btn_bar = ttk.Frame(frame)
-        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
-
-        def _exp_graph(f=fig, n=tab_name):
-            from tkinter import filedialog
-            path = filedialog.asksaveasfilename(
-                defaultextension='.png',
-                filetypes=[('PNG image', '*.png'), ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
-                initialfile=n.replace(' ', '_') + '.png',
-                parent=frame.winfo_toplevel())
-            if path:
-                f.savefig(path, dpi=300, bbox_inches='tight')
-
-        def _exp_data(g=groups, gc=graph_cfg, m=metric, n=tab_name):
-            from tkinter import filedialog
-            if not g:
-                return
-            ordered_keys = ([t for t in (gc or {}).get('order', []) if t in g]
-                            + [t for t in g if t not in (gc or {}).get('order', [])])
-            rows = [{'treatment': t, m: float(v)}
-                    for t in (ordered_keys or list(g.keys()))
-                    for v in g[t]]
-            path = filedialog.asksaveasfilename(
-                defaultextension='.csv', filetypes=[('CSV', '*.csv')],
-                initialfile=n.replace(' ', '_') + '_data.csv',
-                parent=frame.winfo_toplevel())
-            if path:
-                import pandas as _pd
-                _pd.DataFrame(rows).to_csv(path, index=False)
-
-        ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-        ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
-
-    def _add_violin_tab(self, nb, df, metric, tab_name,
-                        reference=None, y_label='', graph_cfg=None):
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+    def _build_violin_graph(self, frame, df, metric, tab_name,
+                            reference=None, y_label='', graph_cfg=None):
+        """Create a violin plot figure and embed it in the given frame."""
         fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
@@ -6503,7 +7845,8 @@ class GaitLimbTab(ttk.Frame):
                                   showmeans=True, showmedians=True,
                                   showextrema=False)
             for i, (pc, t) in enumerate(zip(parts['bodies'], treatments)):
-                if graph_cfg and graph_cfg.get('colors') and t in graph_cfg['colors']:
+                if (graph_cfg and graph_cfg.get('colors')
+                        and t in graph_cfg['colors']):
                     raw = graph_cfg['colors'][t]
                     fc = 'white' if raw == 'white_black' else raw
                 else:
@@ -6524,60 +7867,37 @@ class GaitLimbTab(ttk.Frame):
             self._style_ax(ax, title=tab_name, ylabel=y_label or metric)
             y_top = max(np.nanmax(v) for v in data if len(v) > 0)
             if self._enable_stats_var.get():
-                self._add_stat_annotation(ax, {t: groups[t] for t in treatments}, y_top)
+                self._add_stat_annotation(
+                    ax, {t: groups[t] for t in treatments}, y_top)
+        self._add_export_buttons(frame, fig, groups, metric, tab_name,
+                                 graph_cfg=graph_cfg, data_type='summary')
+        self._embed_figure(frame, fig, ax=ax)
 
-        btn_bar = ttk.Frame(frame)
-        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
-
-        def _exp_graph(f=fig, n=tab_name):
-            from tkinter import filedialog
-            path = filedialog.asksaveasfilename(
-                defaultextension='.png',
-                filetypes=[('PNG image', '*.png'), ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
-                initialfile=n.replace(' ', '_') + '.png',
-                parent=frame.winfo_toplevel())
-            if path:
-                f.savefig(path, dpi=300, bbox_inches='tight')
-
-        def _exp_data(g=groups, gc=graph_cfg, m=metric, n=tab_name):
-            from tkinter import filedialog
-            if not g:
-                return
-            ordered_keys = ([t for t in (gc or {}).get('order', []) if t in g]
-                            + [t for t in g if t not in (gc or {}).get('order', [])])
-            rows = [{'treatment': t, m: float(v)}
-                    for t in (ordered_keys or list(g.keys()))
-                    for v in g[t]]
-            path = filedialog.asksaveasfilename(
-                defaultextension='.csv', filetypes=[('CSV', '*.csv')],
-                initialfile=n.replace(' ', '_') + '_data.csv',
-                parent=frame.winfo_toplevel())
-            if path:
-                import pandas as _pd
-                _pd.DataFrame(rows).to_csv(path, index=False)
-
-        ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-        ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
-
-    def _add_timecourse_tab(self, nb, bins_df, metric, tab_name,
-                            reference=None, y_label=None, graph_cfg=None):
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+    def _build_timecourse_graph(self, frame, bins_df, metric, tab_name,
+                                reference=None, y_label=None,
+                                graph_cfg=None):
+        """Create a timecourse figure and embed it in the given frame."""
         fig, ax = plt.subplots(figsize=(8, 5), tight_layout=True)
 
-        # Reference line: use explicit value if given, else infer from metric name
         if reference is None:
-            reference = 0.0 if 'SI' in metric else 50.0
+            if 'SI' in metric or 'symmetry' in metric.lower():
+                reference = 0.0
+            elif 'WBI' in metric or 'SBI' in metric:
+                reference = 50.0
         if reference is not None:
             ax.axhline(reference, color='crimson', linestyle='--',
                        linewidth=1.1, alpha=0.6)
 
-        use_sd = graph_cfg and graph_cfg.get('error_type') == 'SD'
+        _err_type = graph_cfg.get('error_type', 'SEM') if graph_cfg else 'SEM'
+
+        # Filter bins to the user-specified time window so lines don't
+        # extend beyond the requested range.
+        if graph_cfg and graph_cfg.get('time_window') is not None:
+            _tw_sec = graph_cfg['time_window'] * 60.0
+            bins_df = bins_df[bins_df['bin_start_s'] <= _tw_sec].copy()
 
         if ('treatment' in bins_df.columns
                 and bins_df['treatment'].ne('').any()):
-            # Determine iteration order
             all_treats = bins_df['treatment'].dropna().unique().tolist()
             if graph_cfg and graph_cfg.get('order'):
                 ordered = [t for t in graph_cfg['order'] if t in all_treats]
@@ -6591,70 +7911,226 @@ class GaitLimbTab(ttk.Frame):
                     continue
                 tg = grp.groupby('bin_start_s')[metric]
                 tmean = tg.mean()
-                terr  = (tg.std(ddof=1).fillna(0) if use_sd
-                         else tg.sem().fillna(0))
+                if _err_type == 'SD':
+                    terr = tg.std(ddof=1).fillna(0)
+                elif _err_type == '95CI':
+                    terr = tg.apply(
+                        lambda x: self._calc_error(x.values, '95CI')).fillna(0)
+                else:
+                    terr = tg.sem().fillna(0)
                 t_min = tmean.index.values / 60.0
 
-                # Determine color
                 raw_color = None
                 if graph_cfg and graph_cfg.get('colors'):
                     raw_color = graph_cfg['colors'].get(str(treatment))
                 line_color = ('black' if raw_color == 'white_black'
                               else (raw_color if raw_color else None))
-                plot_kw = dict(label=str(treatment), linewidth=1.8)
+                _tkey = str(treatment)
+                _lstyle = (graph_cfg.get('line_styles', {}).get(_tkey, '-')
+                           if graph_cfg else '-')
+                _mshape = (graph_cfg.get('marker_shapes', {}).get(_tkey, 'o')
+                           if graph_cfg else 'o')
+                _msize = (graph_cfg.get('marker_sizes', {}).get(_tkey, 5)
+                          if graph_cfg else 5)
+                _lw = (graph_cfg.get('line_widths', {}).get(_tkey, 1.8)
+                       if graph_cfg else 1.8)
+                _alpha = (graph_cfg.get('opacities', {}).get(_tkey, 1.0)
+                          if graph_cfg else 1.0)
+                if not _mshape or _mshape == 'none':
+                    _mshape_g = (graph_cfg.get('marker_shape', 'none')
+                                 if graph_cfg else 'none')
+                    if _mshape_g and _mshape_g != 'none':
+                        _mshape = _mshape_g
+                        _msize = (graph_cfg.get('marker_size', 5)
+                                  if graph_cfg else 5)
+                _mfill = (graph_cfg.get('marker_fills', {}).get(_tkey, 'full')
+                          if graph_cfg else 'full')
+                plot_kw = dict(label=_tkey, linewidth=_lw,
+                               linestyle=_lstyle, alpha=_alpha)
+                if _mshape and _mshape != 'none':
+                    plot_kw['marker'] = _mshape
+                    plot_kw['markersize'] = _msize
+                    plot_kw['fillstyle'] = _mfill
+                    if _mfill == 'none':
+                        plot_kw['markeredgewidth'] = 1.2
+                    elif _mfill in ('left', 'right', 'top', 'bottom'):
+                        plot_kw['markerfacecoloralt'] = 'white'
                 if line_color:
                     plot_kw['color'] = line_color
+                if raw_color == 'white_black':
+                    plot_kw['markerfacecolor'] = 'white'
+                    plot_kw['markeredgecolor'] = 'black'
+                _edge_sel = graph_cfg.get('marker_edge_colors', {}).get(_tkey, 'auto') if graph_cfg else 'auto'
+                if _edge_sel == 'black':
+                    plot_kw['markeredgecolor'] = 'black'
+                elif _edge_sel == 'white':
+                    plot_kw['markeredgecolor'] = 'white'
+                elif _edge_sel == 'match':
+                    plot_kw['markeredgecolor'] = line_color or plot_kw.get('color', 'black')
                 rebin = graph_cfg.get('rebin_minutes') if graph_cfg else None
                 if rebin and rebin > 0:
                     t_min, _means, _errs = GaitLimbTab._rebin_timecourse(
-                        list(t_min), list(tmean.values), list(terr.values), rebin)
+                        list(t_min), list(tmean.values),
+                        list(terr.values), rebin)
                     t_min = np.array(t_min)
                     tmean_v = np.array(_means)
                     terr_v = np.array(_errs)
                 else:
                     tmean_v = tmean.values
                     terr_v = terr.values
-                ax.plot(t_min, tmean_v, **plot_kw)
-                ax.fill_between(t_min,
-                                tmean_v - terr_v,
-                                tmean_v + terr_v,
-                                alpha=0.18,
-                                **(dict(color=line_color) if line_color else {}))
-                # Individual traces (spaghetti plot)
+                _err_disp = (graph_cfg.get('error_display', 'circles_caps')
+                             if graph_cfg else 'circles_caps')
+                # When circles_caps, draw line without markers (markers drawn with errorbar)
+                if _err_disp == 'circles_caps':
+                    _line_kw = {k: v for k, v in plot_kw.items()
+                                if k not in ('marker', 'markersize', 'fillstyle',
+                                             'markeredgewidth', 'markerfacecoloralt',
+                                             'markerfacecolor', 'markeredgecolor')}
+                    ax.plot(t_min, tmean_v, **_line_kw)
+                else:
+                    ax.plot(t_min, tmean_v, **plot_kw)
+                _ec = line_color or plot_kw.get('color')
+                if _err_disp == 'caps':
+                    ax.errorbar(t_min, tmean_v, yerr=terr_v, capsize=4,
+                                capthick=1.5, fmt='none', alpha=0.6,
+                                ecolor=_ec)
+                elif _err_disp == 'circles_caps':
+                    ax.errorbar(t_min, tmean_v, yerr=terr_v, capsize=4,
+                                capthick=1.5, fmt='none', alpha=0.6 * _alpha,
+                                ecolor=_ec)
+                    _msz = _msize if (_mshape and _mshape != 'none') else 5
+                    _mkw = dict(linestyle='none', color=_ec,
+                                marker='o', markersize=_msz, alpha=_alpha)
+                    _mkw['fillstyle'] = _mfill
+                    if _mfill == 'none':
+                        _mkw['markeredgewidth'] = 1.2
+                    elif _mfill in ('left', 'right', 'top', 'bottom'):
+                        _mkw['markerfacecoloralt'] = 'white'
+                    if raw_color == 'white_black':
+                        _mkw['markerfacecolor'] = 'white'
+                        _mkw['markeredgecolor'] = 'black'
+                    if _edge_sel == 'black':
+                        _mkw['markeredgecolor'] = 'black'
+                    elif _edge_sel == 'white':
+                        _mkw['markeredgecolor'] = 'white'
+                    elif _edge_sel == 'match':
+                        _mkw['markeredgecolor'] = _ec or 'black'
+                    ax.plot(t_min, tmean_v, **_mkw)
+                else:
+                    ax.fill_between(
+                        t_min, tmean_v - terr_v, tmean_v + terr_v,
+                        alpha=0.18,
+                        **(dict(color=line_color) if line_color else {}))
                 if graph_cfg and graph_cfg.get('show_individual'):
                     for subj in grp['subject'].unique():
                         subj_data = grp[grp['subject'] == subj]
                         sg = subj_data.groupby('bin_start_s')[metric].mean()
                         s_min = sg.index.values / 60.0
                         ax.plot(s_min, sg.values, alpha=0.3, linewidth=0.8,
-                                **(dict(color=line_color) if line_color else {}))
+                                **(dict(color=line_color)
+                                   if line_color else {}))
             ax.legend(fontsize=10)
 
-            # Per-bin significance markers
             if self._enable_stats_var.get() and len(ordered) >= 2:
                 from matplotlib.transforms import blended_transform_factory
                 trans = blended_transform_factory(ax.transData, ax.transAxes)
                 tw = graph_cfg.get('time_window') if graph_cfg else None
-                for bin_t, grp in bins_df.groupby('bin_start_s'):
-                    t_min_val = bin_t / 60.0
-                    if tw is not None and t_min_val > tw:
-                        continue
-                    gvals = [grp[grp['treatment'] == t][metric].dropna().values
-                             for t in ordered if t in grp['treatment'].values]
-                    gvals = [v for v in gvals if len(v) >= 2]
-                    if len(gvals) < 2:
-                        continue
-                    try:
-                        if len(gvals) == 2:
-                            _, p = _sp_stats.ttest_ind(gvals[0], gvals[1], equal_var=False)
-                        else:
-                            _, p = _sp_stats.f_oneway(*gvals)
-                        lbl = _p_label(p)
-                        if lbl:
-                            ax.text(t_min_val, 0.98, lbl, transform=trans,
-                                    ha='center', va='top', fontsize=9, color='black')
-                    except Exception as _stats_err:
-                        print(f"Warning: time-bin stats failed: {_stats_err}")
+                _rebin_min = (graph_cfg.get('rebin_minutes')
+                              if graph_cfg else None)
+                if _rebin_min and _rebin_min > 0:
+                    _rebin_s = _rebin_min * 60.0
+                    _all_bins = sorted(bins_df['bin_start_s'].unique())
+                    _rebin_windows = {}
+                    for bs in _all_bins:
+                        win_start = int(bs // _rebin_s) * _rebin_s
+                        _rebin_windows.setdefault(win_start, []).append(bs)
+                    # Count testable windows for Bonferroni
+                    _n_tests_r = 0
+                    for ws_bins in _rebin_windows.values():
+                        wd = bins_df[bins_df['bin_start_s'].isin(ws_bins)]
+                        _gc = [wd[wd['treatment'] == t].groupby('subject')[metric]
+                               .mean().dropna().values for t in ordered]
+                        _gc = [g for g in _gc if len(g) >= 2]
+                        if len(_gc) >= 2:
+                            _n_tests_r += 1
+                    _n_tests_r = max(_n_tests_r, 1)
+                    for win_start in sorted(_rebin_windows.keys()):
+                        t_min_val = win_start / 60.0
+                        if tw is not None and t_min_val > tw:
+                            continue
+                        win_bins = _rebin_windows[win_start]
+                        win_data = bins_df[
+                            bins_df['bin_start_s'].isin(win_bins)]
+                        gvals = []
+                        for t in ordered:
+                            t_data = win_data[win_data['treatment'] == t]
+                            if t_data.empty:
+                                continue
+                            subj_means = (t_data.groupby('subject')[metric]
+                                          .mean().dropna().values)
+                            if len(subj_means) >= 2:
+                                gvals.append(subj_means)
+                        if len(gvals) < 2:
+                            continue
+                        try:
+                            if len(gvals) == 2:
+                                _, p = _sp_stats.ttest_ind(
+                                    gvals[0], gvals[1], equal_var=False)
+                                if np.isnan(p):
+                                    continue
+                                p = min(p * _n_tests_r, 1.0)
+                            else:
+                                _, p = _sp_stats.f_oneway(*gvals)
+                                if np.isnan(p):
+                                    continue
+                            lbl = _p_label(p, self._sig_style)
+                            if lbl:
+                                ax.text(t_min_val, 0.98, lbl,
+                                        transform=trans, ha='center',
+                                        va='top', fontsize=9, color='black')
+                        except Exception:
+                            pass
+                else:
+                    # Count testable bins for Bonferroni
+                    _n_tests_nb = 0
+                    for _, bgrp in bins_df.groupby('bin_start_s'):
+                        _gc = [bgrp[bgrp['treatment'] == t][metric]
+                               .dropna().values for t in ordered
+                               if t in bgrp['treatment'].values]
+                        _gc = [v for v in _gc if len(v) >= 2]
+                        if len(_gc) >= 2:
+                            _n_tests_nb += 1
+                    _n_tests_nb = max(_n_tests_nb, 1)
+                    for bin_t, bgrp in bins_df.groupby('bin_start_s'):
+                        t_min_val = bin_t / 60.0
+                        if tw is not None and t_min_val > tw:
+                            continue
+                        gvals = [
+                            bgrp[bgrp['treatment'] == t][metric]
+                            .dropna().values
+                            for t in ordered
+                            if t in bgrp['treatment'].values]
+                        gvals = [v for v in gvals if len(v) >= 2]
+                        if len(gvals) < 2:
+                            continue
+                        try:
+                            if len(gvals) == 2:
+                                _, p = _sp_stats.ttest_ind(
+                                    gvals[0], gvals[1], equal_var=False)
+                                if np.isnan(p):
+                                    continue
+                                p = min(p * _n_tests_nb, 1.0)
+                            else:
+                                _, p = _sp_stats.f_oneway(*gvals)
+                                if np.isnan(p):
+                                    continue
+                            lbl = _p_label(p, self._sig_style)
+                            if lbl:
+                                ax.text(t_min_val, 0.98, lbl,
+                                        transform=trans, ha='center',
+                                        va='top', fontsize=9, color='black')
+                        except Exception:
+                            pass
         else:
             tg = bins_df.groupby('bin_start_s')[metric]
             tmean = tg.mean()
@@ -6662,21 +8138,71 @@ class GaitLimbTab(ttk.Frame):
             rebin = graph_cfg.get('rebin_minutes') if graph_cfg else None
             if rebin and rebin > 0:
                 t_min, _means, _ = GaitLimbTab._rebin_timecourse(
-                    list(t_min), list(tmean.values), [0]*len(t_min), rebin)
+                    list(t_min), list(tmean.values),
+                    [0] * len(t_min), rebin)
                 t_min = np.array(t_min)
                 tmean_v = np.array(_means)
             else:
                 tmean_v = tmean.values
-            ax.plot(t_min, tmean_v, linewidth=1.8, color='steelblue')
+            _st_plot_kw = dict(linewidth=1.8, color='steelblue')
+            _ls_d = graph_cfg.get('line_styles', {}) if graph_cfg else {}
+            if _ls_d:
+                _ft = next(iter(_ls_d))
+                _st_plot_kw['linestyle'] = _ls_d.get(_ft, '-')
+                _st_plot_kw['linewidth'] = (
+                    graph_cfg.get('line_widths', {}).get(_ft, 1.8))
+                _st_plot_kw['alpha'] = (
+                    graph_cfg.get('opacities', {}).get(_ft, 1.0))
+                _mk = graph_cfg.get('marker_shapes', {}).get(_ft, 'o')
+                if _mk and _mk != 'none':
+                    _st_plot_kw['marker'] = _mk
+                    _st_plot_kw['markersize'] = (
+                        graph_cfg.get('marker_sizes', {}).get(_ft, 5))
+                    _mf = graph_cfg.get('marker_fills', {}).get(_ft, 'full')
+                    _st_plot_kw['fillstyle'] = _mf
+                    if _mf == 'none':
+                        _st_plot_kw['markeredgewidth'] = 1.2
+                    elif _mf in ('left', 'right', 'top', 'bottom'):
+                        _st_plot_kw['markerfacecoloralt'] = 'white'
+                _me = graph_cfg.get('marker_edge_colors', {}).get(_ft, 'auto') if graph_cfg else 'auto'
+                if _me == 'black':
+                    _st_plot_kw['markeredgecolor'] = 'black'
+                elif _me == 'white':
+                    _st_plot_kw['markeredgecolor'] = 'white'
+                elif _me == 'match':
+                    _st_plot_kw['markeredgecolor'] = _st_plot_kw.get('color', 'steelblue')
+            else:
+                _mshape = (graph_cfg.get('marker_shape', 'o')
+                           if graph_cfg else 'o')
+                if _mshape and _mshape != 'none':
+                    _st_plot_kw['marker'] = _mshape
+                    _st_plot_kw['markersize'] = (
+                        graph_cfg.get('marker_size', 5))
+            ax.plot(t_min, tmean_v, **_st_plot_kw)
 
         if graph_cfg and graph_cfg.get('time_window') is not None:
-            ax.set_xlim(0, graph_cfg['time_window'])
+            ax.set_xlim(-0.5, graph_cfg['time_window'] + 0.5)
+        else:
+            ax.margins(x=0.02)
 
         self._style_ax(ax, title=tab_name,
                         xlabel='Time (min)',
                         ylabel=y_label or metric.replace('_', ' '))
+        # Annotate error type on the plot
+        ax.annotate(self._error_label(_err_type),
+                    xy=(1, 1), xycoords='axes fraction',
+                    ha='right', va='bottom', fontsize=8,
+                    color='gray', style='italic')
 
-        # -- export button bar --
+        self._add_export_buttons(frame, fig, None, metric, tab_name,
+                                 graph_cfg=graph_cfg, data_type='timecourse',
+                                 bins_df=bins_df)
+        self._embed_figure(frame, fig, ax=ax)
+
+    def _add_export_buttons(self, frame, fig, groups, metric, tab_name,
+                            graph_cfg=None, data_type='summary',
+                            bins_df=None):
+        """Add Export Graph / Export Data buttons to a frame."""
         btn_bar = ttk.Frame(frame)
         btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
 
@@ -6684,34 +8210,75 @@ class GaitLimbTab(ttk.Frame):
             from tkinter import filedialog
             path = filedialog.asksaveasfilename(
                 defaultextension='.png',
-                filetypes=[('PNG image', '*.png'), ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
+                filetypes=[('PNG image', '*.png'),
+                           ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
                 initialfile=n.replace(' ', '_') + '.png',
                 parent=frame.winfo_toplevel())
             if path:
                 f.savefig(path, dpi=300, bbox_inches='tight')
 
-        def _exp_data(bdf=bins_df, m=metric, n=tab_name):
+        def _exp_data():
             from tkinter import filedialog
-            cols = [c for c in ['treatment', 'bin_start_s', m] if c in bdf.columns]
-            out = bdf[cols].copy()
-            if 'bin_start_s' in out.columns:
-                out.insert(out.columns.get_loc('bin_start_s') + 1,
-                           'bin_start_min', out['bin_start_s'] / 60.0)
+            if data_type == 'timecourse' and bins_df is not None:
+                cols = [c for c in ['treatment', 'bin_start_s', metric]
+                        if c in bins_df.columns]
+                out = bins_df[cols].copy()
+                if 'bin_start_s' in out.columns:
+                    out.insert(
+                        out.columns.get_loc('bin_start_s') + 1,
+                        'bin_start_min', out['bin_start_s'] / 60.0)
+            elif groups:
+                gc = graph_cfg or {}
+                ordered_keys = (
+                    [t for t in gc.get('order', []) if t in groups]
+                    + [t for t in groups if t not in gc.get('order', [])])
+                rows = [{'treatment': t, metric: float(v)}
+                        for t in (ordered_keys or list(groups.keys()))
+                        for v in groups[t]]
+                out = pd.DataFrame(rows)
+            else:
+                return
             path = filedialog.asksaveasfilename(
                 defaultextension='.csv', filetypes=[('CSV', '*.csv')],
-                initialfile=n.replace(' ', '_') + '_data.csv',
+                initialfile=tab_name.replace(' ', '_') + '_data.csv',
                 parent=frame.winfo_toplevel())
             if path:
                 out.to_csv(path, index=False)
 
-        ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-        ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
+        ttk.Button(btn_bar, text="Export Graph",
+                   command=_exp_graph).pack(side='left', padx=4)
+        ttk.Button(btn_bar, text="Export Data",
+                   command=_exp_data).pack(side='left', padx=2)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Statistical test helper
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Original tab-based graph methods (now delegate to build methods) ─
 
+    def _add_bar_tab(self, nb, df, metric, tab_name,
+                     reference=None, y_label='', graph_cfg=None):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=tab_name)
+        self._build_bar_graph(frame, df, metric, tab_name,
+                              reference, y_label, graph_cfg)
+
+    def _add_box_tab(self, nb, df, metric, tab_name,
+                     reference=None, y_label='', graph_cfg=None):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=tab_name)
+        self._build_box_graph(frame, df, metric, tab_name,
+                              reference, y_label, graph_cfg)
+
+    def _add_violin_tab(self, nb, df, metric, tab_name,
+                        reference=None, y_label='', graph_cfg=None):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=tab_name)
+        self._build_violin_graph(frame, df, metric, tab_name,
+                                 reference, y_label, graph_cfg)
+
+    def _add_timecourse_tab(self, nb, bins_df, metric, tab_name,
+                            reference=None, y_label=None, graph_cfg=None):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=tab_name)
+        self._build_timecourse_graph(frame, bins_df, metric, tab_name,
+                                     reference, y_label, graph_cfg)
     def _perform_wb_statistical_test(self, data_by_treatment, treatments):
         """Statistical test with parametric/non-parametric support and effect sizes."""
         from scipy import stats as _scipy_stats
@@ -6796,6 +8363,7 @@ class GaitLimbTab(ttk.Frame):
                 valid_treats = [t for t in treatments
                                 if len(data_by_treatment.get(t, [])) > 0]
                 valid_groups = [data_by_treatment[t] for t in valid_treats]
+                n_comparisons = len(valid_treats) * (len(valid_treats) - 1) // 2
                 for i in range(len(valid_treats)):
                     for j in range(i + 1, len(valid_treats)):
                         if use_nonparam:
@@ -6806,16 +8374,18 @@ class GaitLimbTab(ttk.Frame):
                             _, pp = _scipy_stats.ttest_ind(
                                 valid_groups[i], valid_groups[j],
                                 equal_var=False)
+                        pp_adj = min(float(pp) * n_comparisons, 1.0)
                         key = f"{valid_treats[i]}_vs_{valid_treats[j]}"
                         pairwise[key] = {
-                            'p_value':     float(pp),
-                            'significant': bool(pp < alpha),
+                            'p_value':     pp_adj,
+                            'significant': bool(pp_adj < alpha),
                         }
                 results['pairwise'] = pairwise
 
         return results
 
-    def _add_paw_contact_bar_tab(self, nb, df, graph_cfg=None):
+    def _add_paw_contact_bar_tab(self, nb, df, graph_cfg=None,
+                                 as_frame=False):
         """Grouped bar chart: per-paw contact%, one bar group per treatment."""
         _PAW_COLORS = {
             'contact_pct_HL': '#2ca02c',
@@ -6844,15 +8414,18 @@ class GaitLimbTab(ttk.Frame):
             treatment_labels = ['All sessions']
         n_treats = len(treatment_labels)
 
-        use_sd = graph_cfg and graph_cfg.get('error_type') == 'SD'
+        _err_type = graph_cfg.get('error_type', 'SEM') if graph_cfg else 'SEM'
 
         if n_treats > 1:
             colors = list(plt.cm.Set2(np.linspace(0, 0.8, n_treats)))
         else:
             colors = [_PAW_COLORS.get(active[0][1], '#1f77b4')]
 
-        frame = ttk.Frame(nb)
-        nb.add(frame, text='Contact %')
+        if as_frame:
+            frame = nb  # nb is already the target frame
+        else:
+            frame = ttk.Frame(nb)
+            nb.add(frame, text='Contact %')
 
         fig, ax = plt.subplots(
             figsize=(max(5, len(active) * 1.4 + 1), 4), tight_layout=True)
@@ -6868,8 +8441,7 @@ class GaitLimbTab(ttk.Frame):
                 else:
                     subset = df[col].dropna()
                 mean_ = subset.mean() if len(subset) else 0
-                err_  = (np.nanstd(subset, ddof=1) if use_sd else
-                         (_sp_stats.sem(subset) if len(subset) > 1 else 0))
+                err_  = self._calc_error(subset.values, _err_type)
                 # Color: from graph_cfg if available, else fallback
                 if graph_cfg and graph_cfg.get('colors') and treat in graph_cfg['colors']:
                     raw = graph_cfg['colors'][treat]
@@ -6905,7 +8477,7 @@ class GaitLimbTab(ttk.Frame):
                     if len(v0) > 0 and len(v1) > 0:
                         try:
                             _, p = _sp_stats.ttest_ind(v0, v1, equal_var=False)
-                            lbl = _p_label(p)
+                            lbl = _p_label(p, self._sig_style)
                             if lbl:
                                 x0 = x[pi] - 0.35 + 0.5 * bar_w
                                 x1 = x[pi] - 0.35 + 1.5 * bar_w
@@ -6926,7 +8498,7 @@ class GaitLimbTab(ttk.Frame):
                     if len(grp_vals) > 1:
                         try:
                             _, p = _sp_stats.f_oneway(*grp_vals)
-                            lbl = _p_label(p)
+                            lbl = _p_label(p, self._sig_style)
                             if lbl:
                                 ax.text(x[pi], ax.get_ylim()[1] * 0.96, lbl,
                                         ha='center', va='bottom',
@@ -6962,7 +8534,77 @@ class GaitLimbTab(ttk.Frame):
 
         ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
         ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
+        self._embed_figure(frame, fig, ax=ax)
+
+    def _add_support_pattern_tab(self, nb, df, graph_cfg=None,
+                                 as_frame=False):
+        """Stacked bar chart: support pattern distribution per treatment."""
+        support_cols = [f'support_{n}paw_pct' for n in range(5)]
+        active = [c for c in support_cols if c in df.columns and df[c].notna().any()]
+        if not active:
+            return
+
+        has_treats = ('treatment' in df.columns
+                      and df['treatment'].ne('').any()
+                      and df['treatment'].notna().any())
+        if has_treats:
+            all_treats = [str(t) for t in df['treatment'].dropna().unique() if str(t).strip()]
+            if graph_cfg and graph_cfg.get('order'):
+                treatment_labels = [t for t in graph_cfg['order'] if t in all_treats]
+                treatment_labels += [t for t in all_treats if t not in treatment_labels]
+            else:
+                treatment_labels = sorted(all_treats)
+        else:
+            treatment_labels = ['All sessions']
+
+        if as_frame:
+            frame = nb
+        else:
+            frame = ttk.Frame(nb)
+            nb.add(frame, text='Support Patterns')
+
+        fig, ax = plt.subplots(figsize=(max(5, len(treatment_labels) * 1.5 + 1), 4),
+                               tight_layout=True)
+        x = np.arange(len(treatment_labels))
+        _support_colors = ['#d62728', '#ff7f0e', '#2ca02c', '#1f77b4', '#9467bd']
+        _support_labels = ['0 paw', '1 paw', '2 paw', '3 paw', '4 paw']
+
+        bottom = np.zeros(len(treatment_labels))
+        for i, col in enumerate(support_cols):
+            if col not in df.columns:
+                continue
+            means = []
+            for treat in treatment_labels:
+                if has_treats and len(treatment_labels) > 1:
+                    vals = df[df['treatment'] == treat][col].dropna().values
+                else:
+                    vals = df[col].dropna().values
+                means.append(np.nanmean(vals) if len(vals) > 0 else 0)
+            means = np.array(means)
+            ax.bar(x, means, bottom=bottom, color=_support_colors[i],
+                   label=_support_labels[i], edgecolor='black', linewidth=0.5)
+            bottom += means
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(treatment_labels, fontsize=11)
+        self._style_ax(ax, title='Support Patterns (locomotion)',
+                       ylabel='% of locomotion frames')
+        ax.legend(fontsize=9, loc='upper right')
+
+        btn_bar = ttk.Frame(frame)
+        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
+
+        def _exp_graph(f=fig):
+            path = filedialog.asksaveasfilename(
+                defaultextension='.png',
+                filetypes=[('PNG image', '*.png'), ('SVG vector', '*.svg'), ('PDF', '*.pdf')],
+                initialfile='Support_patterns.png',
+                parent=frame.winfo_toplevel())
+            if path:
+                f.savefig(path, dpi=300, bbox_inches='tight')
+
+        ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
+        self._embed_figure(frame, fig, ax=ax)
 
     # ── Contour grouped graphs ──────────────────────────────────────────
 
@@ -7026,7 +8668,8 @@ class GaitLimbTab(ttk.Frame):
         return ar, circ
 
     def _add_contour_shape_tab(self, nb, sessions_df, intermediates,
-                               role, tab_name='Shape', graph_cfg=None):
+                               role, tab_name='Shape', graph_cfg=None,
+                               filter_paw=False, as_frame=False):
         """Add a tab showing mean contour outline for a paw, per treatment group."""
         # Gather normalized contour shapes from intermediates
         # Group by treatment
@@ -7044,8 +8687,9 @@ class GaitLimbTab(ttk.Frame):
         else:
             treatment_labels = ['All sessions']
 
-        # Collect shapes per treatment
+        # Collect shapes (and solidities for filtering) per treatment
         treat_shapes = {t: [] for t in treatment_labels}
+        treat_sols = {t: [] for t in treatment_labels}
 
         for _, row in sessions_df.iterrows():
             sess_name = row.get('session', '')
@@ -7058,13 +8702,39 @@ class GaitLimbTab(ttk.Frame):
             shapes = role_data.get('contour_shapes')
             if shapes:
                 treat_shapes[treat].extend(shapes)
+                sols = role_data.get('contour_solidities', [])
+                if len(sols) < len(shapes):
+                    sols = list(sols) + [1.0] * (len(shapes) - len(sols))
+                treat_sols[treat].extend(sols[:len(shapes)])
+
+        # Apply paw-like filter if requested
+        treat_total = {}  # original counts (before filtering)
+        if filter_paw:
+            sol_thresh = self._pawlike_thresholds.get('solidity', 1.00)
+            ar_thresh = self._pawlike_thresholds.get('aspect_ratio', 1.6)
+            circ_thresh = self._pawlike_thresholds.get('circularity', 0.10)
+            for treat in treatment_labels:
+                shapes = treat_shapes[treat]
+                if not shapes:
+                    continue
+                treat_total[treat] = len(shapes)
+                filtered = []
+                for i, s in enumerate(shapes):
+                    ar_i, circ_i = self._shape_metrics(s)
+                    sol_i = treat_sols[treat][i] if i < len(treat_sols[treat]) else 1.0
+                    if sol_i <= sol_thresh and ar_i <= ar_thresh and circ_i >= circ_thresh:
+                        filtered.append(s)
+                treat_shapes[treat] = filtered
 
         # Check we have any shapes
         if not any(treat_shapes.values()):
             return
 
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+        if as_frame:
+            frame = nb
+        else:
+            frame = ttk.Frame(nb)
+            nb.add(frame, text=tab_name)
 
         fig, ax = plt.subplots(figsize=(5, 5), tight_layout=True)
         ax.set_aspect('equal')
@@ -7091,8 +8761,12 @@ class GaitLimbTab(ttk.Frame):
             else:
                 color = self._PAW_COLORS_ROLE.get(role, '#1f77b4')
 
+            if filter_paw and treat in treat_total:
+                _shape_lbl = f'{treat} (n={len(stacked)}/{treat_total[treat]})'
+            else:
+                _shape_lbl = f'{treat} (n={len(stacked)})'
             ax.plot(mean_closed[:, 0], mean_closed[:, 1],
-                    color=color, linewidth=2.0, label=f'{treat} (n={len(stacked)})')
+                    color=color, linewidth=2.0, label=_shape_lbl)
 
             # SD envelope: offset contour points radially by ±1 SD
             radial_sd = np.sqrt(sd_closed[:, 0] ** 2 + sd_closed[:, 1] ** 2)
@@ -7132,11 +8806,12 @@ class GaitLimbTab(ttk.Frame):
                 f.savefig(path, dpi=300, bbox_inches='tight')
 
         ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-        self._embed_figure(frame, fig)
+        self._embed_figure(frame, fig, ax=ax)
 
     def _add_contour_print_tab(self, nb, sessions_df, intermediates,
                                role, tab_name='Paw Print', graph_cfg=None,
-                               n_prints=5, group_by='treatment', filter_paw=False):
+                               n_prints=5, group_by='treatment', filter_paw=False,
+                               as_frame=False):
         """Add a tab showing representative individual paw-print contours.
 
         Parameters
@@ -7214,8 +8889,11 @@ class GaitLimbTab(ttk.Frame):
         if n_groups == 0:
             return
 
-        frame = ttk.Frame(nb)
-        nb.add(frame, text=tab_name)
+        if as_frame:
+            frame = nb
+        else:
+            frame = ttk.Frame(nb)
+            nb.add(frame, text=tab_name)
 
         # Layout: wrap to multiple rows when many subjects
         max_cols = min(n_groups, 6)
@@ -7247,8 +8925,8 @@ class GaitLimbTab(ttk.Frame):
 
             # Apply paw-like filter using stored solidities + shape metrics
             if filter_paw:
-                sol_thresh = self._pawlike_thresholds.get('solidity', 0.88)
-                ar_thresh = self._pawlike_thresholds.get('aspect_ratio', 5.0)
+                sol_thresh = self._pawlike_thresholds.get('solidity', 1.00)
+                ar_thresh = self._pawlike_thresholds.get('aspect_ratio', 1.6)
                 circ_thresh = self._pawlike_thresholds.get('circularity', 0.10)
                 grp_sols = np.array(group_solidities.get(grp, [1.0] * total_all))
                 paw_mask = grp_sols <= sol_thresh
@@ -7437,9 +9115,13 @@ class GaitLimbTab(ttk.Frame):
         ctrl_frame = ttk.LabelFrame(frame, text='Filter Thresholds', padding=6)
         ctrl_frame.pack(side='top', fill='x', padx=6, pady=(4, 2))
 
-        sol_var = tk.DoubleVar(value=self._pawlike_thresholds.get('solidity', 0.88))
-        ar_var = tk.DoubleVar(value=self._pawlike_thresholds.get('aspect_ratio', 5.0))
+        sol_var = tk.DoubleVar(value=self._pawlike_thresholds.get('solidity', 1.00))
+        ar_var = tk.DoubleVar(value=self._pawlike_thresholds.get('aspect_ratio', 1.6))
         circ_var = tk.DoubleVar(value=self._pawlike_thresholds.get('circularity', 0.10))
+
+        # Store slider vars for sync support — callback added after _on_slider_change defined
+        _PAIRED = {'HL': 'HR', 'HR': 'HL', 'FL': 'FR', 'FR': 'FL'}
+        _syncing = [False]  # guard against infinite recursion
 
         def _make_slider(parent, label, var, from_, to, resolution, row, tooltip):
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=(0, 4))
@@ -7475,13 +9157,13 @@ class GaitLimbTab(ttk.Frame):
                                   state='readonly', width=12)
         view_combo.pack(side='left')
 
+        # -- Button bar (pack before canvas so it reserves space at bottom) --
+        btn_bar = ttk.Frame(frame)
+        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 4))
+
         # -- Canvas area --
         canvas_frame = ttk.Frame(frame)
         canvas_frame.pack(side='top', fill='both', expand=True, padx=4, pady=2)
-
-        # -- Button bar --
-        btn_bar = ttk.Frame(frame)
-        btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 4))
 
         # Mutable state
         state = dict(page=0, canvas_widget=None, fig=None,
@@ -7583,12 +9265,33 @@ class GaitLimbTab(ttk.Frame):
             _compute_mask()
             state['page'] = 0
             _draw_page(0)
+            # Sync paired paw if enabled
+            if _syncing[0]:
+                return
+            if (hasattr(self, '_filter_sync_lr_var')
+                    and self._filter_sync_lr_var.get()
+                    and hasattr(self, '_filter_slider_vars')):
+                paired = _PAIRED.get(role)
+                if paired and paired in self._filter_slider_vars:
+                    p_sol, p_ar, p_circ, p_cb = self._filter_slider_vars[paired]
+                    p_sol.set(sol_var.get())
+                    p_ar.set(ar_var.get())
+                    p_circ.set(circ_var.get())
+                    _syncing[0] = True
+                    try:
+                        p_cb()
+                    finally:
+                        _syncing[0] = False
 
         def _on_view_change(_event=None):
             state['page'] = 0
             _draw_page(0)
 
         view_combo.bind('<<ComboboxSelected>>', _on_view_change)
+
+        # Register slider vars + callback for sync support
+        if hasattr(self, '_filter_slider_vars'):
+            self._filter_slider_vars[role] = (sol_var, ar_var, circ_var, _on_slider_change)
 
         def _prev():
             if state['page'] > 0:
@@ -7616,18 +9319,18 @@ class GaitLimbTab(ttk.Frame):
         ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
 
         def _apply():
-            """Store current thresholds for use by metrics and print tabs."""
+            """Store current thresholds and live-regenerate the Filtered Contour tab."""
             self._pawlike_thresholds['solidity'] = sol_var.get()
             self._pawlike_thresholds['aspect_ratio'] = ar_var.get()
             self._pawlike_thresholds['circularity'] = circ_var.get()
-            messagebox.showinfo(
-                'Thresholds Applied',
-                f'Paw-like filter thresholds updated:\n'
-                f'  Solidity \u2264 {sol_var.get():.2f}\n'
-                f'  Aspect Ratio \u2264 {ar_var.get():.2f}\n'
-                f'  Circularity \u2265 {circ_var.get():.2f}\n\n'
-                f'Re-run analysis to see updated metrics and prints.',
-                parent=frame.winfo_toplevel())
+            try:
+                self._rebuild_filtered_contour_tab()
+                self._refresh_results_table()
+            except Exception as exc:
+                messagebox.showerror(
+                    'Rebuild Error',
+                    f'Failed to regenerate Filtered Contour tab:\n{exc}',
+                    parent=frame.winfo_toplevel())
 
         ttk.Button(btn_bar, text="Apply", command=_apply).pack(side='right', padx=4)
 
@@ -7658,7 +9361,7 @@ class GaitLimbTab(ttk.Frame):
             treatment_labels = ['All sessions']
         n_treats = len(treatment_labels)
 
-        use_sd = graph_cfg and graph_cfg.get('error_type') == 'SD'
+        _err_type = graph_cfg.get('error_type', 'SEM') if graph_cfg else 'SEM'
 
         frame = ttk.Frame(nb)
         nb.add(frame, text=tab_name)
@@ -7677,8 +9380,7 @@ class GaitLimbTab(ttk.Frame):
                 else:
                     subset = df[col].dropna()
                 mean_ = subset.mean() if len(subset) else 0
-                err_  = (np.nanstd(subset, ddof=1) if use_sd else
-                         (_sp_stats.sem(subset) if len(subset) > 1 else 0))
+                err_  = self._calc_error(subset.values, _err_type)
                 if graph_cfg and graph_cfg.get('colors') and treat in graph_cfg['colors']:
                     raw = graph_cfg['colors'][treat]
                     color = 'white' if raw == 'white_black' else raw
@@ -7711,7 +9413,7 @@ class GaitLimbTab(ttk.Frame):
                 if len(v0) > 0 and len(v1) > 0:
                     try:
                         _, p = _sp_stats.ttest_ind(v0, v1, equal_var=False)
-                        lbl = _p_label(p)
+                        lbl = _p_label(p, self._sig_style)
                         if lbl:
                             x0 = x[pi] - 0.35 + 0.5 * bar_w
                             x1 = x[pi] - 0.35 + 1.5 * bar_w
@@ -7720,6 +9422,21 @@ class GaitLimbTab(ttk.Frame):
                                     [y_ann * 0.97, y_ann, y_ann, y_ann * 0.97],
                                     color='black', linewidth=1)
                             ax.text((x0 + x1) / 2, y_ann * 1.01, lbl,
+                                    ha='center', va='bottom',
+                                    fontsize=11, fontweight='bold')
+                    except Exception:
+                        pass
+        elif self._enable_stats_var.get() and n_treats > 2:
+            for pi, (role, col) in enumerate(paw_cols):
+                grp_vals = [df[df['treatment'] == t][col].dropna().values
+                            for t in treatment_labels]
+                grp_vals = [v for v in grp_vals if len(v) > 0]
+                if len(grp_vals) > 1:
+                    try:
+                        _, p = _sp_stats.f_oneway(*grp_vals)
+                        lbl = _p_label(p, self._sig_style)
+                        if lbl:
+                            ax.text(x[pi], ax.get_ylim()[1] * 0.96, lbl,
                                     ha='center', va='bottom',
                                     fontsize=11, fontweight='bold')
                     except Exception:
@@ -7750,7 +9467,7 @@ class GaitLimbTab(ttk.Frame):
 
         ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
         ttk.Button(btn_bar, text="Export Data",  command=_exp_data).pack(side='left', padx=2)
-        self._embed_figure(frame, fig)
+        self._embed_figure(frame, fig, ax=ax)
 
     @staticmethod
     def _rebin_timecourse(xs, means, errs, rebin_min):
@@ -7768,7 +9485,7 @@ class GaitLimbTab(ttk.Frame):
                 group_e.append(errs[i])
                 i += 1
             if group_m:
-                new_xs.append(bin_start + rebin_min / 2.0)
+                new_xs.append(bin_start)
                 new_means.append(float(np.mean(group_m)))
                 # Propagate error: average of errors (simple approach)
                 new_errs.append(float(np.mean(group_e)))
@@ -7796,10 +9513,15 @@ class GaitLimbTab(ttk.Frame):
         else:
             treatment_labels = ['All sessions']
 
-        use_sd = graph_cfg and graph_cfg.get('error_type') == 'SD'
+        _err_type = graph_cfg.get('error_type', 'SEM') if graph_cfg else 'SEM'
 
         # Re-bin support
         rebin = graph_cfg.get('rebin_minutes') if graph_cfg else None
+
+        # Filter bins to the user-specified time window
+        if graph_cfg and graph_cfg.get('time_window') is not None:
+            _tw_sec = graph_cfg['time_window'] * 60.0
+            bdf = bdf[bdf['bin_start_s'] <= _tw_sec].copy()
 
         outer_frame = ttk.Frame(nb)
         nb.add(outer_frame, text=tab_name)
@@ -7824,8 +9546,7 @@ class GaitLimbTab(ttk.Frame):
                     vals = sub[sub['bin_start_s'] == b][col].dropna().values
                     if len(vals) > 0:
                         means.append(np.nanmean(vals))
-                        errs.append(np.nanstd(vals, ddof=1) if use_sd else
-                                    (_sp_stats.sem(vals) if len(vals) > 1 else 0))
+                        errs.append(self._calc_error(vals, _err_type))
                         xs.append(b / 60.0)
 
                 if rebin and rebin > 0 and xs:
@@ -7837,23 +9558,132 @@ class GaitLimbTab(ttk.Frame):
                         color = 'black' if raw == 'white_black' else raw
                     else:
                         color = self._PAW_COLORS_ROLE.get(role, '#1f77b4')
-                    ax.errorbar(xs, means, yerr=errs, fmt='o-',
-                                color=color, capsize=3,
-                                label=treat, markersize=4)
-                    ax.fill_between(xs,
-                                    np.array(means) - np.array(errs),
-                                    np.array(means) + np.array(errs),
-                                    alpha=0.18, color=color)
+                    _tkey = str(treat)
+                    _lstyle = graph_cfg.get('line_styles', {}).get(_tkey, '-') if graph_cfg else '-'
+                    _mshape = graph_cfg.get('marker_shapes', {}).get(_tkey, 'o') if graph_cfg else 'o'
+                    _msize  = graph_cfg.get('marker_sizes', {}).get(_tkey, 4) if graph_cfg else 4
+                    _lw     = graph_cfg.get('line_widths', {}).get(_tkey, 1.8) if graph_cfg else 1.8
+                    _alpha  = graph_cfg.get('opacities', {}).get(_tkey, 1.0) if graph_cfg else 1.0
+                    _mfill = graph_cfg.get('marker_fills', {}).get(_tkey, 'full') if graph_cfg else 'full'
+                    _pkw = dict(color=color, linewidth=_lw, linestyle=_lstyle,
+                                alpha=_alpha, label=treat)
+                    if _mshape and _mshape != 'none':
+                        _pkw['marker'] = _mshape
+                        _pkw['markersize'] = _msize
+                        _pkw['fillstyle'] = _mfill
+                        if _mfill == 'none':
+                            _pkw['markeredgewidth'] = 1.2
+                        elif _mfill in ('left', 'right', 'top', 'bottom'):
+                            _pkw['markerfacecoloralt'] = 'white'
+                    if raw == 'white_black':
+                        _pkw['markerfacecolor'] = 'white'
+                        _pkw['markeredgecolor'] = 'black'
+                    _edge_sel = graph_cfg.get('marker_edge_colors', {}).get(_tkey, 'auto') if graph_cfg else 'auto'
+                    if _edge_sel == 'black':
+                        _pkw['markeredgecolor'] = 'black'
+                    elif _edge_sel == 'white':
+                        _pkw['markeredgecolor'] = 'white'
+                    elif _edge_sel == 'match':
+                        _pkw['markeredgecolor'] = color
+                    _err_disp = graph_cfg.get('error_display', 'circles_caps') if graph_cfg else 'circles_caps'
+                    if _err_disp == 'circles_caps':
+                        _line_kw = {k: v for k, v in _pkw.items()
+                                    if k not in ('marker', 'markersize', 'fillstyle',
+                                                 'markeredgewidth', 'markerfacecoloralt',
+                                                 'markerfacecolor', 'markeredgecolor')}
+                        ax.plot(xs, means, **_line_kw)
+                    else:
+                        ax.plot(xs, means, **_pkw)
+                    if _err_disp == 'caps':
+                        ax.errorbar(xs, means, yerr=errs, capsize=4,
+                                    capthick=1.5, fmt='none',
+                                    alpha=0.6 * _alpha, ecolor=color)
+                    elif _err_disp == 'circles_caps':
+                        ax.errorbar(xs, means, yerr=errs, capsize=4,
+                                    capthick=1.5, fmt='none',
+                                    alpha=0.6 * _alpha, ecolor=color)
+                        _msz = _msize if (_mshape and _mshape != 'none') else 5
+                        _mkw = dict(linestyle='none', color=color,
+                                    marker='o', markersize=_msz, alpha=_alpha)
+                        _mkw['fillstyle'] = _mfill
+                        if _mfill == 'none':
+                            _mkw['markeredgewidth'] = 1.2
+                        elif _mfill in ('left', 'right', 'top', 'bottom'):
+                            _mkw['markerfacecoloralt'] = 'white'
+                        if raw == 'white_black':
+                            _mkw['markerfacecolor'] = 'white'
+                            _mkw['markeredgecolor'] = 'black'
+                        if _edge_sel == 'black':
+                            _mkw['markeredgecolor'] = 'black'
+                        elif _edge_sel == 'white':
+                            _mkw['markeredgecolor'] = 'white'
+                        elif _edge_sel == 'match':
+                            _mkw['markeredgecolor'] = color
+                        ax.plot(xs, means, **_mkw)
+                    else:
+                        ax.fill_between(xs,
+                                        np.array(means) - np.array(errs),
+                                        np.array(means) + np.array(errs),
+                                        alpha=0.18 * _alpha, color=color)
 
             paw_label = {'HL': 'Hind Left', 'HR': 'Hind Right',
                          'FL': 'Fore Left', 'FR': 'Fore Right'}.get(role, role)
             self._style_ax(ax, title=f'{tab_name} — {paw_label}',
                            xlabel='Time (min)', ylabel=y_label or metric_key)
+            ax.annotate(self._error_label(_err_type),
+                        xy=(1, 1), xycoords='axes fraction',
+                        ha='right', va='bottom', fontsize=8,
+                        color='gray', style='italic')
             if len(treatment_labels) > 1:
                 ax.legend(fontsize=10)
 
+            # Per-bin significance markers (Bonferroni-corrected for 2 groups)
+            if self._enable_stats_var.get() and len(treatment_labels) >= 2 and has_treats:
+                from matplotlib.transforms import blended_transform_factory
+                trans = blended_transform_factory(ax.transData, ax.transAxes)
+                tw = graph_cfg.get('time_window') if graph_cfg else None
+                bins_unique = sorted(bdf['bin_start_s'].unique())
+                # Count testable bins for Bonferroni
+                _n_tests_c = 0
+                for _bt in bins_unique:
+                    _bd = bdf[bdf['bin_start_s'] == _bt]
+                    _gc = [_bd[_bd['treatment'] == t][col].dropna().values
+                           for t in treatment_labels if t in _bd['treatment'].values]
+                    _gc = [v for v in _gc if len(v) >= 2]
+                    if len(_gc) >= 2:
+                        _n_tests_c += 1
+                _n_tests_c = max(_n_tests_c, 1)
+                for bin_t in bins_unique:
+                    t_min_val = bin_t / 60.0
+                    if tw is not None and t_min_val > tw:
+                        continue
+                    bin_df = bdf[bdf['bin_start_s'] == bin_t]
+                    gvals = [bin_df[bin_df['treatment'] == t][col].dropna().values
+                             for t in treatment_labels if t in bin_df['treatment'].values]
+                    gvals = [v for v in gvals if len(v) >= 2]
+                    if len(gvals) < 2:
+                        continue
+                    try:
+                        if len(gvals) == 2:
+                            _, p = _sp_stats.ttest_ind(gvals[0], gvals[1], equal_var=False)
+                            if np.isnan(p):
+                                continue
+                            p = min(p * _n_tests_c, 1.0)
+                        else:
+                            _, p = _sp_stats.f_oneway(*gvals)
+                            if np.isnan(p):
+                                continue
+                        lbl = _p_label(p, self._sig_style)
+                        if lbl:
+                            ax.text(t_min_val, 0.98, lbl, transform=trans,
+                                    ha='center', va='top', fontsize=9, color='black')
+                    except Exception:
+                        pass
+
             if graph_cfg and graph_cfg.get('time_window') is not None:
-                ax.set_xlim(0, graph_cfg['time_window'])
+                ax.set_xlim(-0.5, graph_cfg['time_window'] + 0.5)
+            else:
+                ax.margins(x=0.02)
 
             btn_bar = ttk.Frame(paw_frame)
             btn_bar.pack(side='bottom', fill='x', padx=4, pady=(0, 2))
@@ -7868,7 +9698,7 @@ class GaitLimbTab(ttk.Frame):
                     f.savefig(path, dpi=300, bbox_inches='tight')
 
             ttk.Button(btn_bar, text="Export Graph", command=_exp_graph).pack(side='left', padx=4)
-            self._embed_figure(paw_frame, fig)
+            self._embed_figure(paw_frame, fig, ax=ax)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Statistics tab methods
@@ -8140,23 +9970,39 @@ class GaitLimbTab(ttk.Frame):
         row_idx = 1
         n_sig   = 0
 
+        # Count testable bins for Bonferroni correction (2-group case)
+        n_tests = 0
+        for bin_s in time_bins:
+            bin_df = bins_df[bins_df['bin_start_s'] == bin_s]
+            _gc = []
+            for treat in treatments:
+                vals = bin_df[bin_df['treatment'] == treat][metric].dropna().values
+                if len(vals) >= 2:
+                    _gc.append(vals)
+            if len(_gc) >= 2:
+                n_tests += 1
+        n_tests = max(n_tests, 1)
+
         for bin_s in time_bins:
             bin_df = bins_df[bins_df['bin_start_s'] == bin_s]
             groups = []
             for treat in treatments:
                 vals = bin_df[bin_df['treatment'] == treat][metric].dropna().values
-                if len(vals) > 0:
+                if len(vals) >= 2:
                     groups.append(vals)
             if len(groups) < 2:
                 continue
 
             if len(groups) == 2:
                 t_stat, p_val = _scipy_stats.ttest_ind(groups[0], groups[1], equal_var=False)
-                test_name    = "Welch's t-test (2 groups)"
+                if np.isnan(t_stat) or np.isnan(p_val):
+                    continue
+                p_val = min(p_val * n_tests, 1.0)  # Bonferroni
+                test_name    = f"Welch's t (Bonf. \u00d7{n_tests})"
                 stat_display = f't={t_stat:.3f}'
             else:
                 f_stat, anova_p = _scipy_stats.f_oneway(*groups)
-                if anova_p >= alpha:
+                if np.isnan(anova_p) or anova_p >= alpha:
                     continue
                 try:
                     from scipy.stats import tukey_hsd
@@ -8169,12 +10015,13 @@ class GaitLimbTab(ttk.Frame):
                     for gi in range(len(groups)):
                         for gj in range(gi + 1, len(groups)):
                             _, pp = _scipy_stats.ttest_ind(groups[gi], groups[gj], equal_var=False)
-                            min_p = min(min_p, pp)
+                            if not np.isnan(pp):
+                                min_p = min(min_p, pp)
                     p_val        = min_p
                     test_name    = f'Bonferroni ({len(groups)} groups)'
                     stat_display = f'p(min)={min_p:.4f}'
 
-            if p_val >= alpha:
+            if np.isnan(p_val) or p_val >= alpha:
                 continue
 
             n_sig += 1
@@ -8209,7 +10056,7 @@ class GaitLimbTab(ttk.Frame):
 
     def _create_wb_statistics_tab(self, nb, summary_df, bins_df,
                                    treatments, max_time_min):
-        """Create a Statistics notebook tab for weight-bearing results.
+        """Create a Statistics notebook tab for limb use results.
 
         nb            — ttk.Notebook to add the tab to
         summary_df    — per-session summary DataFrame (lowercase columns)
@@ -8222,7 +10069,7 @@ class GaitLimbTab(ttk.Frame):
 
         max_time_int = max(1, int(max_time_min))
 
-        # ── Control bar ───────────────────────────────────────────────────
+        # ── Control bar (shared across sub-tabs) ─────────────────────────
         ctrl_frame = ttk.Frame(frame)
         ctrl_frame.pack(fill='x', padx=10, pady=(8, 4))
 
@@ -8237,25 +10084,65 @@ class GaitLimbTab(ttk.Frame):
                                font=('Arial', 9), foreground='gray')
         status_lbl.pack(side='left', padx=10)
 
-        # ── Scrollable content holder (rebuilt on recalculate) ────────────
-        content_holder = ttk.Frame(frame)
-        content_holder.pack(fill='both', expand=True)
+        # ── Category notebook for sub-tabs ────────────────────────────────
+        stats_nb = ttk.Notebook(frame)
+        stats_nb.pack(fill='both', expand=True)
 
-        # Metrics to show (hind always; fore only if configured; gait if available)
+        # Metrics grouped by category
         hind_metrics = ['WBI_hind', 'SI_hind', 'SBI_hind']
         fore_metrics = (['WBI_fore', 'SI_fore', 'SBI_fore']
                         if self._use_fore_var.get() else [])
-        gait_metrics = ['stance_dur_HL', 'stance_dur_HR', 'duty_cycle_HL', 'duty_cycle_HR',
-                        'stride_len_HL', 'stride_len_HR', 'stance_SI_hind', 'stride_len_SI_hind']
-        all_metrics  = hind_metrics + fore_metrics + gait_metrics
+        contact_metrics = [f'contact_pct_{r}' for r in self.ROLES]
+        brightness_metrics = ['brightness_HL', 'brightness_HR',
+                              'brightness_ratio_HL_HR']
+        gait_metrics = [
+            'stance_dur_HL', 'stance_dur_HR', 'swing_dur_HL', 'swing_dur_HR',
+            'stride_dur_HL', 'stride_dur_HR', 'cadence_HL', 'cadence_HR',
+            'duty_cycle_HL', 'duty_cycle_HR',
+            'stride_len_HL', 'stride_len_HR',
+            'step_len_hind', 'step_width_hind',
+            'swing_speed_HL', 'swing_speed_HR',
+            'stride_cv_HL', 'stride_cv_HR',
+            'stance_SI_hind', 'stride_len_SI_hind',
+        ]
+        loco_metrics = ['total_distance', 'loco_total_distance',
+                        'time_moving_s', 'time_moving_pct',
+                        'body_speed_mean', 'body_speed_loco']
+        phase_metrics = ['phase_HL_HR', 'phase_diagonal',
+                         'phase_FL_FR', 'phase_HL_FL', 'phase_HR_FR', 'phase_HL_FR']
+        coordination_metrics = ['regularity_index',
+                                'print_position_L', 'print_position_R',
+                                'support_0paw_pct', 'support_1paw_pct',
+                                'support_2paw_pct', 'support_3paw_pct',
+                                'support_4paw_pct']
+        contour_metrics = [f'paw_area_{r}' for r in ('HL', 'HR')]
+        contour_metrics += [f'paw_spread_{r}' for r in ('HL', 'HR')]
+        contour_metrics += ['paw_area_ratio_hind']
 
-        def build_content(s_df, b_df):
-            for w in content_holder.winfo_children():
+        # All metrics for CSV export
+        all_metrics = (hind_metrics + fore_metrics + contact_metrics
+                       + brightness_metrics + gait_metrics
+                       + loco_metrics + phase_metrics
+                       + coordination_metrics + contour_metrics)
+
+        # Define sub-tab categories
+        _stats_categories = [
+            ('Limb Use', hind_metrics + fore_metrics + contact_metrics + brightness_metrics),
+            ('Gait',           gait_metrics),
+            ('Movement',       loco_metrics + phase_metrics + coordination_metrics),
+            ('Paw Contour',    contour_metrics),
+        ]
+
+        # Content holders per sub-tab (for rebuild on recalculate)
+        _cat_holders = {}
+
+        def _build_category_content(holder, cat_metrics, s_df, b_df):
+            """Build scrollable statistics content for one category."""
+            for w in holder.winfo_children():
                 w.destroy()
 
-            # Scrollable canvas
-            canvas = tk.Canvas(content_holder, bg='white')
-            sb_inner = ttk.Scrollbar(content_holder, orient='vertical',
+            canvas = tk.Canvas(holder, bg='white')
+            sb_inner = ttk.Scrollbar(holder, orient='vertical',
                                      command=canvas.yview)
             scrollable_frame = ttk.Frame(canvas)
             scrollable_frame.bind(
@@ -8265,12 +10152,8 @@ class GaitLimbTab(ttk.Frame):
             canvas.configure(yscrollcommand=sb_inner.set)
 
             win_val = stats_time_var.get()
-            ttk.Label(scrollable_frame,
-                      text=f'Gait & Limb Use Statistical Analysis (0\u2013{win_val} min)',
-                      font=('Arial', 14, 'bold')).pack(pady=10)
-
             sec = 1
-            for metric in all_metrics:
+            for metric in cat_metrics:
                 if s_df is None or metric not in s_df.columns:
                     continue
                 if s_df[metric].dropna().empty:
@@ -8282,7 +10165,7 @@ class GaitLimbTab(ttk.Frame):
                 sec += 1
 
             if b_df is not None and not b_df.empty:
-                for metric in all_metrics:
+                for metric in cat_metrics:
                     if metric not in b_df.columns:
                         continue
                     if b_df[metric].dropna().empty:
@@ -8294,13 +10177,29 @@ class GaitLimbTab(ttk.Frame):
             canvas.pack(side='left', fill='both', expand=True, padx=10, pady=10)
             sb_inner.pack(side='right', fill='y')
 
-            export_frame = ttk.Frame(content_holder)
+            export_frame = ttk.Frame(holder)
             export_frame.pack(side='bottom', fill='x', padx=10, pady=5)
             stats_data = {'summary_df': s_df, 'bins_df': b_df,
-                          'treatments': treatments, 'metrics': all_metrics}
+                          'treatments': treatments, 'metrics': cat_metrics}
             ttk.Button(export_frame, text="\U0001f4ca Export Statistics CSV",
                        command=lambda sd=stats_data: self._export_wb_statistics(sd)
                        ).pack()
+
+        # Create sub-tabs
+        for cat_name, cat_metrics in _stats_categories:
+            # Only add sub-tab if at least one metric has data
+            has_data = any(
+                m in summary_df.columns and summary_df[m].notna().any()
+                for m in cat_metrics
+            )
+            if not has_data:
+                continue
+            cat_frame = ttk.Frame(stats_nb)
+            stats_nb.add(cat_frame, text=cat_name)
+            holder = ttk.Frame(cat_frame)
+            holder.pack(fill='both', expand=True)
+            _cat_holders[cat_name] = (holder, cat_metrics)
+            _build_category_content(holder, cat_metrics, summary_df, bins_df)
 
         def on_recalculate():
             win_min = stats_time_var.get()
@@ -8309,15 +10208,14 @@ class GaitLimbTab(ttk.Frame):
                              if bins_df is not None and not bins_df.empty
                              else bins_df)
             status_lbl.config(text=f"(showing 0\u2013{win_min} min)")
-            build_content(summary_df, filtered_bins)
+            for cat_name, (holder, cat_metrics) in _cat_holders.items():
+                _build_category_content(holder, cat_metrics, summary_df, filtered_bins)
 
         ttk.Button(ctrl_frame, text="\u21ba Recalculate",
                    command=on_recalculate).pack(side='left')
 
-        build_content(summary_df, bins_df)
-
     def _export_wb_statistics(self, stats_data):
-        """Export weight-bearing statistics summary to CSV."""
+        """Export limb use statistics summary to CSV."""
         s_df       = stats_data.get('summary_df')
         treatments = stats_data.get('treatments', [])
         metrics    = stats_data.get('metrics', [])

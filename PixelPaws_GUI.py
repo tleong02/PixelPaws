@@ -144,7 +144,7 @@ try:
     from brightness_features import PixelBrightnessExtractor
     from classifier_training import BehaviorClassifier
     PIXELPAWS_MODULES_AVAILABLE = True
-    print("[OK] PixelPaws modules loaded successfully")
+    pass  # modules loaded
 except ImportError as e:
     PIXELPAWS_MODULES_AVAILABLE = False
     POSE_FEATURE_VERSION = 1  # fallback if module unavailable
@@ -156,7 +156,7 @@ try:
     from active_learning_v2 import (ALSessionV2, LabelingInterface, BoutLabelingInterface,
                                      run_directed_discovery)
     ACTIVE_LEARNING_AVAILABLE = True
-    print("[OK] Active Learning v2 module loaded successfully")
+    pass  # module loaded
 except ImportError as e:
     ACTIVE_LEARNING_AVAILABLE = False
     print(f"Note: Active Learning v2 module not available: {e}")
@@ -2795,38 +2795,194 @@ class PixelPawsGUI:
         
     def create_menu(self):
         """Create application menu bar"""
+        import tkinter.font as tkFont
+
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
-        
-        # File menu
+
+        # ── File menu ──────────────────────────────────────────────
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Load Project\u2026", command=self._show_startup_wizard)
+
+        # Recent Projects submenu — rebuilt each time the menu is opened
+        self._recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Recent Projects", menu=self._recent_menu)
+        file_menu.add_separator()
+        file_menu.add_command(label="Open Project Folder",
+                              command=self._open_project_folder)
+        file_menu.add_command(label="Export Project as ZIP\u2026",
+                              command=self._export_project_zip)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
-        
-        # View menu
+
+        # Populate recent projects dynamically
+        def _refresh_recent():
+            self._recent_menu.delete(0, 'end')
+            try:
+                from project_setup import _load_recent
+                recents = _load_recent()
+            except Exception:
+                recents = []
+            if not recents:
+                self._recent_menu.add_command(label="(none)", state='disabled')
+            else:
+                for path in recents:
+                    self._recent_menu.add_command(
+                        label=path,
+                        command=lambda p=path: self._open_recent_project(p))
+        file_menu.configure(postcommand=_refresh_recent)
+
+        # ── View menu ─────────────────────────────────────────────
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Toggle Dark Mode", command=self.toggle_theme)
-        
-        # Tools menu
+        view_menu.add_separator()
+
+        # Font size controls
+        self._base_font_size = tkFont.nametofont('TkDefaultFont').actual()['size']
+        self._current_font_size = self._base_font_size
+        view_menu.add_command(label="Increase Font Size",
+                              command=lambda: self._change_font_size(1),
+                              accelerator="Ctrl++")
+        view_menu.add_command(label="Decrease Font Size",
+                              command=lambda: self._change_font_size(-1),
+                              accelerator="Ctrl+-")
+        view_menu.add_command(label="Reset Font Size",
+                              command=lambda: self._change_font_size(0))
+
+        # Keyboard accelerators for font size
+        self.root.bind_all('<Control-plus>', lambda e: self._change_font_size(1))
+        self.root.bind_all('<Control-equal>', lambda e: self._change_font_size(1))
+        self.root.bind_all('<Control-minus>', lambda e: self._change_font_size(-1))
+
+        # ── Tools menu ────────────────────────────────────────────
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Data Quality Checker", command=self.open_quality_checker)
-        tools_menu.add_command(label="Auto-Label Assistant", command=self.open_auto_labeler)
-        tools_menu.add_command(label="Video Preview", command=self.open_video_preview)
+        tools_menu.add_command(label="Data Quality Checker",
+                               command=self.open_quality_checker)
+        tools_menu.add_command(label="Auto-Label Assistant",
+                               command=self.open_auto_labeler)
+        tools_menu.add_command(label="Video Preview",
+                               command=self.open_video_preview)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Key File (Group Assignment)…",
+        tools_menu.add_command(label="Skeleton Video Renderer",
+                               command=self.open_skeleton_renderer)
+        tools_menu.add_command(label="Brightness Preview",
+                               command=self.show_brightness_preview)
+        tools_menu.add_command(label="Crop Video for DLC\u2026",
+                               command=self.crop_video_for_dlc)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Key File (Group Assignment)\u2026",
                                command=self._open_key_file_dialog)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Generate Ethogram", command=self.generate_ethogram)
-        
-        # Help menu
+        tools_menu.add_command(label="Generate Ethogram",
+                               command=self.generate_ethogram)
+
+        # ── Help menu ─────────────────────────────────────────────
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_command(label="Documentation", command=self.show_docs)
-        help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
+        help_menu.add_command(label="Keyboard Shortcuts",
+                              command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label="Check for Updates\u2026",
+                              command=self._check_for_updates)
     
+    # ── Menu handler helpers ──────────────────────────────────────────
+
+    def _open_recent_project(self, folder_path):
+        """Load a project from the recent-projects list."""
+        if not os.path.isdir(folder_path):
+            messagebox.showerror("Not Found",
+                                 f"Project folder no longer exists:\n{folder_path}")
+            return
+        self.current_project_folder.set(folder_path)
+        config_path = os.path.join(folder_path, 'PixelPaws_project.json')
+        if os.path.isfile(config_path):
+            self._load_project_config(config_path, silent=True)
+
+    def _open_project_folder(self):
+        """Open the current project folder in the system file manager."""
+        folder = self.current_project_folder.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showinfo("No Project",
+                                "No project folder is currently loaded.")
+            return
+        os.startfile(folder)
+
+    def _export_project_zip(self):
+        """Export the current project folder as a ZIP archive."""
+        import shutil
+        folder = self.current_project_folder.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showinfo("No Project",
+                                "No project folder is currently loaded.")
+            return
+        default_name = os.path.basename(folder)
+        dest = filedialog.asksaveasfilename(
+            title="Export Project as ZIP",
+            defaultextension='.zip',
+            initialfile=default_name,
+            filetypes=[("ZIP archive", "*.zip"), ("All files", "*.*")])
+        if not dest:
+            return
+        # Strip .zip — shutil.make_archive adds it
+        if dest.lower().endswith('.zip'):
+            dest = dest[:-4]
+
+        def _do_zip():
+            try:
+                shutil.make_archive(dest, 'zip', root_dir=os.path.dirname(folder),
+                                    base_dir=os.path.basename(folder))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Export Complete", f"Project exported to:\n{dest}.zip"))
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Export Failed", str(exc)))
+
+        threading.Thread(target=_do_zip, daemon=True).start()
+
+    def _change_font_size(self, delta):
+        """Increase (+1), decrease (-1), or reset (0) the UI font size."""
+        import tkinter.font as tkFont
+        if delta == 0:
+            self._current_font_size = self._base_font_size
+        else:
+            self._current_font_size = max(6, self._current_font_size + delta)
+        for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont',
+                     'TkHeadingFont', 'TkCaptionFont', 'TkSmallCaptionFont',
+                     'TkIconFont', 'TkTooltipFont', 'TkFixedFont'):
+            try:
+                tkFont.nametofont(name).configure(size=self._current_font_size)
+            except Exception:
+                pass
+
+    def _check_for_updates(self):
+        """Check GitHub releases for a newer version of PixelPaws."""
+        import urllib.request, json as _json
+        _CURRENT = "1.0.0"
+        _REPO = "https://api.github.com/repos/rslivicki/PixelPaws/releases/latest"
+        try:
+            req = urllib.request.Request(_REPO,
+                                        headers={'User-Agent': 'PixelPaws'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read().decode())
+            tag = data.get('tag_name', '').lstrip('vV')
+            if tag and tag != _CURRENT:
+                messagebox.showinfo("Update Available",
+                                    f"A new version is available: v{tag}\n"
+                                    f"You are running v{_CURRENT}\n\n"
+                                    f"Visit the GitHub releases page to download.")
+            else:
+                messagebox.showinfo("Up to Date",
+                                    f"You are running the latest version (v{_CURRENT}).")
+        except Exception:
+            messagebox.showinfo("Check for Updates",
+                                "Could not reach GitHub.\n"
+                                "Check your internet connection and try again.")
+
     def create_training_tab(self):
         """Create the classifier training tab with all options"""
         train_frame = ttk.Frame(self.notebook)
@@ -9321,57 +9477,14 @@ Median: {feature_data.median():.6f}
         self.root.update_idletasks()
     
     def show_about(self):
-        """Show about dialog"""
-        about_text = """
-PixelPaws - Behavioral Analysis & Recognition
-
-Enhanced features:
-✓ Video Preview with Predictions
-✓ Real-Time Training Visualization
-✓ Auto-Label Suggestion Mode
-✓ Behavior Ethogram Generator
-✓ Data Quality Checker
-✓ Dark Mode
-
-Version: 2.0 Enhanced
-"""
-        messagebox.showinfo("About PixelPaws", about_text)
+        """Open the PixelPaws GitHub page."""
+        import webbrowser
+        webbrowser.open("https://github.com/rslivicki/PixelPaws")
     
     def show_docs(self):
-        """Show documentation"""
-        docs_text = """
-PixelPaws Documentation
-
-ENHANCED FEATURES:
-
-1. VIDEO PREVIEW
-   - View videos with prediction overlays
-   - Jump to behavior bouts
-   - Frame-by-frame navigation
-
-2. AUTO-LABEL ASSISTANT
-   - AI suggests uncertain frames
-   - Quick correction interface
-   - Export improved labels
-
-3. DATA QUALITY CHECKER
-   - Pre-training validation
-   - Identifies issues early
-   - Comprehensive reports
-
-4. ETHOGRAM GENERATOR
-   - Time budget analysis
-   - Bout statistics
-   - Publication-ready plots
-
-5. REAL-TIME TRAINING VIZ
-   - Live F1 score tracking
-   - Timing analysis
-   - Early stopping guidance
-
-For detailed documentation, see the README files.
-"""
-        messagebox.showinfo("Documentation", docs_text)
+        """Open the PixelPaws documentation on GitHub."""
+        import webbrowser
+        webbrowser.open("https://github.com/rslivicki/PixelPaws#readme")
     
     def show_shortcuts(self):
         """Show keyboard shortcuts"""
