@@ -14,6 +14,36 @@ import seaborn as sns
 from datetime import datetime
 
 
+def _bind_tight_layout_on_resize(canvas, fig, rect=None):
+    """Debounced redraw on widget resize so constrained_layout recomputes."""
+    _timer = [None]
+    widget = canvas.get_tk_widget()
+    def _sync_size_and_draw():
+        try:
+            w, h = widget.winfo_width(), widget.winfo_height()
+            if w > 1 and h > 1:
+                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
+            canvas.draw_idle()
+        except Exception:
+            pass
+    def _on_configure(event):
+        if _timer[0] is not None:
+            widget.after_cancel(_timer[0])
+        _timer[0] = widget.after(150, _sync_size_and_draw)
+    widget.bind('<Configure>', _on_configure, add='+')
+    widget.after(300, _sync_size_and_draw)
+
+
+def _draw_canvas_fit(canvas, fig):
+    """Force geometry computation, resize figure to widget, and draw."""
+    widget = canvas.get_tk_widget()
+    widget.update_idletasks()
+    w, h = widget.winfo_width(), widget.winfo_height()
+    if w > 1 and h > 1:
+        fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
+    canvas.draw()
+
+
 class AnalysisTab(ttk.Frame):
     """
     Analysis tab for batch processing results
@@ -47,7 +77,7 @@ class AnalysisTab(ttk.Frame):
     def setup_ui(self):
         """Setup the Analysis tab UI"""
         # Main container with scrollbar
-        canvas = tk.Canvas(self, bg='white')
+        canvas = tk.Canvas(self)
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
@@ -193,18 +223,32 @@ class AnalysisTab(ttk.Frame):
         # Time binning
         bin_frame = ttk.Frame(frame)
         bin_frame.pack(fill='x', pady=5)
-        
+
         ttk.Label(bin_frame, text="Time Bin Size:", width=15).pack(side='left')
-        self.bin_size_var = tk.IntVar(value=5)
-        ttk.Spinbox(
+        self.bin_size_var = tk.DoubleVar(value=5)
+        self.bin_size_spinbox = ttk.Spinbox(
             bin_frame,
             from_=1,
-            to=60,
+            to=3600,
             textvariable=self.bin_size_var,
             width=10
-        ).pack(side='left', padx=5)
-        ttk.Label(bin_frame, text="minutes").pack(side='left')
-        
+        )
+        self.bin_size_spinbox.pack(side='left', padx=5)
+        self.bin_unit_var = tk.StringVar(value='minutes')
+        ttk.Combobox(bin_frame, textvariable=self.bin_unit_var,
+                     values=['seconds', 'minutes'], state='readonly',
+                     width=8).pack(side='left', padx=(2, 0))
+
+        # "Entire session" checkbox
+        self.no_time_bins_var = tk.BooleanVar(value=False)
+        self.no_bins_check = ttk.Checkbutton(
+            bin_frame,
+            text="Entire session (no bins)",
+            variable=self.no_time_bins_var,
+            command=self._toggle_bin_size_spinbox
+        )
+        self.no_bins_check.pack(side='left', padx=(15, 0))
+
         ttk.Label(
             frame,
             text="Video will be divided into bins of this duration",
@@ -339,7 +383,7 @@ class AnalysisTab(ttk.Frame):
         
         # Formalin Phase Analysis
         ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=15)
-        ttk.Label(frame, text="🧪 Formalin Phase Analysis (Optional):", font=('Arial', 10, 'bold')).pack(anchor='w', pady=(5, 5))
+        ttk.Label(frame, text="🧪 Phase Analysis (Optional):", font=('Arial', 10, 'bold')).pack(anchor='w', pady=(5, 5))
         
         self.enable_phase_analysis = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -396,7 +440,14 @@ class AnalysisTab(ttk.Frame):
             self.phase_settings_frame.pack(fill='x', pady=10)
         else:
             self.phase_settings_frame.pack_forget()
-    
+
+    def _toggle_bin_size_spinbox(self):
+        """Enable/disable bin size spinbox based on 'Entire session' checkbox."""
+        if self.no_time_bins_var.get():
+            self.bin_size_spinbox.config(state='disabled')
+        else:
+            self.bin_size_spinbox.config(state='normal')
+
     def create_analysis_section(self, parent):
         """Create analysis section"""
         frame = ttk.LabelFrame(parent, text="📊 Analysis", padding=15)
@@ -582,6 +633,7 @@ class AnalysisTab(ttk.Frame):
             pf = self.main_gui.current_project_folder.get()
             if pf and os.path.isdir(pf):
                 self.analysis_project_var.set(pf)
+                self.scan_project_folder(pf)
         except Exception:
             pass
 
@@ -840,7 +892,7 @@ class AnalysisTab(ttk.Frame):
                             and ('Results' in item or 'PixelPaws_Results' in item)]
             
             # Check if this IS a Results folder (new single-folder format)
-            is_results_folder = os.path.basename(folder) in ['Results', 'PixelPaws_Results']
+            is_results_folder = os.path.basename(folder).lower() in ['results', 'pixelpaws_results']
             
             if result_folders:
                 # OLD FORMAT: Each subject has a results folder
@@ -875,32 +927,35 @@ class AnalysisTab(ttk.Frame):
             
             elif is_results_folder or not result_folders:
                 # NEW FORMAT: All files in single Results folder OR direct CSV files
+                # Recurse into subdirectories (e.g. results/<behavior>/)
                 self.al_log_message(f"Scanning for prediction files in {os.path.basename(folder)}")
-                
-                for file in os.listdir(folder):
-                    # Skip non-CSV files and summary files
-                    if not file.endswith('.csv'):
-                        continue
-                    if any(skip in file for skip in ['Summary', 'Treatment', 'Analysis']):
-                        continue
-                    
-                    # Only process prediction files
-                    if 'prediction' in file.lower():
-                        full_path = os.path.join(folder, file)
-                        behavior_name = self.extract_behavior_name(file, None)
-                        
-                        file_info = {
-                            'path': full_path,
-                            'folder': None,  # No individual subject folders
-                            'filename': file,
-                            'behavior': behavior_name
-                        }
-                        
-                        prediction_files.append(file_info)
-                        
-                        if behavior_name not in behaviors:
-                            behaviors[behavior_name] = []
-                        behaviors[behavior_name].append(file_info)
+
+                for dirpath, _dirnames, filenames in os.walk(folder):
+                    for file in filenames:
+                        # Skip non-CSV files and summary files
+                        if not file.endswith('.csv'):
+                            continue
+                        if any(skip in file for skip in ['Summary', 'Treatment', 'Analysis']):
+                            continue
+
+                        # Process prediction files only (skip bout analysis outputs)
+                        fl = file.lower()
+                        if 'prediction' in fl:
+                            full_path = os.path.join(dirpath, file)
+                            behavior_name = self.extract_behavior_name(file, None)
+
+                            file_info = {
+                                'path': full_path,
+                                'folder': os.path.basename(dirpath) if dirpath != folder else None,
+                                'filename': file,
+                                'behavior': behavior_name
+                            }
+
+                            prediction_files.append(file_info)
+
+                            if behavior_name not in behaviors:
+                                behaviors[behavior_name] = []
+                            behaviors[behavior_name].append(file_info)
             
             self.prediction_files = prediction_files
             self.available_behaviors = behaviors
@@ -1074,8 +1129,11 @@ class AnalysisTab(ttk.Frame):
             self.update_idletasks()
             
             # Get settings (with validation)
+            whole_session = self.no_time_bins_var.get()
             bin_size_min = self.bin_size_var.get()
-            if bin_size_min <= 0:
+            if self.bin_unit_var.get() == 'seconds':
+                bin_size_min = bin_size_min / 60.0
+            if not whole_session and bin_size_min <= 0:
                 messagebox.showwarning("Invalid Bin Size",
                                        "Bin size must be a positive number.")
                 self.run_btn.config(state='normal')
@@ -1089,7 +1147,10 @@ class AnalysisTab(ttk.Frame):
             
             # Filter prediction files to only selected behaviors
             filtered_files = [f for f in self.prediction_files if f['behavior'] in selected_behaviors]
-            
+
+            # Initialize per-frame data storage for timecourse graph
+            self.perframe_data = {}  # {(subject, treatment, behavior): sec_predictions_array}
+
             # Process based on analysis mode
             all_results = []
             
@@ -1103,7 +1164,7 @@ class AnalysisTab(ttk.Frame):
                     
                     results = []
                     for i, pred_file_info in enumerate(behavior_files, 1):
-                        result = self.analyze_single_file(pred_file_info, bin_size_min, fps, behavior)
+                        result = self.analyze_single_file(pred_file_info, bin_size_min, fps, behavior, whole_session=whole_session)
                         if result is not None:
                             results.extend(result)
                     
@@ -1115,7 +1176,7 @@ class AnalysisTab(ttk.Frame):
                 self.update_idletasks()
                 
                 combined_results = self.analyze_combined_behaviors(
-                    filtered_files, selected_behaviors, bin_size_min, fps
+                    filtered_files, selected_behaviors, bin_size_min, fps, whole_session=whole_session
                 )
                 all_results.extend(combined_results)
             
@@ -1162,7 +1223,7 @@ class AnalysisTab(ttk.Frame):
         finally:
             self.run_btn.config(state='normal')
     
-    def analyze_single_file(self, pred_file_info, bin_size_min, fps, behavior_name=None):
+    def analyze_single_file(self, pred_file_info, bin_size_min, fps, behavior_name=None, whole_session=False):
         """Analyze a single prediction file"""
         try:
             # Extract info
@@ -1215,49 +1276,77 @@ class AnalysisTab(ttk.Frame):
                 # Convert to binary if needed
                 predictions = (predictions > 0.5).astype(int)
             
+            # Store per-frame predictions downsampled to 1-second resolution
+            if hasattr(self, 'perframe_data'):
+                fps_int = max(1, int(fps))
+                sec_predictions = np.array([
+                    int(np.any(predictions[i:i+fps_int]))
+                    for i in range(0, len(predictions), fps_int)
+                ])
+                self.perframe_data[(subject, treatment, behavior_name)] = sec_predictions
+
             # Calculate time bins
             total_frames = len(predictions)
             total_seconds = total_frames / fps
             total_minutes = total_seconds / 60
-            
+
             print(f"  Video: {total_frames} frames @ {fps} fps = {total_minutes:.1f} minutes")
-            
-            bin_size_sec = bin_size_min * 60
-            bin_size_frames = int(bin_size_sec * fps)
-            
-            n_bins = int(np.ceil(total_frames / bin_size_frames))
-            
+
+            if whole_session:
+                bin_size_frames = total_frames
+                n_bins = 1
+            else:
+                bin_size_sec = bin_size_min * 60
+                bin_size_frames = int(bin_size_sec * fps)
+                n_bins = int(np.ceil(total_frames / bin_size_frames))
+
             # Analyze each bin
             results = []
-            
+
             for bin_idx in range(n_bins):
                 start_frame = bin_idx * bin_size_frames
                 end_frame = min(start_frame + bin_size_frames, total_frames)
-                
+
                 bin_preds = predictions[start_frame:end_frame]
-                
+
                 # Calculate actual bin duration (might be shorter for last bin)
                 actual_bin_duration_sec = len(bin_preds) / fps
-                
+
                 # Calculate metrics
                 metrics = self.calculate_metrics(bin_preds, fps, actual_bin_duration_sec, bin_idx)
-                
+
+                # Compute absolute latency from video start
+                if metrics.get('Latency_In_Bin_s') is not None:
+                    metrics['Latency_s'] = (start_frame / fps) + metrics['Latency_In_Bin_s']
+                else:
+                    metrics['Latency_s'] = None
+
                 # Debug logging for first bin
                 if bin_idx == 0:
-                    print(f"  First bin ({bin_idx * bin_size_min}-{(bin_idx + 1) * bin_size_min} min):")
+                    _bs = round(bin_idx * bin_size_min, 4)
+                    _be = round((bin_idx + 1) * bin_size_min, 4)
+                    print(f"  First bin ({_bs}-{_be} min):")
                     print(f"    Frames: {start_frame}-{end_frame}")
                     print(f"    Predictions sum: {np.sum(bin_preds == 1)}/{len(bin_preds)}")
                     print(f"    N_Bouts detected: {metrics.get('N_Bouts', 0)}")
-                
+
                 # Add metadata
                 metrics['Subject'] = subject
                 metrics['Treatment'] = treatment
                 metrics['Behavior'] = behavior_name
-                metrics['Bin'] = f"{bin_idx * bin_size_min}-{(bin_idx + 1) * bin_size_min}"
-                metrics['Bin_Index'] = bin_idx
-                metrics['Bin_Start_Min'] = bin_idx * bin_size_min
-                metrics['Bin_End_Min'] = (bin_idx + 1) * bin_size_min
-                
+                if whole_session:
+                    metrics['Bin'] = 'Whole'
+                    metrics['Bin_Index'] = 0
+                    metrics['Bin_Start_Min'] = 0
+                    metrics['Bin_End_Min'] = round(total_minutes, 1)
+                else:
+                    _bin_start = round(bin_idx * bin_size_min, 4)
+                    _bin_end = round((bin_idx + 1) * bin_size_min, 4)
+                    metrics['Bin'] = f"{_bin_start}-{_bin_end}"
+                    metrics['Bin_Index'] = bin_idx
+                    metrics['Bin_Start_Min'] = _bin_start
+                    metrics['Bin_End_Min'] = _bin_end
+
                 results.append(metrics)
             
             # Add phase-specific analysis if enabled
@@ -1343,7 +1432,7 @@ class AnalysisTab(ttk.Frame):
         """Extract subject name from filename — delegates to resolve_subject."""
         return self.resolve_subject(filename)
     
-    def analyze_combined_behaviors(self, filtered_files, selected_behaviors, bin_size_min, fps):
+    def analyze_combined_behaviors(self, filtered_files, selected_behaviors, bin_size_min, fps, whole_session=False):
         """Analyze combined behaviors (sum predictions across all behaviors)"""
         try:
             # Group files by subject
@@ -1398,28 +1487,49 @@ class AnalysisTab(ttk.Frame):
                 
                 # Calculate time bins
                 total_frames = len(combined_predictions)
-                bin_size_sec = bin_size_min * 60
-                bin_size_frames = int(bin_size_sec * fps)
-                n_bins = int(np.ceil(total_frames / bin_size_frames))
-                
+                total_seconds = total_frames / fps
+                total_minutes = total_seconds / 60
+
+                if whole_session:
+                    bin_size_frames = total_frames
+                    n_bins = 1
+                else:
+                    bin_size_sec = bin_size_min * 60
+                    bin_size_frames = int(bin_size_sec * fps)
+                    n_bins = int(np.ceil(total_frames / bin_size_frames))
+
                 # Analyze each bin
                 for bin_idx in range(n_bins):
                     start_frame = bin_idx * bin_size_frames
                     end_frame = min(start_frame + bin_size_frames, total_frames)
-                    
+
                     bin_preds = combined_predictions[start_frame:end_frame]
                     actual_bin_duration_sec = len(bin_preds) / fps
-                    
+
                     metrics = self.calculate_metrics(bin_preds, fps, actual_bin_duration_sec, bin_idx)
-                    
+
+                    # Compute absolute latency from video start
+                    if metrics.get('Latency_In_Bin_s') is not None:
+                        metrics['Latency_s'] = (start_frame / fps) + metrics['Latency_In_Bin_s']
+                    else:
+                        metrics['Latency_s'] = None
+
                     # Add metadata
                     metrics['Subject'] = subject
                     metrics['Treatment'] = treatment
                     metrics['Behavior'] = 'Combined_' + '+'.join(sorted(selected_behaviors))
-                    metrics['Bin'] = f"{bin_idx * bin_size_min}-{(bin_idx + 1) * bin_size_min}"
-                    metrics['Bin_Index'] = bin_idx
-                    metrics['Bin_Start_Min'] = bin_idx * bin_size_min
-                    metrics['Bin_End_Min'] = (bin_idx + 1) * bin_size_min
+                    if whole_session:
+                        metrics['Bin'] = 'Whole'
+                        metrics['Bin_Index'] = 0
+                        metrics['Bin_Start_Min'] = 0
+                        metrics['Bin_End_Min'] = round(total_minutes, 1)
+                    else:
+                        _bin_start = round(bin_idx * bin_size_min, 4)
+                        _bin_end = round((bin_idx + 1) * bin_size_min, 4)
+                        metrics['Bin'] = f"{_bin_start}-{_bin_end}"
+                        metrics['Bin_Index'] = bin_idx
+                        metrics['Bin_Start_Min'] = _bin_start
+                        metrics['Bin_End_Min'] = _bin_end
                     
                     results.append(metrics)
             
@@ -1463,6 +1573,13 @@ class AnalysisTab(ttk.Frame):
             if self.metric_frequency.get():
                 metrics['Bout_Frequency_per_min'] = (len(bouts) / bin_duration_sec) * 60
         
+        # Latency to first positive frame within this bin
+        if np.any(predictions == 1):
+            first_pos = np.argmax(predictions == 1)
+            metrics['Latency_In_Bin_s'] = first_pos / fps
+        else:
+            metrics['Latency_In_Bin_s'] = None
+
         # Percentage of time
         if self.metric_percent.get():
             metrics['Percent_Time'] = (np.sum(predictions == 1) / len(predictions)) * 100
@@ -1553,7 +1670,12 @@ class AnalysisTab(ttk.Frame):
             # Ask user which behaviors to graph
             behavior_dialog = tk.Toplevel(self)
             behavior_dialog.title("Select Behaviors to Graph")
-            behavior_dialog.geometry("450x400")
+            _sw = behavior_dialog.winfo_screenwidth()
+            _sh = behavior_dialog.winfo_screenheight()
+            _dw = min(500, int(_sw * 0.35))
+            _dh = min(450, int(_sh * 0.45))
+            behavior_dialog.geometry(f"{_dw}x{_dh}+{(_sw-_dw)//2}+{(_sh-_dh)//2}")
+            behavior_dialog.resizable(True, True)
             behavior_dialog.grab_set()
             
             ttk.Label(
@@ -1652,43 +1774,84 @@ class AnalysisTab(ttk.Frame):
         # Ask user for treatment order, colors, AND time window (ONE TIME for all behaviors)
         order_dialog = tk.Toplevel(self)
         order_dialog.title(f"Graph Settings - {len(selected_behaviors)} Behavior(s)")
-        order_dialog.geometry("550x900")
+        # Screen-proportional sizing
+        _sw = order_dialog.winfo_screenwidth()
+        _sh = order_dialog.winfo_screenheight()
+        _dw = min(720, int(_sw * 0.50))
+        _dh = int(_sh * 0.68)
+        order_dialog.geometry(f"{_dw}x{_dh}+{(_sw-_dw)//2}+{(_sh-_dh)//2}")
+        order_dialog.resizable(True, True)
         order_dialog.grab_set()
-        
+
         behavior_list = ", ".join(selected_behaviors) if len(selected_behaviors) <= 3 else f"{len(selected_behaviors)} behaviors"
         ttk.Label(
-            order_dialog, 
-            text=f"Graph Settings: {behavior_list}", 
+            order_dialog,
+            text=f"Graph Settings: {behavior_list}",
             font=('Arial', 14, 'bold')
         ).pack(pady=10)
-        
+
+        # ── Button bar (pack at bottom FIRST so scroll area fills remainder) ──
+        _btn_frame = ttk.Frame(order_dialog)
+        _btn_frame.pack(side='bottom', pady=15)
+
+        # ── Scrollable body ──────────────────────────────────────────────
+        _scroll_outer = ttk.Frame(order_dialog)
+        _scroll_outer.pack(fill='both', expand=True)
+        _scroll_canvas = tk.Canvas(_scroll_outer, highlightthickness=0)
+        _scroll_sb = ttk.Scrollbar(_scroll_outer, orient='vertical', command=_scroll_canvas.yview)
+        _scroll_body = ttk.Frame(_scroll_canvas)
+
+        _scroll_body.bind(
+            '<Configure>',
+            lambda e: _scroll_canvas.configure(scrollregion=_scroll_canvas.bbox('all')))
+        _scroll_win = _scroll_canvas.create_window((0, 0), window=_scroll_body, anchor='nw')
+        _scroll_canvas.configure(yscrollcommand=_scroll_sb.set)
+        _scroll_canvas.bind('<Configure>',
+            lambda e: _scroll_canvas.itemconfigure(_scroll_win, width=e.width))
+
+        _scroll_canvas.pack(side='left', fill='both', expand=True)
+        _scroll_sb.pack(side='right', fill='y')
+
+        def _on_mousewheel(event):
+            _scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        _scroll_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+        def _cleanup_mousewheel():
+            try:
+                _scroll_canvas.unbind_all('<MouseWheel>')
+            except Exception:
+                pass
+        order_dialog.bind('<Destroy>', lambda e: _cleanup_mousewheel() if e.widget is order_dialog else None)
+
         # Time window section
-        ttk.Label(order_dialog, text="1. Time Window", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
-        time_frame = ttk.Frame(order_dialog)
+        ttk.Label(_scroll_body, text="1. Time Window", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
+        time_frame = ttk.Frame(_scroll_body)
         time_frame.pack(fill='x', padx=20, pady=5)
         ttk.Label(time_frame, text="Show data up to:").pack(side='left')
-        time_var = tk.IntVar(value=int(max_time))
-        ttk.Spinbox(time_frame, from_=5, to=int(max_time), textvariable=time_var, width=10).pack(side='left', padx=5)
-        ttk.Label(time_frame, text=f"minutes (max: {int(max_time)} min)").pack(side='left')
+        _max_t_display = round(max_time, 2) if max_time != int(max_time) else int(max_time)
+        time_var = tk.DoubleVar(value=round(max_time, 2))
+        ttk.Spinbox(time_frame, from_=0.1, to=round(max_time, 2), increment=0.1,
+                     textvariable=time_var, width=10).pack(side='left', padx=5)
+        ttk.Label(time_frame, text=f"minutes (max: {_max_t_display} min)").pack(side='left')
         
         # Error bar type section
-        ttk.Label(order_dialog, text="2. Error Bar Type", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
-        error_frame = ttk.Frame(order_dialog)
+        ttk.Label(_scroll_body, text="2. Error Bar Type", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
+        error_frame = ttk.Frame(_scroll_body)
         error_frame.pack(fill='x', padx=20, pady=5)
         ttk.Label(error_frame, text="Display:").pack(side='left')
         error_var = tk.StringVar(value='SEM')
         ttk.Radiobutton(error_frame, text="SEM (Standard Error)", variable=error_var, value='SEM').pack(side='left', padx=5)
         ttk.Radiobutton(error_frame, text="SD (Standard Deviation)", variable=error_var, value='SD').pack(side='left', padx=5)
         ttk.Label(
-            order_dialog,
+            _scroll_body,
             text="SEM = SD / √n  (shows precision of the mean)",
             font=('Arial', 9),
             foreground='gray'
         ).pack(anchor='w', padx=20, pady=2)
-        
+
         # Heatmap color palette section
-        ttk.Label(order_dialog, text="3. Heatmap Color Palette", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
-        palette_frame = ttk.Frame(order_dialog)
+        ttk.Label(_scroll_body, text="3. Heatmap Color Palette", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
+        palette_frame = ttk.Frame(_scroll_body)
         palette_frame.pack(fill='x', padx=20, pady=5)
         ttk.Label(palette_frame, text="Palette:").pack(side='left')
         palette_var = tk.StringVar(value='YlOrRd')
@@ -1698,9 +1861,9 @@ class AnalysisTab(ttk.Frame):
         ttk.Label(palette_frame, text="(for heatmap only)", font=('Arial', 9), foreground='gray').pack(side='left')
         
         # Groups to include section
-        ttk.Label(order_dialog, text="4. Groups to Include",
+        ttk.Label(_scroll_body, text="4. Groups to Include",
                   font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10, 5))
-        include_frame = ttk.Frame(order_dialog)
+        include_frame = ttk.Frame(_scroll_body)
         include_frame.pack(fill='x', padx=20, pady=5)
 
         include_vars = {}
@@ -1711,11 +1874,11 @@ class AnalysisTab(ttk.Frame):
                 row=i // 3, column=i % 3, sticky='w', padx=(0, 20))
 
         # Treatment order section
-        ttk.Label(order_dialog, text="5. Treatment Order", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
-        ttk.Label(order_dialog, text="(Left to right, or top to bottom)", font=('Arial', 9), foreground='gray').pack(anchor='w', padx=20)
-        
+        ttk.Label(_scroll_body, text="5. Treatment Order", font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10,5))
+        ttk.Label(_scroll_body, text="(Left to right, or top to bottom)", font=('Arial', 9), foreground='gray').pack(anchor='w', padx=20)
+
         # Create listbox with treatments
-        listbox_frame = ttk.Frame(order_dialog)
+        listbox_frame = ttk.Frame(_scroll_body)
         listbox_frame.pack(fill='both', expand=True, padx=20, pady=10)
         
         listbox = tk.Listbox(listbox_frame, font=('Arial', 11), height=len(treatments))
@@ -1729,7 +1892,7 @@ class AnalysisTab(ttk.Frame):
             listbox.insert('end', treatment)
         
         # ── Section 6: Colors ────────────────────────────────────────────────
-        ttk.Label(order_dialog, text="6. Colors (for graphs, not heatmap)",
+        ttk.Label(_scroll_body, text="6. Colors (for graphs, not heatmap)",
                   font=('Arial', 12, 'bold')).pack(anchor='w', padx=20, pady=(10, 5))
 
         color_options = {
@@ -1762,7 +1925,7 @@ class AnalysisTab(ttk.Frame):
         non_veh_color_keys = [k for k in color_options if k != 'White (black outline)']
 
         # Color mode toggle
-        mode_row = ttk.Frame(order_dialog)
+        mode_row = ttk.Frame(_scroll_body)
         mode_row.pack(fill='x', padx=20, pady=(0, 5))
         ttk.Label(mode_row, text="Color mode:", width=15).pack(side='left')
         color_mode_var = tk.StringVar(value='individual')
@@ -1772,7 +1935,7 @@ class AnalysisTab(ttk.Frame):
                         variable=color_mode_var, value='gradient').pack(side='left', padx=10)
 
         # Container that holds whichever sub-frame is active
-        color_container = ttk.Frame(order_dialog)
+        color_container = ttk.Frame(_scroll_body)
         color_container.pack(fill='x', padx=20, pady=5)
 
         # ── Individual pickers ────────────────────────────────────────────
@@ -1962,7 +2125,7 @@ class AnalysisTab(ttk.Frame):
         color_mode_var.trace_add('write', _toggle_color_mode)
         
         # Instructions
-        inst_frame = ttk.Frame(order_dialog)
+        inst_frame = ttk.Frame(_scroll_body)
         inst_frame.pack(fill='x', padx=20, pady=10)
         ttk.Label(inst_frame, text="💡 Tip: Click and drag items in the list to reorder", 
                  font=('Arial', 9), foreground='blue').pack(anchor='w')
@@ -2042,10 +2205,8 @@ class AnalysisTab(ttk.Frame):
             result['cancelled'] = True
             order_dialog.destroy()
         
-        btn_frame = ttk.Frame(order_dialog)
-        btn_frame.pack(pady=15)
-        ttk.Button(btn_frame, text="✓ Generate Graphs", command=on_ok, width=20).pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="✗ Cancel", command=on_cancel, width=15).pack(side='left', padx=5)
+        ttk.Button(_btn_frame, text="✓ Generate Graphs", command=on_ok, width=20).pack(side='left', padx=5)
+        ttk.Button(_btn_frame, text="✗ Cancel", command=on_cancel, width=15).pack(side='left', padx=5)
         
         order_dialog.wait_window()
         
@@ -2069,7 +2230,9 @@ class AnalysisTab(ttk.Frame):
         graph_window = tk.Toplevel(self)
         behaviors_text = " + ".join(selected_behaviors) if len(selected_behaviors) <= 3 else f"{len(selected_behaviors)} Behaviors"
         graph_window.title(f"Analysis Graphs - {behaviors_text}")
-        graph_window.geometry("1200x800")
+        sw, sh = graph_window.winfo_screenwidth(), graph_window.winfo_screenheight()
+        gw, gh = int(sw * 0.92), int(sh * 0.92)
+        graph_window.geometry(f"{gw}x{gh}+{(sw-gw)//2}+{(sh-gh)//2}")
         
         # Create main notebook for behaviors
         main_notebook = ttk.Notebook(graph_window)
@@ -2131,6 +2294,10 @@ class AnalysisTab(ttk.Frame):
             f = self.create_cumulative_bouts_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_bouts_graph(None, b, _frame=_f)))
 
+            if hasattr(self, 'perframe_data') and self.perframe_data:
+                f = self.create_mean_time_area_graph(graph_notebook, behavior)
+                graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_mean_time_area_graph(None, b, _frame=_f)))
+
             f = self.create_latency_graph(graph_notebook, behavior)
             graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_latency_graph(None, b, _frame=_f)))
 
@@ -2153,7 +2320,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
         
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         
         # Use filtered data
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -2484,19 +2651,19 @@ class AnalysisTab(ttk.Frame):
             # Set x-axis limit if time window specified
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
-        
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
-        # Add button frame
+
+        # Pack buttons first so they're always visible at the bottom
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
-        
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                   command=lambda: self.export_timecourse_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_cumulative_graph(self, notebook, behavior_name="", _frame=None):
@@ -2509,7 +2676,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'Total_Time_s' in df.columns:
@@ -2552,16 +2719,17 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
 
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                    command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                    command=lambda: self.export_cumulative_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_cumulative_bouts_graph(self, notebook, behavior_name="", _frame=None):
@@ -2574,7 +2742,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'N_Bouts' in df.columns:
@@ -2616,17 +2784,196 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
 
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                    command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                    command=lambda: self.export_cumulative_bouts_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
+
+    def create_mean_time_area_graph(self, notebook, behavior_name="", _frame=None, bin_sec_override=None):
+        """Create mean timecourse filled-area plot from per-frame data, binned on the fly"""
+        if _frame is None:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text="Mean Timecourse")
+        else:
+            frame = _frame
+            for w in frame.winfo_children():
+                w.destroy()
+
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+        # Gather per-frame (1-second) arrays for this behavior
+        treatment_arrays = {}  # {treatment: [(subject, array), ...]}
+        if hasattr(self, 'perframe_data'):
+            for (subject, treatment, behav), arr in self.perframe_data.items():
+                if behav != behavior_name:
+                    continue
+                treatment_arrays.setdefault(treatment, []).append((subject, arr))
+
+        if not treatment_arrays:
+            ax.text(0.5, 0.5, 'No per-frame data available',
+                    transform=ax.transAxes, ha='center', va='center', fontsize=14)
+            bin_sec = 5
+        else:
+            treatments = self.treatment_order if hasattr(self, 'treatment_order') else list(treatment_arrays.keys())
+            colors = self.treatment_colors if hasattr(self, 'treatment_colors') else {}
+
+            # Truncate all arrays to the shortest length
+            min_len = min(
+                len(arr) for arrays in treatment_arrays.values() for _, arr in arrays
+            )
+
+            # Default bin size: use analysis bin size, or 5s
+            if bin_sec_override is not None:
+                bin_sec = bin_sec_override
+            elif hasattr(self, 'bin_size_var') and hasattr(self, 'bin_unit_var'):
+                val = self.bin_size_var.get()
+                bin_sec = int(val) if self.bin_unit_var.get() == 'seconds' else int(val * 60)
+            else:
+                bin_sec = 5
+            bin_sec = max(1, bin_sec)
+
+            n_bins = int(np.ceil(min_len / bin_sec))
+
+            for treatment in treatments:
+                if treatment not in treatment_arrays:
+                    continue
+                arrays = treatment_arrays[treatment]
+                mat = np.array([arr[:min_len] for _, arr in arrays], dtype=float)
+                n_subjects = mat.shape[0]
+
+                # Bin: sum each bin_sec window to get seconds of behavior per bin
+                bin_means = []
+                bin_times = []
+                for i in range(n_bins):
+                    start = i * bin_sec
+                    end = min(start + bin_sec, min_len)
+                    # Mean across subjects of the sum within this bin
+                    bin_val = np.mean(np.sum(mat[:, start:end], axis=1))
+                    bin_means.append(bin_val)
+                    bin_times.append(start)
+
+                bin_times = np.array(bin_times, dtype=float)
+                bin_means = np.array(bin_means)
+
+                # Convert x-axis to appropriate unit
+                if bin_sec >= 60:
+                    x_vals = bin_times / 60.0
+                else:
+                    x_vals = bin_times
+
+                color = colors.get(treatment, None)
+                plot_color = 'black' if color == 'white_black' else color
+
+                # Shift to bin centers so peaks sit at the middle of each bin
+                half_bin = (bin_sec / 60.0 / 2.0) if bin_sec >= 60 else (bin_sec / 2.0)
+                x_centers = x_vals + half_bin
+
+                ax.fill_between(x_centers, 0, bin_means,
+                                alpha=0.3, color=plot_color,
+                                label=f'{treatment} (n={n_subjects})')
+                ax.plot(x_centers, bin_means, color=plot_color, linewidth=1.5)
+
+            if bin_sec >= 60:
+                ax.set_xlabel('Time (minutes)', fontsize=12)
+                time_unit_label = f'{bin_sec // 60}min'
+            else:
+                ax.set_xlabel('Time (seconds)', fontsize=12)
+                time_unit_label = f'{bin_sec}s'
+
+            ax.set_ylabel(f'Mean time in behavior (s / {time_unit_label} bin)', fontsize=12)
+            title = f'{behavior_name} - Mean Timecourse' if behavior_name else 'Mean Timecourse'
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+
+            if hasattr(self, 'time_window') and bin_sec >= 60:
+                ax.set_xlim(-0.5, self.time_window + 0.5)
+
+        # Controls at bottom
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(side='bottom', pady=5)
+
+        bin_var = tk.IntVar(value=bin_sec)
+        ttk.Label(button_frame, text="Bin size (s):").pack(side='left', padx=(5, 2))
+        ttk.Spinbox(button_frame, from_=1, to=600, textvariable=bin_var, width=5).pack(side='left', padx=(0, 5))
+        ttk.Button(button_frame, text="\u21ba Redraw",
+                   command=lambda: self.create_mean_time_area_graph(
+                       notebook, behavior_name, _frame=frame, bin_sec_override=bin_var.get()
+                   )).pack(side='left', padx=5)
+
+        ttk.Button(button_frame, text="\U0001f4be Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="\U0001f4ca Export Data",
+                   command=lambda: self.export_mean_time_area_data(behavior_name, bin_sec=bin_var.get())).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
+        return frame
+
+    def export_mean_time_area_data(self, behavior_name="", bin_sec=5):
+        """Export mean timecourse binned data to CSV"""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"{behavior_name}_mean_timecourse.csv" if behavior_name else "mean_timecourse.csv"
+        )
+        if not filename:
+            return
+
+        treatment_arrays = {}
+        if hasattr(self, 'perframe_data'):
+            for (subject, treatment, behav), arr in self.perframe_data.items():
+                if behav != behavior_name:
+                    continue
+                treatment_arrays.setdefault(treatment, []).append((subject, arr))
+
+        if not treatment_arrays:
+            messagebox.showwarning("No Data", "No per-frame data available for export.")
+            return
+
+        treatments = self.treatment_order if hasattr(self, 'treatment_order') else list(treatment_arrays.keys())
+        min_len = min(len(arr) for arrays in treatment_arrays.values() for _, arr in arrays)
+        bin_sec = max(1, bin_sec)
+        n_bins = int(np.ceil(min_len / bin_sec))
+
+        rows = []
+        for i in range(n_bins):
+            start = i * bin_sec
+            end = min(start + bin_sec, min_len)
+            row = {'Bin_Start_s': start, 'Bin_End_s': end}
+
+            for treatment in treatments:
+                if treatment not in treatment_arrays:
+                    continue
+                arrays = treatment_arrays[treatment]
+                mat = np.array([arr[:min_len] for _, arr in arrays], dtype=float)
+                bin_vals = np.sum(mat[:, start:end], axis=1)  # per-subject sum
+                row[f'{treatment}_Mean'] = round(float(np.mean(bin_vals)), 4)
+                row[f'{treatment}_SD'] = round(float(np.std(bin_vals, ddof=1)), 4) if len(bin_vals) > 1 else ''
+                row[f'{treatment}_SEM'] = round(float(np.std(bin_vals, ddof=1) / np.sqrt(len(bin_vals))), 4) if len(bin_vals) > 1 else ''
+                row[f'{treatment}_N'] = len(bin_vals)
+
+                # Individual subjects
+                for (subj, _), val in zip(arrays, bin_vals):
+                    row[f'{treatment}_{subj}'] = round(float(val), 4)
+
+            rows.append(row)
+
+        export_df = pd.DataFrame(rows)
+        export_df.to_csv(filename, index=False)
+        messagebox.showinfo("Success", f"Mean timecourse data exported to:\n{filename}")
 
     def create_latency_graph(self, notebook, behavior_name="", _frame=None):
         """Create latency to first bout bar + scatter plot"""
@@ -2638,7 +2985,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'Total_Time_s' in df.columns:
@@ -2652,8 +2999,15 @@ class AnalysisTab(ttk.Frame):
                 ax.text(0.5, 0.5, 'No bouts detected in any session',
                         transform=ax.transAxes, ha='center', va='center', fontsize=14)
             else:
-                first_bout = active.groupby('Subject')['Bin_Start_Min'].min().reset_index()
-                first_bout.columns = ['Subject', 'Latency_Min']
+                # Use precomputed Latency_s if available, fall back to Bin_Start_Min
+                if 'Latency_s' in active.columns and active['Latency_s'].notna().any():
+                    active_with_latency = active.dropna(subset=['Latency_s'])
+                    first_bout = active_with_latency.groupby('Subject')['Latency_s'].min().reset_index()
+                    first_bout['Latency_Min'] = first_bout['Latency_s'] / 60
+                    first_bout = first_bout[['Subject', 'Latency_Min']]
+                else:
+                    first_bout = active.groupby('Subject')['Bin_Start_Min'].min().reset_index()
+                    first_bout.columns = ['Subject', 'Latency_Min']
                 subject_treatment = df[['Subject', 'Treatment']].drop_duplicates()
                 first_bout = first_bout.merge(subject_treatment, on='Subject')
 
@@ -2717,16 +3071,17 @@ class AnalysisTab(ttk.Frame):
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
 
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                    command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                    command=lambda: self.export_latency_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_total_time_graph(self, notebook, behavior_name="", _frame=None):
@@ -2739,7 +3094,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
         
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
         
         # Use filtered data (specific to this behavior)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -2847,19 +3202,18 @@ class AnalysisTab(ttk.Frame):
                 if stats_results:
                     y_max = max(means) + max(errors) if errors else max(means)
                     self.add_significance_markers(ax, x, stats_results, treatments, y_max)
-        
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
-        # Add button frame
+
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
-        
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                   command=lambda: self.export_total_time_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_bout_analysis_graph(self, notebook, behavior_name="", _frame=None):
@@ -2872,7 +3226,7 @@ class AnalysisTab(ttk.Frame):
             for w in frame.winfo_children():
                 w.destroy()
         
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
         
         # Use filtered data (specific to this behavior)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -3059,21 +3413,18 @@ class AnalysisTab(ttk.Frame):
                 y_max = max([d.max() for d in bout_data if len(d) > 0])
                 x_positions = np.arange(1, len(treatments) + 1)
                 self.add_significance_markers(ax1, x_positions, stats_results, treatments, y_max)
-        
-        plt.tight_layout()
-        
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
-        # Add button frame
+
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
-        
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                   command=lambda: self.export_bout_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_phase_analysis_graph(self, notebook, behavior_name="", _frame=None):
@@ -3087,7 +3438,7 @@ class AnalysisTab(ttk.Frame):
                 w.destroy()
         
         # Create 2 subplots side by side
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
         
         # Use filtered data
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -3273,21 +3624,18 @@ class AnalysisTab(ttk.Frame):
         # Add overall title
         if behavior_name:
             fig.suptitle(f'{behavior_name} - Phase Analysis', fontsize=15, fontweight='bold', y=0.98)
-        
-        plt.tight_layout()
-        
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
-        # Add button frame
+
         button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=5)
-        
+        button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(side='left', padx=5)
         ttk.Button(button_frame, text="📊 Export Data",
                   command=lambda: self.export_phase_data(behavior_name)).pack(side='left', padx=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_heatmap_graph(self, notebook, behavior_name="", _frame=None):
@@ -3343,7 +3691,7 @@ class AnalysisTab(ttk.Frame):
         fig_height = max(7, n_subjects * 0.4)  # Slightly larger for better spacing
         fig_width = max(11, n_bins * 0.35)
         
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
         
         # Create heatmap
         im = ax.imshow(pivot_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
@@ -3398,16 +3746,13 @@ class AnalysisTab(ttk.Frame):
         ax.set_title(title,
                     fontsize=12, fontweight='bold', pad=12)
         
-        # Adjust layout - more room for labels on right
-        plt.tight_layout()
-        plt.subplots_adjust(right=0.85)
-        
-        canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
         ttk.Button(frame, text="💾 Save Figure",
-                  command=lambda: self.save_figure(fig)).pack(pady=5)
+                  command=lambda: self.save_figure(fig)).pack(side='bottom', pady=5)
+
+        canvas = FigureCanvasTkAgg(fig, frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_heatmap_bouts_graph(self, notebook, behavior_name="", _frame=None):
@@ -3456,7 +3801,7 @@ class AnalysisTab(ttk.Frame):
         fig_height = max(7, n_subjects * 0.4)
         fig_width = max(11, n_bins * 0.35)
 
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
 
         im = ax.imshow(pivot_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
 
@@ -3501,15 +3846,13 @@ class AnalysisTab(ttk.Frame):
         title = f'{behavior_name} - Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)' if behavior_name else 'Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)'
         ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
 
-        plt.tight_layout()
-        plt.subplots_adjust(right=0.85)
+        ttk.Button(frame, text="💾 Save Figure",
+                   command=lambda: self.save_figure(fig)).pack(side='bottom', pady=5)
 
         canvas = FigureCanvasTkAgg(fig, frame)
-        canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True)
-
-        ttk.Button(frame, text="💾 Save Figure",
-                   command=lambda: self.save_figure(fig)).pack(pady=5)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
         return frame
 
     def create_statistics_tab(self, notebook, behavior_name, behavior_df,
@@ -4556,7 +4899,8 @@ TIPS:
         
         help_window = tk.Toplevel(self)
         help_window.title("Analysis Help")
-        help_window.geometry("600x700")
+        _sw, _sh = help_window.winfo_screenwidth(), help_window.winfo_screenheight()
+        help_window.geometry(f"700x800+{(_sw-700)//2}+{(_sh-800)//2}")
         
         text = tk.Text(help_window, wrap='word', padx=10, pady=10)
         text.pack(fill='both', expand=True)

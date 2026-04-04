@@ -227,7 +227,8 @@ def recalculate_brightness(features_df, video_path, x_offset=0, y_offset=0, radi
     progress_root.withdraw()
     progress_win = Toplevel(progress_root)
     progress_win.title("Re-extracting Brightness Features")
-    progress_win.geometry("500x120")
+    _sw, _sh = progress_win.winfo_screenwidth(), progress_win.winfo_screenheight()
+    progress_win.geometry(f"550x140+{(_sw-550)//2}+{(_sh-140)//2}")
     
     Label(progress_win, text="Re-extracting brightness (single-pass)...", 
           font=('Arial', 11, 'bold')).pack(pady=10)
