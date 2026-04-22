@@ -353,7 +353,11 @@ class CropForDLCApp:
     def __init__(self, root: tk.Tk, initial_project: str = ""):
         self.root = root
         root.title("PixelPaws — Crop Video for DLC")
-        root.geometry("700x600")
+        _sw = root.winfo_screenwidth()
+        _sh = root.winfo_screenheight()
+        _w = int(_sw * 0.60)
+        _h = int(_sh * 0.65)
+        root.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
         root.resizable(True, True)
 
         self._build_ui()

@@ -71,13 +71,14 @@ class ProjectSetupWizard(tk.Toplevel):
         self.project_folder = ''
 
         self.title("PixelPaws — Project Setup")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(750, 660)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Centre on screen — taller when recent projects exist
         self.update_idletasks()
-        w = 600
-        h = 620 if _load_recent() else 530
+        w = 820
+        h = 850 if _load_recent() else 750
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
@@ -94,14 +95,18 @@ class ProjectSetupWizard(tk.Toplevel):
 
     def _build_shell(self):
         """Build the persistent header + content area + nav bar."""
-        # Header
-        hdr = tk.Frame(self, bg='#2c5f8a', pady=12)
+        # Header — use theme primary color if ttkbootstrap available
+        try:
+            _hdr_bg = self.app.style.colors.primary
+        except Exception:
+            _hdr_bg = '#2c5f8a'
+        hdr = tk.Frame(self, bg=_hdr_bg, pady=12)
         hdr.pack(fill='x')
         tk.Label(hdr, text="🐾 PixelPaws — Project Setup",
-                 bg='#2c5f8a', fg='white',
+                 bg=_hdr_bg, fg='white',
                  font=('Arial', 14, 'bold')).pack()
         self.step_label = tk.Label(hdr, text="",
-                                   bg='#2c5f8a', fg='#c8e0f4',
+                                   bg=_hdr_bg, fg='#c8e0f4',
                                    font=('Arial', 9))
         self.step_label.pack()
 
@@ -333,9 +338,14 @@ class ProjectSetupWizard(tk.Toplevel):
         self._bp_listbox.pack(side='left', fill='both', expand=True)
         bp_scroll.pack(side='right', fill='y')
 
-        ttk.Button(cf, text="🔄", width=3,
-                   command=self._parse_bp_from_h5).grid(
-                       row=row, column=2, padx=2, sticky='n', pady=(10, 0))
+        _refresh_btn = ttk.Button(cf, text="🔄", width=3,
+                   command=self._parse_bp_from_h5)
+        _refresh_btn.grid(row=row, column=2, padx=2, sticky='n', pady=(10, 0))
+        try:
+            from ui_utils import ToolTip
+            ToolTip(_refresh_btn, "Auto-detect body parts from DLC .h5 files")
+        except ImportError:
+            pass
 
         # Performance disclaimer
         ttk.Label(bp_outer,
@@ -672,6 +682,11 @@ class ProjectSetupWizard(tk.Toplevel):
         KeyFileGeneratorDialog(self, self.project_folder, basenames, existing)
 
     def _skip_extraction(self):
+        if not messagebox.askyesno(
+                "Skip Feature Extraction?",
+                "You can extract features later from the Tools tab.\n\n"
+                "Skip for now?", parent=self):
+            return
         self._log_extract("(Skipped — you can run feature extraction later.)")
         self.btn_next.config(state='normal')
 
@@ -746,14 +761,18 @@ class KeyFileGeneratorDialog(tk.Toplevel):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
-        # Header
-        hdr = tk.Frame(self, bg='#2c5f8a', pady=10)
+        # Header — use theme primary color if ttkbootstrap available
+        try:
+            _hdr_bg = self.master.nametowidget('.').style.colors.primary
+        except Exception:
+            _hdr_bg = '#2c5f8a'
+        hdr = tk.Frame(self, bg=_hdr_bg, pady=10)
         hdr.pack(fill='x')
         tk.Label(hdr, text="📋 Key File — Group Assignment",
-                 bg='#2c5f8a', fg='white', font=('Arial', 12, 'bold')).pack()
+                 bg=_hdr_bg, fg='white', font=('Arial', 12, 'bold')).pack()
         tk.Label(hdr,
                  text="Assign each video to a group (e.g. Control, Treatment, Sham).",
-                 bg='#2c5f8a', fg='#c8e0f4', font=('Arial', 9)).pack()
+                 bg=_hdr_bg, fg='#c8e0f4', font=('Arial', 9)).pack()
 
         # Quick-fill bar
         qf = ttk.Frame(self, padding=(10, 6, 10, 2))

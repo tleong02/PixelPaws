@@ -81,7 +81,7 @@ class BehaviorClassifier:
         """Create XGBoost model with specified parameters."""
         params = {
             'n_estimators': self.n_estimators,
-            'objective': 'reg:squaredlogerror',  # BAREfoot uses this
+            'objective': 'binary:logistic',
             'max_depth': self.max_depth,
             'learning_rate': self.learning_rate,
             'subsample': self.subsample,

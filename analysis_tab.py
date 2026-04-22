@@ -13,35 +13,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import seaborn as sns
 from datetime import datetime
 
-
-def _bind_tight_layout_on_resize(canvas, fig, rect=None):
-    """Debounced redraw on widget resize so constrained_layout recomputes."""
-    _timer = [None]
-    widget = canvas.get_tk_widget()
-    def _sync_size_and_draw():
-        try:
-            w, h = widget.winfo_width(), widget.winfo_height()
-            if w > 1 and h > 1:
-                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
-            canvas.draw_idle()
-        except Exception:
-            pass
-    def _on_configure(event):
-        if _timer[0] is not None:
-            widget.after_cancel(_timer[0])
-        _timer[0] = widget.after(150, _sync_size_and_draw)
-    widget.bind('<Configure>', _on_configure, add='+')
-    widget.after(300, _sync_size_and_draw)
-
-
-def _draw_canvas_fit(canvas, fig):
-    """Force geometry computation, resize figure to widget, and draw."""
-    widget = canvas.get_tk_widget()
-    widget.update_idletasks()
-    w, h = widget.winfo_width(), widget.winfo_height()
-    if w > 1 and h > 1:
-        fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
-    canvas.draw()
+from ui_utils import _bind_tight_layout_on_resize, _draw_canvas_fit
 
 
 class AnalysisTab(ttk.Frame):
@@ -2226,101 +2198,235 @@ class AnalysisTab(ttk.Frame):
             (filtered_df['Treatment'].isin(self.treatment_order))
         ].copy()
         
-        # Create new window for graphs
-        graph_window = tk.Toplevel(self)
-        behaviors_text = " + ".join(selected_behaviors) if len(selected_behaviors) <= 3 else f"{len(selected_behaviors)} Behaviors"
-        graph_window.title(f"Analysis Graphs - {behaviors_text}")
-        sw, sh = graph_window.winfo_screenwidth(), graph_window.winfo_screenheight()
-        gw, gh = int(sw * 0.92), int(sh * 0.92)
-        graph_window.geometry(f"{gw}x{gh}+{(sw-gw)//2}+{(sh-gh)//2}")
-        
-        # Create main notebook for behaviors
-        main_notebook = ttk.Notebook(graph_window)
-        main_notebook.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Create a tab for each behavior
-        for behavior in selected_behaviors:
-            # Filter to this behavior
-            behavior_df = self.filtered_results_df[self.filtered_results_df['Behavior'] == behavior].copy()
-            
-            # Create frame for this behavior
-            behavior_frame = ttk.Frame(main_notebook)
-            main_notebook.add(behavior_frame, text=behavior)
-            
-            # Create sub-notebook for graph types
-            graph_notebook = ttk.Notebook(behavior_frame)
-            graph_notebook.pack(fill='both', expand=True, padx=5, pady=5)
-            
-            # Temporarily set filtered_results_df to this behavior's data
-            original_df = self.filtered_results_df
+        # Build the new single-canvas graph window (transitions-tab-style):
+        # persistent Figure/Canvas + behavior dropdown + view-selector Notebook +
+        # overlay toggles.  Every setting change triggers _gw_refresh_plot() which
+        # calls fig.clear() and dispatches to the retrofitted create_*_graph
+        # methods with _fig=self._gw_fig so they draw into the shared figure.
+        self._gw_open_graph_window(selected_behaviors)
+
+    # ------------------------------------------------------------------
+    # New graph-window infrastructure (single persistent Figure/Canvas,
+    # transitions-tab dispatch style).  Replaces the old per-tab-figure
+    # Notebook approach.  The legacy create_*_graph methods still work for
+    # the Statistics tab's graph_rebuild_fns callbacks.
+    # ------------------------------------------------------------------
+
+    # Ordered registry of (view_label, render_callback) pairs.  Each callback
+    # takes (fig, behavior_name) and draws into the provided figure.  The
+    # order here is the order the view-selector tabs appear.
+    def _gw_view_registry(self):
+        VR = [
+            ('Time Course',     lambda fig, b: self.create_time_course_graph(None, b, _fig=fig, show_traces=False)),
+            ('Individual Traces', lambda fig, b: self.create_time_course_graph(None, b, _fig=fig, show_traces=True)),
+            ('Total Time',      lambda fig, b: self.create_total_time_graph(None, b, _fig=fig)),
+            ('Bout Analysis',   lambda fig, b: self.create_bout_analysis_graph(None, b, _fig=fig)),
+        ]
+        if self.enable_phase_analysis.get():
+            VR.append(('Phase Analysis',
+                       lambda fig, b: self.create_phase_analysis_graph(None, b, _fig=fig)))
+        VR += [
+            ('Heatmap',         lambda fig, b: self.create_heatmap_graph(None, b, _fig=fig)),
+            ('Heatmap (Bouts)', lambda fig, b: self.create_heatmap_bouts_graph(None, b, _fig=fig)),
+            ('Cumulative',      lambda fig, b: self.create_cumulative_graph(None, b, _fig=fig)),
+            ('Cumulative Bouts', lambda fig, b: self.create_cumulative_bouts_graph(None, b, _fig=fig)),
+        ]
+        if hasattr(self, 'perframe_data') and self.perframe_data:
+            VR.append(('Mean Timecourse',
+                       lambda fig, b: self.create_mean_time_area_graph(None, b, _fig=fig)))
+        VR.append(('Latency',
+                   lambda fig, b: self.create_latency_graph(None, b, _fig=fig)))
+        return VR
+
+    # Map export-button targets per view.  None = "Save only" (no data export).
+    def _gw_exporter_for(self, view_label):
+        m = {
+            'Time Course':       self.export_timecourse_data,
+            'Individual Traces': self.export_timecourse_data,
+            'Total Time':        self.export_total_time_data,
+            'Bout Analysis':     self.export_bout_data,
+            'Phase Analysis':    self.export_phase_data,
+            'Cumulative':        self.export_cumulative_data,
+            'Cumulative Bouts':  self.export_cumulative_bouts_data,
+            'Mean Timecourse':   self.export_mean_time_area_data,
+            'Latency':           self.export_latency_data,
+        }
+        return m.get(view_label)
+
+    def _gw_open_graph_window(self, selected_behaviors):
+        """Create the single-canvas graph window."""
+        gw_win = tk.Toplevel(self)
+        behaviors_text = (" + ".join(selected_behaviors)
+                          if len(selected_behaviors) <= 3
+                          else f"{len(selected_behaviors)} Behaviors")
+        gw_win.title(f"Analysis Graphs - {behaviors_text}")
+        sw, sh = gw_win.winfo_screenwidth(), gw_win.winfo_screenheight()
+        ww, wh = int(sw * 0.92), int(sh * 0.92)
+        gw_win.geometry(f"{ww}x{wh}+{(sw-ww)//2}+{(sh-wh)//2}")
+
+        # State
+        self._gw_win            = gw_win
+        self._gw_behaviors      = list(selected_behaviors)
+        self._gw_behavior_var   = tk.StringVar(value=selected_behaviors[0])
+        self._gw_view_var       = tk.StringVar(value='Time Course')
+        self._gw_show_sig_var   = tk.BooleanVar(value=self.enable_stats_var.get())
+        # Snapshot of full multi-behavior df; per-behavior slicing happens in _gw_refresh_plot
+        self._gw_all_df         = self.filtered_results_df.copy()
+
+        # ── Top settings bar ─────────────────────────────────────────────
+        top_bar = ttk.Frame(gw_win, padding=(10, 8, 10, 4))
+        top_bar.pack(fill='x')
+        ttk.Label(top_bar, text="Behavior:").pack(side='left')
+        beh_combo = ttk.Combobox(top_bar, values=selected_behaviors,
+                                  textvariable=self._gw_behavior_var,
+                                  state='readonly', width=22)
+        beh_combo.pack(side='left', padx=(4, 12))
+        beh_combo.bind('<<ComboboxSelected>>', lambda e: self._gw_refresh_plot())
+
+        ttk.Label(top_bar, text=f"Window: {self.time_window:g} min").pack(side='left', padx=(0, 12))
+        ttk.Label(top_bar, text=f"Error: {self.error_type}").pack(side='left', padx=(0, 12))
+
+        sig_cb = ttk.Checkbutton(top_bar, text="Sig. markers",
+                                  variable=self._gw_show_sig_var,
+                                  command=self._gw_on_sig_toggle)
+        sig_cb.pack(side='left', padx=(0, 4))
+
+        # ── View selector (empty-frame Notebook used as a tab-strip) ──────
+        selector = ttk.Notebook(gw_win)
+        selector.pack(fill='x', padx=10, pady=(0, 4))
+        self._gw_selector = selector
+        self._gw_view_frames = []   # parallel with _gw_view_registry
+        for label, _fn in self._gw_view_registry():
+            f = ttk.Frame(selector)
+            selector.add(f, text=label)
+            self._gw_view_frames.append((label, f))
+        selector.bind('<<NotebookTabChanged>>', self._gw_on_view_changed)
+
+        # ── Single Figure/Canvas ─────────────────────────────────────────
+        canvas_frame = ttk.Frame(gw_win)
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=(0, 4))
+        self._gw_fig = plt.figure(figsize=(10, 6), constrained_layout=True)
+        self._gw_canvas = FigureCanvasTkAgg(self._gw_fig, canvas_frame)
+        self._gw_canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(self._gw_canvas, self._gw_fig)
+
+        # ── Action bar ───────────────────────────────────────────────────
+        action_bar = ttk.Frame(gw_win, padding=(10, 2, 10, 8))
+        action_bar.pack(fill='x')
+        ttk.Button(action_bar, text="💾 Save Figure",
+                   command=lambda: self.save_figure(self._gw_fig)).pack(side='left', padx=4)
+        ttk.Button(action_bar, text="📊 Export Data",
+                   command=self._gw_export_data).pack(side='left', padx=4)
+        ttk.Button(action_bar, text="📈 Statistics",
+                   command=self._gw_open_statistics).pack(side='left', padx=4)
+        ttk.Button(action_bar, text="✕ Close",
+                   command=gw_win.destroy).pack(side='right', padx=4)
+
+        # Initial render — after geometry settles so canvas has real size
+        gw_win.after(50, self._gw_refresh_plot)
+
+    def _gw_on_view_changed(self, event=None):
+        idx = self._gw_selector.index('current')
+        if 0 <= idx < len(self._gw_view_frames):
+            self._gw_view_var.set(self._gw_view_frames[idx][0])
+            self._gw_refresh_plot()
+
+    def _gw_on_sig_toggle(self):
+        # "Sig. markers" reuses the existing enable_stats_var plumbing so the
+        # inline stats code in each graph method picks it up.  Saves the caller
+        # from threading a new flag through every method.
+        self.enable_stats_var.set(self._gw_show_sig_var.get())
+        self._gw_refresh_plot()
+
+    def _gw_refresh_plot(self):
+        if not hasattr(self, '_gw_fig') or self._gw_fig is None:
+            return
+        self._gw_fig.clear()
+        behavior = self._gw_behavior_var.get()
+        view     = self._gw_view_var.get()
+
+        # Slice the df to this behavior and swap into filtered_results_df
+        # so the existing create_*_graph methods see the right data.
+        prev_df = self.filtered_results_df
+        try:
+            self.filtered_results_df = self._gw_all_df[
+                self._gw_all_df['Behavior'] == behavior].copy()
+            for label, fn in self._gw_view_registry():
+                if label == view:
+                    fn(self._gw_fig, behavior)
+                    break
+            else:
+                ax = self._gw_fig.add_subplot(111)
+                ax.text(0.5, 0.5, f"Unknown view: {view}",
+                        ha='center', va='center', transform=ax.transAxes)
+        except Exception as e:
+            self._gw_fig.clear()
+            ax = self._gw_fig.add_subplot(111)
+            ax.text(0.5, 0.5, f"Error rendering {view}:\n{e}",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=10, color='crimson')
+        finally:
+            self.filtered_results_df = prev_df
+        self._gw_canvas.draw_idle()
+
+    def _gw_export_data(self):
+        """Call the export function matching the current view."""
+        exporter = self._gw_exporter_for(self._gw_view_var.get())
+        if exporter is None:
+            messagebox.showinfo("Export",
+                                "No CSV export is defined for this view.")
+            return
+        behavior = self._gw_behavior_var.get()
+        prev_df = self.filtered_results_df
+        try:
+            self.filtered_results_df = self._gw_all_df[
+                self._gw_all_df['Behavior'] == behavior].copy()
+            exporter(behavior)
+        finally:
+            self.filtered_results_df = prev_df
+
+    def _gw_open_statistics(self):
+        """Open the Statistics view in a separate Toplevel using the legacy
+        create_statistics_tab contract (expects an outer notebook)."""
+        behavior = self._gw_behavior_var.get()
+        stats_win = tk.Toplevel(self._gw_win)
+        stats_win.title(f"Statistics — {behavior}")
+        sw, sh = stats_win.winfo_screenwidth(), stats_win.winfo_screenheight()
+        stats_win.geometry(f"{int(sw*0.7)}x{int(sh*0.85)}")
+        nb = ttk.Notebook(stats_win)
+        nb.pack(fill='both', expand=True, padx=8, pady=8)
+        prev_df = self.filtered_results_df
+        try:
+            behavior_df = self._gw_all_df[
+                self._gw_all_df['Behavior'] == behavior].copy()
             self.filtered_results_df = behavior_df
-            
-            # Verify we're only showing data for this behavior
-            if 'Behavior' in behavior_df.columns:
-                unique_behaviors = behavior_df['Behavior'].unique()
-                if len(unique_behaviors) != 1 or unique_behaviors[0] != behavior:
-                    print(f"WARNING: Behavior filter may have failed. Expected {behavior}, got {unique_behaviors}")
-            
-            # Generate graph tabs and collect (frame, rebuild_fn) for stats recalculate
-            _b = behavior   # capture for lambdas
-            graph_rebuild_fns = []
+            # Stats tab re-renders graphs on time-window change via
+            # graph_rebuild_fns — in this window there are no sibling graph
+            # frames, so pass an empty list.  Stats tables still compute.
+            self.create_statistics_tab(nb, behavior, behavior_df,
+                                       graph_rebuild_fns=[])
+        finally:
+            self.filtered_results_df = prev_df
 
-            f = self.create_time_course_graph(graph_notebook, behavior, show_traces=False)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_time_course_graph(None, b, _frame=_f, show_traces=False)))
+    def create_time_course_graph(self, notebook, behavior_name="", _frame=None, show_traces=False, _fig=None):
+        """Create time course line plot with SEM error bars.
 
-            f = self.create_time_course_graph(graph_notebook, behavior, show_traces=True)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_time_course_graph(None, b, _frame=_f, show_traces=True)))
-
-            f = self.create_total_time_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_total_time_graph(None, b, _frame=_f)))
-
-            f = self.create_bout_analysis_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_bout_analysis_graph(None, b, _frame=_f)))
-
-            # Add phase analysis if enabled
-            if self.enable_phase_analysis.get():
-                f = self.create_phase_analysis_graph(graph_notebook, behavior)
-                graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_phase_analysis_graph(None, b, _frame=_f)))
-
-            f = self.create_heatmap_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_heatmap_graph(None, b, _frame=_f)))
-
-            f = self.create_heatmap_bouts_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_heatmap_bouts_graph(None, b, _frame=_f)))
-
-            f = self.create_cumulative_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_graph(None, b, _frame=_f)))
-
-            f = self.create_cumulative_bouts_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_cumulative_bouts_graph(None, b, _frame=_f)))
-
-            if hasattr(self, 'perframe_data') and self.perframe_data:
-                f = self.create_mean_time_area_graph(graph_notebook, behavior)
-                graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_mean_time_area_graph(None, b, _frame=_f)))
-
-            f = self.create_latency_graph(graph_notebook, behavior)
-            graph_rebuild_fns.append((f, lambda _f, b=_b: self.create_latency_graph(None, b, _frame=_f)))
-
-            # Add statistics tab if enabled
-            if hasattr(self, 'enable_stats_var') and self.enable_stats_var.get():
-                self.create_statistics_tab(graph_notebook, behavior, behavior_df,
-                                           graph_rebuild_fns=graph_rebuild_fns)
-            
-            # Restore original dataframe
-            self.filtered_results_df = original_df
-    
-    def create_time_course_graph(self, notebook, behavior_name="", _frame=None, show_traces=False):
-        """Create time course line plot with SEM error bars"""
+        When `_fig` is provided (new single-canvas window path), draw into it
+        and skip frame/canvas/button construction — the caller owns the canvas.
+        """
         tab_label = "Individual Traces" if show_traces else "Time Course"
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text=tab_label)
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text=tab_label)
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-        
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
         
         # Use filtered data
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -2652,6 +2758,9 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
 
+        if _fig is not None:
+            return None
+
         # Pack buttons first so they're always visible at the bottom
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
@@ -2666,17 +2775,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_cumulative_graph(self, notebook, behavior_name="", _frame=None):
+    def create_cumulative_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create cumulative behavior time line plot"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Cumulative")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Cumulative")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'Total_Time_s' in df.columns:
@@ -2719,6 +2831,9 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -2732,17 +2847,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_cumulative_bouts_graph(self, notebook, behavior_name="", _frame=None):
+    def create_cumulative_bouts_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create cumulative number of bouts line plot"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Cumulative Bouts")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Cumulative Bouts")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'N_Bouts' in df.columns:
@@ -2784,6 +2902,9 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window'):
                 ax.set_xlim(-2, self.time_window + 2)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -2797,17 +2918,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_mean_time_area_graph(self, notebook, behavior_name="", _frame=None, bin_sec_override=None):
+    def create_mean_time_area_graph(self, notebook, behavior_name="", _frame=None, bin_sec_override=None, _fig=None):
         """Create mean timecourse filled-area plot from per-frame data, binned on the fly"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Mean Timecourse")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Mean Timecourse")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
 
         # Gather per-frame (1-second) arrays for this behavior
         treatment_arrays = {}  # {treatment: [(subject, array), ...]}
@@ -2899,6 +3023,9 @@ class AnalysisTab(ttk.Frame):
             if hasattr(self, 'time_window') and bin_sec >= 60:
                 ax.set_xlim(-0.5, self.time_window + 0.5)
 
+        if _fig is not None:
+            return None
+
         # Controls at bottom
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
@@ -2975,17 +3102,20 @@ class AnalysisTab(ttk.Frame):
         export_df.to_csv(filename, index=False)
         messagebox.showinfo("Success", f"Mean timecourse data exported to:\n{filename}")
 
-    def create_latency_graph(self, notebook, behavior_name="", _frame=None):
+    def create_latency_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create latency to first bout bar + scatter plot"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Latency")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Latency")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'Total_Time_s' in df.columns:
@@ -3071,6 +3201,9 @@ class AnalysisTab(ttk.Frame):
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -3084,17 +3217,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_total_time_graph(self, notebook, behavior_name="", _frame=None):
+    def create_total_time_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create total time bar plot with individual subjects and SEM error bars"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Total Time")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Total Time")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-        
-        fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
+            fig = _fig
+            ax = fig.add_subplot(111)
         
         # Use filtered data (specific to this behavior)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -3203,6 +3339,9 @@ class AnalysisTab(ttk.Frame):
                     y_max = max(means) + max(errors) if errors else max(means)
                     self.add_significance_markers(ax, x, stats_results, treatments, y_max)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -3216,17 +3355,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_bout_analysis_graph(self, notebook, behavior_name="", _frame=None):
+    def create_bout_analysis_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create bout analysis boxplots with individual subjects and mean line"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Bout Analysis")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Bout Analysis")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+            fig = _fig
+            ax1, ax2 = fig.subplots(1, 2)
         
         # Use filtered data (specific to this behavior)
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -3414,6 +3556,9 @@ class AnalysisTab(ttk.Frame):
                 x_positions = np.arange(1, len(treatments) + 1)
                 self.add_significance_markers(ax1, x_positions, stats_results, treatments, y_max)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -3427,18 +3572,21 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_phase_analysis_graph(self, notebook, behavior_name="", _frame=None):
+    def create_phase_analysis_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create phase-specific analysis graphs (Acute Phase and Phase II on separate graphs)"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Phase Analysis")
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Phase Analysis")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+            # Create 2 subplots side by side
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
         else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-        
-        # Create 2 subplots side by side
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+            fig = _fig
+            ax1, ax2 = fig.subplots(1, 2)
         
         # Use filtered data
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
@@ -3625,6 +3773,9 @@ class AnalysisTab(ttk.Frame):
         if behavior_name:
             fig.suptitle(f'{behavior_name} - Phase Analysis', fontsize=15, fontweight='bold', y=0.98)
 
+        if _fig is not None:
+            return None
+
         button_frame = ttk.Frame(frame)
         button_frame.pack(side='bottom', pady=5)
         ttk.Button(button_frame, text="💾 Save Figure",
@@ -3638,19 +3789,20 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_heatmap_graph(self, notebook, behavior_name="", _frame=None):
+    def create_heatmap_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create heatmap of behavior across time and subjects, grouped by treatment"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Heatmap")
-        else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
-        
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Heatmap")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
+
         # Use filtered data
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
-        
+
         if 'Total_Time_s' not in df.columns:
             return
         
@@ -3685,14 +3837,18 @@ class AnalysisTab(ttk.Frame):
         # Reorder to match sorted subjects
         pivot_data = pivot_data.reindex(sorted_subjects)
         
-        # Dynamic sizing
+        # Dynamic sizing (only when owning the figure)
         n_subjects = len(sorted_subjects)
         n_bins = len(pivot_data.columns)
         fig_height = max(7, n_subjects * 0.4)  # Slightly larger for better spacing
         fig_width = max(11, n_bins * 0.35)
-        
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
-        
+
+        if _fig is None:
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
+        else:
+            fig = _fig
+            ax = fig.add_subplot(111)
+
         # Create heatmap
         im = ax.imshow(pivot_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
         
@@ -3745,7 +3901,10 @@ class AnalysisTab(ttk.Frame):
         title = f'{behavior_name} - Behavior Heatmap Across Time and Subjects\n(Grouped by Treatment)' if behavior_name else 'Behavior Heatmap Across Time and Subjects\n(Grouped by Treatment)'
         ax.set_title(title,
                     fontsize=12, fontweight='bold', pad=12)
-        
+
+        if _fig is not None:
+            return None
+
         ttk.Button(frame, text="💾 Save Figure",
                   command=lambda: self.save_figure(fig)).pack(side='bottom', pady=5)
 
@@ -3755,19 +3914,22 @@ class AnalysisTab(ttk.Frame):
         _draw_canvas_fit(canvas, fig)
         return frame
 
-    def create_heatmap_bouts_graph(self, notebook, behavior_name="", _frame=None):
+    def create_heatmap_bouts_graph(self, notebook, behavior_name="", _frame=None, _fig=None):
         """Create heatmap of bout counts across time and subjects, grouped by treatment"""
-        if _frame is None:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="Heatmap (Bouts)")
-        else:
-            frame = _frame
-            for w in frame.winfo_children():
-                w.destroy()
+        if _fig is None:
+            if _frame is None:
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text="Heatmap (Bouts)")
+            else:
+                frame = _frame
+                for w in frame.winfo_children():
+                    w.destroy()
 
         df = self.filtered_results_df if hasattr(self, 'filtered_results_df') else self.results_df
 
         if 'N_Bouts' not in df.columns:
+            if _fig is not None:
+                return None
             return frame if _frame is not None else ttk.Frame(notebook)
 
         treatment_order = self.treatment_order if hasattr(self, 'treatment_order') else sorted(df['Treatment'].unique())
@@ -3801,7 +3963,11 @@ class AnalysisTab(ttk.Frame):
         fig_height = max(7, n_subjects * 0.4)
         fig_width = max(11, n_bins * 0.35)
 
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
+        if _fig is None:
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
+        else:
+            fig = _fig
+            ax = fig.add_subplot(111)
 
         im = ax.imshow(pivot_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
 
@@ -3845,6 +4011,9 @@ class AnalysisTab(ttk.Frame):
 
         title = f'{behavior_name} - Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)' if behavior_name else 'Bout Count Heatmap Across Time and Subjects\n(Grouped by Treatment)'
         ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
+
+        if _fig is not None:
+            return None
 
         ttk.Button(frame, text="💾 Save Figure",
                    command=lambda: self.save_figure(fig)).pack(side='bottom', pady=5)

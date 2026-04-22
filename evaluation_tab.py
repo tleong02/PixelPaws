@@ -85,6 +85,67 @@ def _apply_bout_filtering(y_pred, min_bout, min_after_bout, max_gap):
     return y_filtered
 
 
+def fit_hmm_transitions(y):
+    """Fit a two-state HMM transition matrix from a binary label sequence.
+
+    Uses Laplace smoothing (+1 to each count) to avoid zero-probability
+    transitions on short recordings.
+
+    Returns
+    -------
+    log_trans : np.ndarray shape (2, 2) — log P(next_state | current_state)
+    log_prior : np.ndarray shape (2,)   — log P(state at t=0)
+    """
+    y = np.asarray(y, dtype=int)
+    trans = np.ones((2, 2), dtype=float)   # Laplace smoothing
+    for t in range(len(y) - 1):
+        s, s_ = int(y[t]), int(y[t + 1])
+        if s in (0, 1) and s_ in (0, 1):
+            trans[s, s_] += 1
+    trans /= trans.sum(axis=1, keepdims=True)
+    log_trans = np.log(trans)
+    prevalence = float(np.clip(y.mean(), 1e-6, 1 - 1e-6))
+    log_prior = np.log(np.array([1 - prevalence, prevalence]))
+    return log_trans, log_prior
+
+
+def viterbi_smooth(probas, log_trans, log_prior):
+    """Two-state Viterbi MAP decoder over per-frame behavior probabilities.
+
+    Emission model: P(obs=p | state=1) = p,  P(obs=p | state=0) = 1-p.
+    This is consistent with calibrated classifier output and does not
+    require a hard threshold — the label sequence is determined entirely
+    by the HMM transition prior and the raw probability stream.
+
+    Parameters
+    ----------
+    probas    : array-like  — raw per-frame P(behavior), shape (n,)
+    log_trans : np.ndarray shape (2, 2) — from fit_hmm_transitions
+    log_prior : np.ndarray shape (2,)   — from fit_hmm_transitions
+
+    Returns
+    -------
+    np.ndarray of int (0/1), shape (n,)
+    """
+    probas = np.clip(np.asarray(probas, dtype=float), 1e-10, 1 - 1e-10)
+    log_emit = np.column_stack([np.log(1 - probas), np.log(probas)])  # (n, 2)
+    n = len(probas)
+    vt = np.full((n, 2), -np.inf)
+    bp = np.zeros((n, 2), dtype=np.int8)
+    vt[0] = log_prior + log_emit[0]
+    for t in range(1, n):
+        for s in range(2):
+            scores = vt[t - 1] + log_trans[:, s]
+            best = int(np.argmax(scores))
+            bp[t, s] = best
+            vt[t, s] = scores[best] + log_emit[t, s]
+    path = np.empty(n, dtype=int)
+    path[-1] = int(np.argmax(vt[-1]))
+    for t in range(n - 2, -1, -1):
+        path[t] = bp[t + 1, path[t + 1]]
+    return path
+
+
 def count_bouts(y_pred: np.ndarray, fps: float) -> dict:
     """
     Count bouts in a binary prediction array and return summary statistics.
@@ -340,7 +401,9 @@ class EvaluationTab(ttk.Frame):
         self.eval_save_predictions= tk.BooleanVar(value=True)
         self.eval_detailed_report = tk.BooleanVar(value=True)
         self.eval_apply_bout_filter = tk.BooleanVar(value=True)
+        self.eval_smoothing_mode    = tk.StringVar(value='bout_filters')
         self._eval_cancel_flag = threading.Event()
+        self._optimized_params = None   # set after CV optimization completes
 
         # Custom parameter overrides
         self.eval_use_custom_params = tk.BooleanVar(value=False)
@@ -427,6 +490,17 @@ class EvaluationTab(ttk.Frame):
         ttk.Checkbutton(opt, text='Apply classifier bout filtering before scoring',
                         variable=self.eval_apply_bout_filter).grid(row=3, column=0, sticky='w', pady=2)
 
+        # Smoothing mode selector (replaces / extends bout-filter checkbox)
+        smooth_frame = ttk.Frame(opt)
+        smooth_frame.grid(row=3, column=0, columnspan=3, sticky='w', pady=(6, 2))
+        ttk.Label(smooth_frame, text="Smoothing:").pack(side='left')
+        for _lbl, _val in [("Bout filters", "bout_filters"),
+                            ("HMM Viterbi", "hmm_viterbi"),
+                            ("None", "none")]:
+            ttk.Radiobutton(smooth_frame, text=_lbl,
+                            variable=self.eval_smoothing_mode,
+                            value=_val).pack(side='left', padx=(8, 0))
+
         # Custom parameter overrides
         ttk.Checkbutton(opt, text='Use custom parameters (override classifier defaults)',
                         variable=self.eval_use_custom_params,
@@ -471,6 +545,10 @@ class EvaluationTab(ttk.Frame):
         self._eval_stop_btn.pack(side='left', padx=5)
         ttk.Button(act, text='🎯 Optimize Parameters',
                    command=self._run_cv_optimization).pack(side='left', padx=5)
+        self._save_params_btn = ttk.Button(act, text='💾 Save Params to Classifier',
+                   command=self._save_optimized_params_to_classifier,
+                   state='disabled')
+        self._save_params_btn.pack(side='left', padx=5)
         ttk.Button(act, text='🔬 SHAP Analysis',
                    command=self.run_shap_analysis).pack(side='left', padx=5)
 
@@ -516,7 +594,17 @@ class EvaluationTab(ttk.Frame):
         """Update the full path StringVar when a dropdown item is chosen."""
         name = self.eval_classifier_combo.get()
         if name in self.eval_classifier_options:
-            self.eval_classifier_path.set(self.eval_classifier_options[name])
+            clf_path = self.eval_classifier_options[name]
+            self.eval_classifier_path.set(clf_path)
+            try:
+                from prediction_pipeline import check_classifier_portability
+                for _w in check_classifier_portability(clf_path):
+                    print(f"⚠️  [{name}] {_w}")
+            except Exception:
+                pass
+        self._optimized_params = None
+        if hasattr(self, '_save_params_btn'):
+            self._save_params_btn.config(state='disabled')
 
     def _browse_classifier(self):
         p = filedialog.askopenfilename(
@@ -546,6 +634,48 @@ class EvaluationTab(ttk.Frame):
         for spin in (self._spin_threshold, self._spin_min_bout,
                      self._spin_min_after, self._spin_max_gap):
             spin.config(state=state)
+
+    # ----------------------------------------- Save optimized params --------
+
+    def _save_optimized_params_to_classifier(self):
+        """Save the optimized post-processing params back into the loaded classifier .pkl."""
+        if self._optimized_params is None:
+            messagebox.showwarning('No Optimized Params', 'Run optimization first.')
+            return
+
+        clf_path = self.eval_classifier_path.get()
+        if not clf_path or not os.path.isfile(clf_path):
+            messagebox.showerror('Classifier Not Found', f'Cannot find: {clf_path}')
+            return
+
+        if not messagebox.askyesno('Update Classifier',
+                f'Overwrite post-processing params in:\n{os.path.basename(clf_path)}\n\n'
+                f'Threshold: {self._optimized_params["best_thresh"]:.3f}\n'
+                f'Min Bout: {self._optimized_params["min_bout"]}\n'
+                f'Min After: {self._optimized_params["min_after_bout"]}\n'
+                f'Max Gap: {self._optimized_params["max_gap"]}\n\n'
+                'Original params will be overwritten.'):
+            return
+
+        try:
+            import pickle
+            with open(clf_path, 'rb') as f:
+                clf_data = pickle.load(f)
+
+            clf_data['best_thresh']    = self._optimized_params['best_thresh']
+            clf_data['min_bout']       = self._optimized_params['min_bout']
+            clf_data['min_after_bout'] = self._optimized_params['min_after_bout']
+            clf_data['max_gap']        = self._optimized_params['max_gap']
+
+            from PixelPaws_GUI import _atomic_pickle_save
+            _atomic_pickle_save(clf_data, clf_path)
+
+            self.eval_results_text.insert(tk.END,
+                f'\n✓ Saved optimized params to {os.path.basename(clf_path)}\n')
+            self.eval_results_text.see(tk.END)
+
+        except Exception as e:
+            messagebox.showerror('Save Failed', str(e))
 
     # -------------------------------------------------- Classifier info ------
 
@@ -881,24 +1011,11 @@ class EvaluationTab(ttk.Frame):
                                 self._log(f'  [Cache] Found in fallback: {_loc}')
                                 break
 
-                if os.path.isfile(cache_file):
-                    self._log('  Loading cached features…')
-                    try:
-                        with open(cache_file, 'rb') as f:
-                            X = pickle.load(f)
-                        self._log(
-                            f'  ✓ Cache loaded: {X.shape[0]} frames, '
-                            f'{X.shape[1]} features')
-                    except Exception as e:
-                        self._log(f'  ⚠️  Cache load failed ({e}), re-extracting…')
-                        X = None
-                        # Reset to canonical save path
-                        cache_file = os.path.join(cache_dir, _cache_fname)
-
-                if X is None:
-                    self._log('  Extracting features (this may take a while)…')
-                    try:
-                        X = _extract(
+                try:
+                    X = _gui._load_features_for_prediction(
+                        cache_file=cache_file,
+                        model=model,
+                        extract_fn=lambda: _extract(
                             pose_data_file=dlc_path,
                             video_file_path=video_path,
                             bp_include_list=None,
@@ -909,42 +1026,37 @@ class EvaluationTab(ttk.Frame):
                             crop_offset_y=crop_y,
                             config_yaml_path=dlc_config_path or None,
                             cancel_flag=self._eval_cancel_flag,
-                        )
-                        # Atomic write to prevent corruption on crash
-                        import tempfile
-                        _dir = os.path.dirname(cache_file) or '.'
-                        _fd, _tmp = tempfile.mkstemp(dir=_dir, suffix='.tmp')
-                        try:
-                            with os.fdopen(_fd, 'wb') as f:
-                                pickle.dump(X, f)
-                            os.replace(_tmp, cache_file)
-                        except BaseException:
-                            try:
-                                os.unlink(_tmp)
-                            except OSError:
-                                pass
-                            raise
-                        self._log(
-                            f'  ✓ Features extracted & cached: '
-                            f'{X.shape[0]} frames, {X.shape[1]} features')
-                    except Exception as e:
-                        self._log(f'  ✗ Feature extraction failed: {e}  — skipping.')
-                        continue
+                        ),
+                        save_path=cache_file,
+                        log_fn=self._log,
+                        dlc_path=dlc_path,
+                        clf_data=clf_data,
+                    )
+                except Exception as e:
+                    self._log(f'  ✗ Feature extraction failed: {e}  — skipping.')
+                    continue
 
                 # ── Post-cache feature augmentation (match training) ────
                 X = _gui.augment_features_post_cache(X, clf_data, model, dlc_path, log_fn=self._log)
 
                 # ── Predict ──────────────────────────────────────────────
                 try:
-                    y_proba = _predict(model, X)
+                    y_proba = _predict(
+                        model, X, calibrator=clf_data.get('prob_calibrator'), fold_models=clf_data.get('fold_models'))
                 except Exception as e:
                     self._log(f'  ✗ Prediction failed: {e}  — skipping.')
                     continue
 
-                y_pred = (y_proba >= best_thresh).astype(int)
-
-                if apply_bout_filter and min_bout > 1:
-                    y_pred = _apply_bout_filtering(y_pred, min_bout, min_after, max_gap)
+                # Apply smoothing (bout filters / HMM Viterbi / none)
+                try:
+                    from prediction_pipeline import apply_smoothing as _smooth_fn
+                    _smode = self.eval_smoothing_mode.get()
+                    y_pred = _smooth_fn(y_proba, clf_data, _smode)
+                except Exception as _se:
+                    # Fallback to legacy bout-filter path on import/runtime error
+                    y_pred = (y_proba >= best_thresh).astype(int)
+                    if apply_bout_filter and min_bout > 1:
+                        y_pred = _apply_bout_filtering(y_pred, min_bout, min_after, max_gap)
 
                 # ── Align lengths ─────────────────────────────────────────
                 n = min(len(y_true), len(y_pred))
@@ -958,9 +1070,12 @@ class EvaluationTab(ttk.Frame):
 
                 # ── Per-video metrics ─────────────────────────────────────
                 f1, prec, rec, acc = self._compute_metrics(y_true, y_pred)
+                bout_m = self._compute_bout_metrics(y_true, y_pred)
                 self._log(
                     f'  F1={f1:.3f}  Prec={prec:.3f}  '
-                    f'Rec={rec:.3f}  Acc={acc:.3f}')
+                    f'Rec={rec:.3f}  Acc={acc:.3f}  '
+                    f'BoutF1={bout_m["bout_f1"]:.3f} '
+                    f'({bout_m["n_true_bouts"]}t/{bout_m["n_pred_bouts"]}p)')
 
                 all_y_true.extend(y_true.tolist())
                 all_y_pred.extend(y_pred.tolist())
@@ -974,6 +1089,11 @@ class EvaluationTab(ttk.Frame):
                     'precision':  prec,
                     'recall':     rec,
                     'accuracy':   acc,
+                    'n_true_bouts':  bout_m['n_true_bouts'],
+                    'n_pred_bouts':  bout_m['n_pred_bouts'],
+                    'bout_f1':       bout_m['bout_f1'],
+                    'bout_precision': bout_m['bout_precision'],
+                    'bout_recall':   bout_m['bout_recall'],
                     'y_true':     y_true,
                     'y_pred':     y_pred,
                     'y_proba':    y_proba_clipped,
@@ -1030,6 +1150,15 @@ class EvaluationTab(ttk.Frame):
             self._log(f'Recall:     {ov_rec:.4f}')
             self._log(f'Accuracy:   {ov_acc:.4f}')
 
+            # Aggregate bout-level metrics
+            ov_bout = self._compute_bout_metrics(all_y_true, all_y_pred)
+            self._log(f'\n--- Bout-Level Metrics ---')
+            self._log(f'Labeled bouts:   {ov_bout["n_true_bouts"]}    '
+                      f'Predicted bouts: {ov_bout["n_pred_bouts"]}')
+            self._log(f'Bout Precision:  {ov_bout["bout_precision"]:.4f}   '
+                      f'Bout Recall: {ov_bout["bout_recall"]:.4f}   '
+                      f'Bout F1: {ov_bout["bout_f1"]:.4f}')
+
             tn_, fp_, fn_, tp_ = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
             self._log('\nConfusion Matrix (aggregate):')
             self._log('              Predicted 0  Predicted 1')
@@ -1043,15 +1172,19 @@ class EvaluationTab(ttk.Frame):
                 self._log('=' * 60)
                 self._log(
                     f'{"Video":<35} {"Frames":>7} {"TruePos%":>9} '
-                    f'{"F1":>7} {"Prec":>7} {"Rec":>7} {"Acc":>7}')
-                self._log('-' * 80)
+                    f'{"F1":>7} {"Prec":>7} {"Rec":>7} {"Acc":>7} '
+                    f'{"TBout":>6} {"PBout":>6} {"BF1":>7}')
+                self._log('-' * 100)
                 for r in per_video_results:
                     true_pct = 100 * r['n_true'] / r['n_frames'] if r['n_frames'] else 0
                     self._log(
                         f'{r["video"][:35]:<35} {r["n_frames"]:>7} '
                         f'{true_pct:>8.1f}% {r["f1"]:>7.3f} '
                         f'{r["precision"]:>7.3f} {r["recall"]:>7.3f} '
-                        f'{r["accuracy"]:>7.3f}')
+                        f'{r["accuracy"]:>7.3f} '
+                        f'{r.get("n_true_bouts", 0):>6} '
+                        f'{r.get("n_pred_bouts", 0):>6} '
+                        f'{r.get("bout_f1", 0):>7.3f}')
 
             # ── Save text report ──────────────────────────────────────────
             report_path = os.path.join(
@@ -1088,6 +1221,9 @@ class EvaluationTab(ttk.Frame):
                 f'Overall Precision: {ov_prec:.4f}\n'
                 f'Overall Recall:    {ov_rec:.4f}\n'
                 f'Overall Accuracy:  {ov_acc:.4f}\n\n'
+                f'Bout F1:           {ov_bout["bout_f1"]:.4f}\n'
+                f'Bout Precision:    {ov_bout["bout_precision"]:.4f}\n'
+                f'Bout Recall:       {ov_bout["bout_recall"]:.4f}\n\n'
                 f'Results saved to:\n{output_folder}'))
 
         except Exception as e:
@@ -1117,6 +1253,48 @@ class EvaluationTab(ttk.Frame):
             f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
             acc  = (tp + tn) / n if n else 0.0
             return f1, prec, rec, acc
+
+    @staticmethod
+    def _compute_bout_metrics(y_true, y_pred, fps=30.0):
+        """Bout-level precision, recall, F1.
+
+        A predicted bout is a true positive if it overlaps any labeled bout.
+        A labeled bout is detected if it overlaps any predicted bout.
+        """
+        true_bouts = count_bouts(y_true, fps)['bouts']
+        pred_bouts = count_bouts(y_pred, fps)['bouts']
+
+        matched_pred = 0
+        for pb in pred_bouts:
+            for tb in true_bouts:
+                if pb['start'] <= tb['end'] and pb['end'] >= tb['start']:
+                    matched_pred += 1
+                    break
+
+        matched_true = 0
+        for tb in true_bouts:
+            for pb in pred_bouts:
+                if tb['start'] <= pb['end'] and tb['end'] >= pb['start']:
+                    matched_true += 1
+                    break
+
+        n_true = len(true_bouts)
+        n_pred = len(pred_bouts)
+
+        bout_precision = matched_pred / n_pred if n_pred else 0.0
+        bout_recall = matched_true / n_true if n_true else 0.0
+        bout_f1 = (2 * bout_precision * bout_recall /
+                   (bout_precision + bout_recall)) if (bout_precision + bout_recall) else 0.0
+
+        return {
+            'n_true_bouts': n_true,
+            'n_pred_bouts': n_pred,
+            'matched_pred': matched_pred,
+            'matched_true': matched_true,
+            'bout_precision': bout_precision,
+            'bout_recall': bout_recall,
+            'bout_f1': bout_f1,
+        }
 
     # ----------------------------------------- CV Parameter Optimization ----
 
@@ -1334,18 +1512,11 @@ class EvaluationTab(ttk.Frame):
                                 cache_file = _loc
                                 break
 
-                if os.path.isfile(cache_file):
-                    try:
-                        with open(cache_file, 'rb') as f:
-                            X = pickle.load(f)
-                        log_fn(f'  Cached features: {X.shape[0]} frames')
-                    except Exception:
-                        X = None
-
-                if X is None:
-                    log_fn(f'  Extracting features…')
-                    try:
-                        X = _extract(
+                try:
+                    X = _gui._load_features_for_prediction(
+                        cache_file=cache_file,
+                        model=model,
+                        extract_fn=lambda: _extract(
                             pose_data_file=dlc_path,
                             video_file_path=video_path,
                             bp_include_list=None,
@@ -1355,28 +1526,22 @@ class EvaluationTab(ttk.Frame):
                             crop_offset_x=crop_x,
                             crop_offset_y=crop_y,
                             config_yaml_path=dlc_config_path or None,
-                        )
-                        import tempfile
-                        _dir = os.path.dirname(cache_file) or '.'
-                        _fd, _tmp = tempfile.mkstemp(dir=_dir, suffix='.tmp')
-                        try:
-                            with os.fdopen(_fd, 'wb') as f:
-                                pickle.dump(X, f)
-                            os.replace(_tmp, cache_file)
-                        except BaseException:
-                            try: os.unlink(_tmp)
-                            except OSError: pass
-                            raise
-                        log_fn(f'  Extracted & cached: {X.shape[0]} frames')
-                    except Exception as e:
-                        log_fn(f'  Skipping — feature extraction failed: {e}')
-                        continue
+                        ),
+                        save_path=cache_file,
+                        log_fn=log_fn,
+                        dlc_path=dlc_path,
+                        clf_data=clf_data,
+                    )
+                except Exception as e:
+                    log_fn(f'  Skipping — feature extraction failed: {e}')
+                    continue
 
                 X = _gui.augment_features_post_cache(X, clf_data, model, dlc_path)
 
                 # Predict
                 try:
-                    y_proba = _predict(model, X)
+                    y_proba = _predict(
+                        model, X, calibrator=clf_data.get('prob_calibrator'), fold_models=clf_data.get('fold_models'))
                 except Exception as e:
                     log_fn(f'  Skipping — prediction failed: {e}')
                     continue
@@ -1408,12 +1573,21 @@ class EvaluationTab(ttk.Frame):
                     [video_data[i]['y_true'] for i in range(N) if i != k])
 
                 best = self._grid_search_params(train_proba, train_labels)
+
+                # Evaluate on held-out fold with best params for bout metrics
+                _ho_pred = (video_data[k]['y_proba'] >= best['threshold']).astype(int)
+                _ho_pred = _apply_bout_filtering(
+                    _ho_pred, best['min_bout'], best['min_after_bout'], best['max_gap'])
+                _ho_bout = self._compute_bout_metrics(video_data[k]['y_true'], _ho_pred)
+                best['bout_f1'] = _ho_bout['bout_f1']
+
                 fold_results.append(best)
 
                 log_fn(f'\n  Fold {k+1}/{N} (held out: {video_data[k]["name"][:30]})')
                 log_fn(f'    Best: thresh={best["threshold"]:.3f}, '
                        f'min_bout={best["min_bout"]}, min_after={best["min_after_bout"]}, '
-                       f'max_gap={best["max_gap"]}  →  F1={best["f1"]:.3f}')
+                       f'max_gap={best["max_gap"]}  →  F1={best["f1"]:.3f}  '
+                       f'BoutF1={best["bout_f1"]:.3f}')
 
             # Step 3: Average params
             avg_thresh = round(float(np.mean([r['threshold'] for r in fold_results])), 3)
@@ -1437,6 +1611,8 @@ class EvaluationTab(ttk.Frame):
 
             f1, prec, rec, acc = self._compute_metrics(all_y_true, all_y_pred)
 
+            lovo_bout = self._compute_bout_metrics(all_y_true, all_y_pred)
+
             log_fn(f'\n{"=" * 60}')
             log_fn('FINAL METRICS (averaged params on all videos)')
             log_fn('=' * 60)
@@ -1444,6 +1620,9 @@ class EvaluationTab(ttk.Frame):
             log_fn(f'  Precision: {prec:.4f}')
             log_fn(f'  Recall:    {rec:.4f}')
             log_fn(f'  Accuracy:  {acc:.4f}')
+            log_fn(f'  Bout F1:        {lovo_bout["bout_f1"]:.4f}')
+            log_fn(f'  Bout Precision: {lovo_bout["bout_precision"]:.4f}')
+            log_fn(f'  Bout Recall:    {lovo_bout["bout_recall"]:.4f}')
 
             # Compare with classifier defaults
             def_y_pred = (all_y_proba >= default_thresh).astype(int)
@@ -1464,11 +1643,12 @@ class EvaluationTab(ttk.Frame):
             log_fn('PER-FOLD PARAMETER STABILITY')
             log_fn('=' * 60)
             log_fn(f'  {"Fold":>5s}  {"Threshold":>10s}  {"MinBout":>8s}  '
-                   f'{"MinAfter":>9s}  {"MaxGap":>7s}  {"F1":>7s}')
-            log_fn(f'  {"-"*5}  {"-"*10}  {"-"*8}  {"-"*9}  {"-"*7}  {"-"*7}')
+                   f'{"MinAfter":>9s}  {"MaxGap":>7s}  {"F1":>7s}  {"BoutF1":>7s}')
+            log_fn(f'  {"-"*5}  {"-"*10}  {"-"*8}  {"-"*9}  {"-"*7}  {"-"*7}  {"-"*7}')
             for k, r in enumerate(fold_results):
                 log_fn(f'  {k+1:>5d}  {r["threshold"]:>10.3f}  {r["min_bout"]:>8d}  '
-                       f'{r["min_after_bout"]:>9d}  {r["max_gap"]:>7d}  {r["f1"]:>7.3f}')
+                       f'{r["min_after_bout"]:>9d}  {r["max_gap"]:>7d}  {r["f1"]:>7.3f}  '
+                       f'{r.get("bout_f1", 0):>7.3f}')
 
             log_fn(f'\n✓ Optimization complete!')
 
@@ -1480,8 +1660,16 @@ class EvaluationTab(ttk.Frame):
             self._safe_after(lambda: self.eval_custom_min_after.set(avg_ma))
             self._safe_after(lambda: self.eval_custom_max_gap.set(avg_mg))
 
+            self._optimized_params = {
+                'best_thresh': avg_thresh,
+                'min_bout': avg_mb,
+                'min_after_bout': avg_ma,
+                'max_gap': avg_mg,
+            }
+            self._safe_after(lambda: self._save_params_btn.config(state='normal'))
+
             log_fn('\nOptimized parameters have been applied to the custom parameter fields.')
-            log_fn('Click "RUN EVALUATION" to evaluate with these parameters.')
+            log_fn('Click "💾 Save Params to Classifier" to persist them, or "RUN EVALUATION" to test.')
 
         except Exception as e:
             err = traceback.format_exc()

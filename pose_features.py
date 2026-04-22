@@ -21,7 +21,7 @@ from typing import List, Tuple, Optional
 import itertools
 
 # Increment this when the feature set changes so cached files are invalidated
-POSE_FEATURE_VERSION = 3
+POSE_FEATURE_VERSION = 5
 
 
 class PoseFeatureExtractor:
@@ -29,22 +29,25 @@ class PoseFeatureExtractor:
     Extracts kinematic and spatial features from pose estimation data.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  bodyparts: List[str],
                  likelihood_threshold: float = 0.8,
-                 velocity_delta: int = 2):
+                 velocity_delta: int = 2,
+                 contact_threshold: float = 15.0):
         """
         Initialize pose feature extractor.
-        
+
         Args:
             bodyparts: List of body part names from DLC
             likelihood_threshold: Minimum confidence for including data points (default 0.8)
             velocity_delta: Time steps for middle velocity calculation (default 2)
                            Note: Velocities are always calculated for dt=1, dt=velocity_delta, and dt=10
+            contact_threshold: Height (px) below which a body part is considered in contact (default 15.0)
         """
         self.bodyparts = bodyparts
         self.likelihood_threshold = likelihood_threshold
         self.velocity_delta = velocity_delta
+        self.contact_threshold = contact_threshold
         
     def load_dlc_data(self, filepath: str) -> pd.DataFrame:
         """
@@ -157,9 +160,9 @@ class PoseFeatureExtractor:
             # Need at least 3 body parts to calculate angles
             return pd.DataFrame()
         
-        BP_angles = pd.DataFrame()
+        angle_cols = {}
         bp_columns = bp_xcord.columns
-        
+
         # Get unique permutations (avoiding duplicates)
         permutations = list(itertools.permutations(range(len(bp_columns)), 2))
         unique_permutations = []
@@ -167,37 +170,37 @@ class PoseFeatureExtractor:
             reverse_perm = perm[::-1]
             if perm not in unique_permutations and reverse_perm not in unique_permutations:
                 unique_permutations.append(perm)
-        
+
         # Calculate angles for all combinations
         for i_p in range(len(unique_permutations)):
             for i_bp in range(len(bp_columns)):
                 i, j = unique_permutations[i_p]
                 k = i_bp
-                
+
                 if (i != k) and (j != k):  # Don't check angle from a point to itself
                     bp1name = bp_columns[i].replace("_x", "")
                     bp2name = bp_columns[j].replace("_x", "")
                     bp3name = bp_columns[k].replace("_x", "")
-                    
+
                     # Law of cosines: angle at point k
                     AC = (bp_xcord.iloc[:, i] - bp_xcord.iloc[:, k])**2 + (bp_ycord.iloc[:, i] - bp_ycord.iloc[:, k])**2
                     BC = (bp_xcord.iloc[:, j] - bp_xcord.iloc[:, k])**2 + (bp_ycord.iloc[:, j] - bp_ycord.iloc[:, k])**2
                     AB = (bp_xcord.iloc[:, i] - bp_xcord.iloc[:, j])**2 + (bp_ycord.iloc[:, i] - bp_ycord.iloc[:, j])**2
-                    
+
                     AC = np.sqrt(AC)
                     BC = np.sqrt(BC)
                     AB = np.sqrt(AB)
-                    
+
                     # Angle in degrees (safe: handle zero denominators and clamp for arccos)
                     denom = 2 * AC * BC
                     denom = denom.replace(0, np.nan)
                     cos_val = ((BC**2 + AC**2 - AB**2) / denom).clip(-1, 1)
                     AngleC = np.rad2deg(np.arccos(cos_val))
-                    
+
                     angle_column = f'Ang_{bp1name}-{bp3name}-{bp2name}'
-                    BP_angles = pd.concat([BP_angles, pd.DataFrame(AngleC, columns=[angle_column])], axis=1)
-        
-        return BP_angles
+                    angle_cols[angle_column] = AngleC.values
+
+        return pd.DataFrame(angle_cols, index=bp_xcord.index) if angle_cols else pd.DataFrame()
     
     def calculate_velocities(self, bp_xcord: pd.DataFrame, bp_ycord: pd.DataFrame, t: int = 1) -> pd.DataFrame:
         """
@@ -211,30 +214,32 @@ class PoseFeatureExtractor:
         Returns:
             DataFrame with velocity features
         """
-        BP_velocity = pd.DataFrame()
-        
+        vel_cols = {}
+
         for i in range(len(bp_xcord.columns)):
             diff_distances_x = bp_xcord.iloc[:, i].diff(periods=t)
             diff_distances_y = bp_ycord.iloc[:, i].diff(periods=t)
             distance = diff_distances_x ** 2 + diff_distances_y ** 2
             velocity = np.sqrt(distance) / np.abs(t)
-            velocity.name = bp_xcord.columns[i].replace("_x", "") + f'_Vel{t}'
-            BP_velocity = pd.concat([BP_velocity, velocity], axis=1)
-        
+            col_name = bp_xcord.columns[i].replace("_x", "") + f'_Vel{t}'
+            vel_cols[col_name] = velocity.values
+
+        BP_velocity = pd.DataFrame(vel_cols, index=bp_xcord.index)
+
         # Fill missing values and set velocities for first/last time points to zero
         BP_velocity.fillna(0, inplace=True)
         if t > 0:
             BP_velocity.iloc[:t, :] = 0
         elif t < 0:
             BP_velocity.iloc[t:, :] = 0
-        
+
         return BP_velocity
     
     def calculate_distance_velocities(self, bp_dist: pd.DataFrame, t: int = 1) -> pd.DataFrame:
         """
         Calculate rate of change of distances.
 """
-        bp_dist_vel = bp_dist.diff(periods=t)
+        bp_dist_vel = bp_dist.diff(periods=t).fillna(0)
         bp_dist_vel.columns = [col + "_Vel" + str(t) for col in bp_dist_vel.columns]
         return bp_dist_vel
     
@@ -336,7 +341,7 @@ class PoseFeatureExtractor:
         """
         w = bp_xcord.max(axis=1) - bp_xcord.min(axis=1)
         h = bp_ycord.max(axis=1) - bp_ycord.min(axis=1)
-        elongation = (w / h.replace(0, np.nan)).fillna(1)
+        elongation = (w / h.replace(0, np.nan)).fillna(0)
         elongation.name = 'body_elongation'
         return elongation.to_frame()
 
@@ -467,6 +472,482 @@ class PoseFeatureExtractor:
             return pd.DataFrame()
         return pd.concat(result_cols, axis=1)
 
+    # ------------------------------------------------------------------
+    # Flinch-discriminative features (v4)
+    # ------------------------------------------------------------------
+
+    def calculate_velocity_asymmetry(self, bp_xcord: pd.DataFrame,
+                                     bp_ycord: pd.DataFrame,
+                                     window: int = 30) -> pd.DataFrame:
+        """Ratio of peak upward velocity to mean downward velocity.
+
+        Flinches have fast-up / slow-down; stepping is symmetric.
+
+        Returns per body part:
+          {bp}_VelAsymmetry  — directional (Vy positive vs negative)
+          {bp}_RiseFallRatio — direction-agnostic speed peak/mean ratio
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vy = bp_ycord.iloc[:, i].diff(1).fillna(0)
+            speed = np.sqrt(bp_xcord.iloc[:, i].diff(1).fillna(0) ** 2 + vy ** 2)
+
+            # Directional asymmetry: max(positive Vy) / mean(|negative Vy|)
+            pos_vy = vy.clip(lower=0)
+            neg_vy_abs = (-vy).clip(lower=0)
+            roll_max_pos = pos_vy.rolling(window, min_periods=1).max()
+            roll_mean_neg = neg_vy_abs.rolling(window, min_periods=1).mean()
+            asym = roll_max_pos / (roll_mean_neg + 1e-6)
+            asym.name = f'{bp_name}_VelAsymmetry'
+            result_cols.append(asym)
+
+            # Direction-agnostic: rolling max / rolling mean of speed
+            roll_max_spd = speed.rolling(window, min_periods=1).max()
+            roll_mean_spd = speed.rolling(window, min_periods=1).mean()
+            rise_fall = roll_max_spd / (roll_mean_spd + 1e-6)
+            rise_fall.name = f'{bp_name}_RiseFallRatio'
+            result_cols.append(rise_fall)
+
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_peak_jerk(self, bp_xcord: pd.DataFrame,
+                            bp_ycord: pd.DataFrame,
+                            peak_window: int = 5,
+                            baseline_window: int = 30) -> pd.DataFrame:
+        """Peak jerk magnitude and peak-to-baseline ratio.
+
+        Flinch onset has much higher peak-to-baseline jerk than voluntary
+        movements.
+        """
+        jerk_df = self.calculate_jerk(bp_xcord, bp_ycord, t=1)
+        result_cols = []
+        for col in jerk_df.columns:
+            bp_name = col.replace('_Jerk1', '')
+            jerk_series = jerk_df[col]
+            peak = jerk_series.rolling(peak_window, center=True, min_periods=1).max()
+            peak.name = f'{bp_name}_JerkPeakW{peak_window}'
+            result_cols.append(peak)
+
+            baseline = jerk_series.rolling(baseline_window, min_periods=1).median()
+            ratio = peak / (baseline + 1e-6)
+            ratio.name = f'{bp_name}_JerkPeakRatio'
+            result_cols.append(ratio)
+
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_height_velocity(self, bp_ycord: pd.DataFrame,
+                                  window: int = 500) -> pd.DataFrame:
+        """First derivative of paw height at dt=1 and dt=2.
+
+        Captures the *rate* of height change — flinches produce sharp
+        height-velocity spikes that static paw height misses.
+        """
+        height_df = self.calculate_paw_height(
+            pd.DataFrame(),  # bp_xcord not used by paw_height
+            bp_ycord, window=window)
+        if height_df.empty:
+            return pd.DataFrame()
+
+        result_cols = []
+        for col in height_df.columns:
+            bp_name = col.replace('_Height', '')
+            for dt in (1, 2):
+                hv = height_df[col].diff(dt).fillna(0)
+                hv.name = f'{bp_name}_HeightVel{dt}'
+                result_cols.append(hv)
+
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_vy_dominance(self, bp_xcord: pd.DataFrame,
+                               bp_ycord: pd.DataFrame,
+                               t: int = 1) -> pd.DataFrame:
+        """Fraction of motion that is vertical: |Vy| / (|Vx| + |Vy| + eps).
+
+        Flinches are primarily vertical; grooming/locomotion have horizontal
+        components.
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(t).fillna(0).abs()
+            vy = bp_ycord.iloc[:, i].diff(t).fillna(0).abs()
+            dom = vy / (vx + vy + 1e-6)
+            dom.name = f'{bp_name}_VyDominance'
+            result_cols.append(dom)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_acceleration_std(self, bp_xcord: pd.DataFrame,
+                                   bp_ycord: pd.DataFrame,
+                                   t: int = 1,
+                                   window: int = 5) -> pd.DataFrame:
+        """Rolling std of acceleration over a short window.
+
+        Flinches produce sharp acceleration spikes = high local std.
+        """
+        accel_df = self.calculate_acceleration(bp_xcord, bp_ycord, t=t)
+        if accel_df.empty:
+            return pd.DataFrame()
+
+        result_cols = []
+        for col in accel_df.columns:
+            bp_name = col.replace(f'_Accel{t}', '')
+            astd = accel_df[col].rolling(window, center=True, min_periods=1).std().fillna(0)
+            astd.name = f'{bp_name}_AccelStdW{window}'
+            result_cols.append(astd)
+
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    def calculate_contralateral_velocity_corr(self, bp_xcord: pd.DataFrame,
+                                              bp_ycord: pd.DataFrame,
+                                              window: int = 15) -> pd.DataFrame:
+        """Rolling Pearson correlation of left vs right paw velocity.
+
+        Low correlation = unilateral movement (flinch); high = bilateral
+        (walking).  Reuses the LEFT_RIGHT_PATTERNS from bilateral asymmetry.
+        """
+        bp_names = [col.replace('_x', '') for col in bp_xcord.columns]
+        bp_name_set = set(bp_names)
+
+        LEFT_RIGHT_PATTERNS = [
+            ('left', 'right'), ('Left', 'Right'),
+            ('hl', 'hr'), ('fl', 'fr'), ('l', 'r'),
+        ]
+
+        pairs = []
+        seen: set = set()
+        for bp in bp_names:
+            if bp in seen:
+                continue
+            for left_pat, right_pat in LEFT_RIGHT_PATTERNS:
+                if bp.startswith(left_pat):
+                    candidate = right_pat + bp[len(left_pat):]
+                    if candidate in bp_name_set and candidate not in seen:
+                        pairs.append((bp, candidate))
+                        seen.update({bp, candidate})
+                        break
+                elif bp.startswith(right_pat):
+                    candidate = left_pat + bp[len(right_pat):]
+                    if candidate in bp_name_set and candidate not in seen:
+                        pairs.append((candidate, bp))
+                        seen.update({bp, candidate})
+                        break
+
+        if not pairs:
+            return pd.DataFrame()
+
+        # Compute velocity magnitude for each body part
+        vel_map = {}
+        for i, col in enumerate(bp_xcord.columns):
+            bp_name = col.replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(1).fillna(0)
+            vy = bp_ycord.iloc[:, i].diff(1).fillna(0)
+            vel_map[bp_name] = np.sqrt(vx ** 2 + vy ** 2)
+
+        result_cols = []
+        for left_bp, right_bp in pairs:
+            left_vel = vel_map.get(left_bp)
+            right_vel = vel_map.get(right_bp)
+            if left_vel is None or right_vel is None:
+                continue
+            corr = left_vel.rolling(window, min_periods=3).corr(right_vel).fillna(0)
+            corr.name = f'{left_bp}-{right_bp}_VelCorr'
+            result_cols.append(corr)
+
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1)
+
+    # ------------------------------------------------------------------
+    # Temporal-context features (v5) — general-purpose
+    # ------------------------------------------------------------------
+    # These plug gaps in v4: "what was the paw doing just *before* the spike",
+    # "is motion upward or downward", "how sharp is the onset", and
+    # "is there high-frequency wiggle energy".  Despite being motivated by
+    # flinch detection, they're useful for any brief/directional event.
+
+    def calculate_pre_event_quiescence(self, bp_xcord: pd.DataFrame,
+                                       bp_ycord: pd.DataFrame,
+                                       lookback: int = 20,
+                                       spike_window: int = 5) -> pd.DataFrame:
+        """Inverse rolling variance of position in the window *preceding* each frame.
+
+        Captures "explosive from stillness" — the defining flinch signature
+        (nothing in v4 represents this).  High values = paw was still in the
+        `lookback` frames leading up to `spike_window` frames before now.
+
+        Returns one column per body part: `{bp}_PreQuiescence`.
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            pos_var = (bp_xcord.iloc[:, i].rolling(lookback, min_periods=3).var()
+                       + bp_ycord.iloc[:, i].rolling(lookback, min_periods=3).var())
+            # Shift so variance is measured over [t - (lookback+spike_window), t - spike_window]
+            pre_var = pos_var.shift(spike_window)
+            # Reciprocal so stillness → HIGH value (better for tree splits targeting flinches)
+            pre_q = 1.0 / (pre_var + 1e-3)
+            pre_q.name = f'{bp_name}_PreQuiescence'
+            result_cols.append(pre_q)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_signed_jerk_y(self, bp_xcord: pd.DataFrame,
+                                bp_ycord: pd.DataFrame,
+                                t: int = 1) -> pd.DataFrame:
+        """Signed vertical jerk — sign preserved (unlike `calculate_jerk` magnitude).
+
+        Image y grows downward, so we negate so that POSITIVE = upward motion
+        (the flinch direction).  Tree splits can discriminate directional
+        events that the magnitude jerk blurs together.
+
+        Returns one column per body part: `{bp}_Jy_signed`.
+        """
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vy = bp_ycord.iloc[:, i].diff(t)
+            ay = vy.diff(t)
+            jy = -ay.diff(t)   # negate: up (decreasing y) → positive
+            jy.name = f'{bp_name}_Jy_signed'
+            result_cols.append(jy)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_onset_sharpness(self, bp_xcord: pd.DataFrame,
+                                  bp_ycord: pd.DataFrame,
+                                  peak_window: int = 5) -> pd.DataFrame:
+        """Rolling ratio: peak speed / (distance of peak from window center + 1).
+
+        Flinches peak sharply at the window center (short time-to-peak);
+        locomotion has smeared peaks.  Captures the time-axis of onset that
+        v4's JerkPeakRatio misses.
+
+        Returns one column per body part: `{bp}_OnsetSharpness`.
+        """
+        width = 2 * peak_window + 1
+
+        def _onset(arr):
+            if arr.size < 2:
+                return 0.0
+            peak = arr.max()
+            if peak <= 0:
+                return 0.0
+            offset = abs(int(np.argmax(arr)) - (arr.size // 2))
+            return peak / (offset + 1.0)
+
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            vx = bp_xcord.iloc[:, i].diff(1).fillna(0)
+            vy = bp_ycord.iloc[:, i].diff(1).fillna(0)
+            speed = np.sqrt(vx ** 2 + vy ** 2)
+            onset = speed.rolling(width, center=True, min_periods=1).apply(_onset, raw=True)
+            onset.name = f'{bp_name}_OnsetSharpness'
+            result_cols.append(onset)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_hf_energy(self, bp_xcord: pd.DataFrame,
+                            bp_ycord: pd.DataFrame,
+                            window: int = 10) -> pd.DataFrame:
+        """High-frequency energy proxy per body part.
+
+        Uses a 2nd-order Butterworth high-pass at normalized frequency 0.5
+        (~10 Hz at 20 fps, higher at higher fps) then rolling RMS over
+        `window` frames.  Falls back to d²-position (second difference) when
+        scipy.signal is not available.
+
+        Captures the spectral "wiggle" signature that low-order velocity /
+        accel / jerk miss.  Useful for flinches (broadband HF) and grooming
+        (sustained HF) — let gain pruning decide per-behavior.
+
+        Returns one column per body part: `{bp}_HFEnergy`.
+        """
+        try:
+            from scipy.signal import butter, filtfilt
+            b, a = butter(2, 0.5, btype='highpass')
+            _use_butter = True
+        except Exception:
+            _use_butter = False
+
+        result_cols = []
+        for i in range(len(bp_xcord.columns)):
+            bp_name = bp_xcord.columns[i].replace('_x', '')
+            x = bp_xcord.iloc[:, i].ffill().bfill().fillna(0).values
+            y = bp_ycord.iloc[:, i].ffill().bfill().fillna(0).values
+            if _use_butter and len(x) > 20:
+                try:
+                    x_hf = filtfilt(b, a, x)
+                    y_hf = filtfilt(b, a, y)
+                except Exception:
+                    x_hf = np.diff(np.diff(x, prepend=x[0]), prepend=0)
+                    y_hf = np.diff(np.diff(y, prepend=y[0]), prepend=0)
+            else:
+                x_hf = np.diff(np.diff(x, prepend=x[0]), prepend=0)
+                y_hf = np.diff(np.diff(y, prepend=y[0]), prepend=0)
+            energy = pd.Series(np.sqrt(x_hf ** 2 + y_hf ** 2))
+            energy = energy.rolling(window, min_periods=1).mean()
+            energy.name = f'{bp_name}_HFEnergy'
+            result_cols.append(energy)
+        if not result_cols:
+            return pd.DataFrame()
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_contact_features(self, height_df: pd.DataFrame,
+                                    contact_threshold: float = None,
+                                    window: int = 30) -> pd.DataFrame:
+        """Derive binary contact state from Height columns.
+
+        Returns per body part:
+          {bp}_ContactState      — 1 if Height < threshold, else 0
+          {bp}_ContactTransition — diff of ContactState (+1 = foot strike, -1 = toe off)
+          {bp}_DutyCycle         — rolling mean of ContactState over *window* frames
+        Plus one global column:
+          N_InContact            — sum of ContactState across all body parts
+        """
+        if contact_threshold is None:
+            contact_threshold = self.contact_threshold
+        height_cols = [c for c in height_df.columns if c.endswith('_Height')]
+        if not height_cols:
+            return pd.DataFrame()
+
+        result_cols = []
+        contact_states = []
+        for col in height_cols:
+            bp_name = col.replace('_Height', '')
+            state = (height_df[col] < contact_threshold).astype(int)
+            state.name = f'{bp_name}_ContactState'
+            contact_states.append(state)
+            result_cols.append(state)
+
+            transition = state.diff().fillna(0).astype(int)
+            transition.name = f'{bp_name}_ContactTransition'
+            result_cols.append(transition)
+
+            duty = state.rolling(window, min_periods=1).mean()
+            duty.name = f'{bp_name}_DutyCycle'
+            result_cols.append(duty)
+
+        n_in_contact = pd.concat(contact_states, axis=1).sum(axis=1)
+        n_in_contact.name = 'N_InContact'
+        result_cols.append(n_in_contact)
+
+        return pd.concat(result_cols, axis=1).fillna(0)
+
+    def calculate_lag_features(self, feature_df: pd.DataFrame,
+                               lags: tuple = (-2, -1, 1, 2),
+                               top_n: int = 10,
+                               shap_importance: pd.Series = None) -> pd.DataFrame:
+        """Add time-shifted copies of top features.
+
+        If shap_importance is provided, selects top_n features by importance.
+        Otherwise, selects the top_n highest-variance features.
+        Lags are in frames: negative = past, positive = future.
+        """
+        if shap_importance is not None:
+            cols = shap_importance.nlargest(top_n).index.tolist()
+            cols = [c for c in cols if c in feature_df.columns]
+        else:
+            variances = feature_df.var().nlargest(top_n)
+            cols = variances.index.tolist()
+
+        lag_dfs = []
+        for lag in lags:
+            shifted = feature_df[cols].shift(lag).fillna(0)
+            sign = f"m{abs(lag)}" if lag < 0 else f"p{lag}"
+            shifted.columns = [f"{c}_lag{sign}" for c in cols]
+            lag_dfs.append(shifted)
+        if not lag_dfs:
+            return pd.DataFrame()
+        return pd.concat(lag_dfs, axis=1)
+
+    def normalize_egocentric(self, bp_xcord: pd.DataFrame,
+                             bp_ycord: pd.DataFrame,
+                             reference_bp: str = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Subtract a reference body part's position from all others.
+
+        If reference_bp is None, uses the centroid of all body parts.
+        Returns normalized (bp_xcord, bp_ycord) DataFrames.
+        """
+        if reference_bp:
+            ref_x_col = f'{reference_bp}_x'
+            ref_y_col = f'{reference_bp}_y'
+            if ref_x_col in bp_xcord.columns and ref_y_col in bp_ycord.columns:
+                ref_x = bp_xcord[ref_x_col]
+                ref_y = bp_ycord[ref_y_col]
+            else:
+                ref_x = bp_xcord.mean(axis=1)
+                ref_y = bp_ycord.mean(axis=1)
+        else:
+            ref_x = bp_xcord.mean(axis=1)
+            ref_y = bp_ycord.mean(axis=1)
+
+        norm_x = bp_xcord.subtract(ref_x, axis=0)
+        norm_y = bp_ycord.subtract(ref_y, axis=0)
+        return norm_x, norm_y
+
+    def extract_v4_features_only(self, dlc_file: str) -> pd.DataFrame:
+        """Compute only v4-new flinch features (no brightness, no video needed).
+
+        Used for incremental cache upgrades — requires only the DLC file.
+        """
+        dlc_df = self.load_dlc_data(dlc_file)
+        bp_xcord, bp_ycord, bp_prob = self.get_bodypart_coords(dlc_df)
+        feature_dfs = []
+        for fn in [self.calculate_velocity_asymmetry,
+                   self.calculate_peak_jerk,
+                   self.calculate_vy_dominance,
+                   self.calculate_acceleration_std]:
+            result = fn(bp_xcord, bp_ycord)
+            if result is not None and not result.empty:
+                feature_dfs.append(result)
+        # Height velocity
+        height_vel = self.calculate_height_velocity(bp_ycord)
+        if height_vel is not None and not height_vel.empty:
+            feature_dfs.append(height_vel)
+        # Contralateral correlation
+        contra = self.calculate_contralateral_velocity_corr(bp_xcord, bp_ycord)
+        if contra is not None and not contra.empty:
+            feature_dfs.append(contra)
+        if not feature_dfs:
+            return pd.DataFrame()
+        return pd.concat(feature_dfs, axis=1).fillna(0)
+
+    def extract_v5_features_only(self, dlc_file: str) -> pd.DataFrame:
+        """Compute only v5-new temporal-context features (no brightness, no video needed).
+
+        Used for incremental cache upgrades — requires only the DLC file.
+        Returns the four v5 columns per body part: PreQuiescence, Jy_signed,
+        OnsetSharpness, HFEnergy.
+        """
+        dlc_df = self.load_dlc_data(dlc_file)
+        bp_xcord, bp_ycord, bp_prob = self.get_bodypart_coords(dlc_df)
+        feature_dfs = []
+        for fn in [self.calculate_pre_event_quiescence,
+                   self.calculate_signed_jerk_y,
+                   self.calculate_onset_sharpness,
+                   self.calculate_hf_energy]:
+            result = fn(bp_xcord, bp_ycord)
+            if result is not None and not result.empty:
+                feature_dfs.append(result)
+        if not feature_dfs:
+            return pd.DataFrame()
+        return pd.concat(feature_dfs, axis=1).fillna(0)
+
     def extract_new_kinematics_only(self, dlc_file: str) -> pd.DataFrame:
         """Compute only v3-new kinematic features (no brightness, no video needed).
 
@@ -493,7 +974,10 @@ class PoseFeatureExtractor:
                            include_distance_velocities: bool = True,
                            include_in_frame: bool = True,
                            include_new_pose: bool = True,
-                           include_new_kinematics: bool = True) -> pd.DataFrame:
+                           include_new_kinematics: bool = True,
+                           include_flinch_features: bool = True,
+                           include_temporal_context_features: bool = True,
+                           include_lag_features: bool = False) -> pd.DataFrame:
         """
         Extract all pose features from DLC file.
 
@@ -520,7 +1004,7 @@ class PoseFeatureExtractor:
         
         # Calculate distances
         bp_distances = self.calculate_distances(bp_xcord, bp_ycord)
-        
+
         # Initialize feature list - only add distances if not empty
         feature_dfs = []
         if not bp_distances.empty:
@@ -595,17 +1079,50 @@ class PoseFeatureExtractor:
             if not rolling_stats.empty:
                 feature_dfs.append(rolling_stats)
 
+        # Flinch-discriminative features (v4)
+        if include_flinch_features:
+            for fn in [self.calculate_velocity_asymmetry,
+                       self.calculate_peak_jerk,
+                       self.calculate_vy_dominance,
+                       self.calculate_acceleration_std]:
+                result = fn(bp_xcord, bp_ycord)
+                if result is not None and not result.empty:
+                    feature_dfs.append(result)
+            # Height velocity (depends on paw height)
+            height_vel = self.calculate_height_velocity(bp_ycord)
+            if height_vel is not None and not height_vel.empty:
+                feature_dfs.append(height_vel)
+            # Contralateral correlation
+            contra = self.calculate_contralateral_velocity_corr(bp_xcord, bp_ycord)
+            if contra is not None and not contra.empty:
+                feature_dfs.append(contra)
+
+        # v5 temporal-context features — general-purpose (not flinch-only)
+        if include_temporal_context_features:
+            for fn in [self.calculate_pre_event_quiescence,
+                       self.calculate_signed_jerk_y,
+                       self.calculate_onset_sharpness,
+                       self.calculate_hf_energy]:
+                result = fn(bp_xcord, bp_ycord)
+                if result is not None and not result.empty:
+                    feature_dfs.append(result)
+
         # Check if we have any features
         if not feature_dfs:
             raise ValueError("No features could be extracted. Check that your DLC file has valid body part data.")
 
-        
         # Combine all features
         X = pd.concat(feature_dfs, axis=1)
-        
+
+        # Lag/lead features (computed post-concat so variance ranking is global)
+        if include_lag_features:
+            lag_df = self.calculate_lag_features(X, lags=(-2, -1, 1, 2), top_n=10)
+            if not lag_df.empty:
+                X = pd.concat([X, lag_df], axis=1)
+
         # Fill NaN values
         X = X.fillna(0)
-        
+
         return X
 
 

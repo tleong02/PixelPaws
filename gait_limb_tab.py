@@ -45,6 +45,7 @@ import os
 import re
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
@@ -75,6 +76,9 @@ except ImportError:
 from pose_features import PoseFeatureExtractor
 from brightness_features import PixelBrightnessExtractorOptimized
 
+from ui_utils import (ToolTip as _ToolTip,
+                      _bind_tight_layout_on_resize, _draw_canvas_fit)
+
 try:
     from evaluation_tab import find_session_triplets
 except ImportError:
@@ -85,33 +89,6 @@ try:
     from PixelPaws_GUI import extract_subject_id_from_filename as _extract_sid
 except ImportError:
     _extract_sid = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lightweight tooltip (same pattern as unsupervised_tab)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _ToolTip:
-    def __init__(self, widget, text):
-        self._tip = None
-        widget.bind('<Enter>', lambda e: self._show(widget, text))
-        widget.bind('<Leave>', lambda e: self._hide())
-
-    def _show(self, widget, text):
-        x = widget.winfo_rootx() + 20
-        y = widget.winfo_rooty() + widget.winfo_height() + 4
-        self._tip = tk.Toplevel(widget)
-        self._tip.wm_overrideredirect(True)
-        self._tip.wm_geometry(f'+{x}+{y}')
-        tk.Label(self._tip, text=text, background='#ffffcc',
-                 relief='solid', borderwidth=1,
-                 font=('Arial', 9), wraplength=320,
-                 justify='left').pack(ipadx=4, ipady=2)
-
-    def _hide(self):
-        if self._tip:
-            self._tip.destroy()
-            self._tip = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +121,34 @@ def _draw_bracket(ax, x1: int, x2: int, y: float, label: str):
             ha='center', va='bottom', fontsize=12, fontweight='bold')
 
 
+def _autofit_treeview_window(win, tree):
+    """Resize *win* so all columns of *tree* are visible, including bottom widgets.
+
+    Must be called AFTER all widgets (buttons, notes) are packed.
+    """
+    win.update_idletasks()
+    style_font = ttk.Style().lookup('Treeview', 'font') or 'TkDefaultFont'
+    font = tkfont.nametofont(style_font)
+    total_w = 0
+    for col in tree['columns']:
+        hdr_w = font.measure(tree.heading(col, 'text')) + 24
+        max_cell = hdr_w
+        for iid in tree.get_children():
+            val = str(tree.set(iid, col))
+            max_cell = max(max_cell, font.measure(val) + 24)
+        tree.column(col, width=max_cell)
+        total_w += max_cell
+    total_w += 40  # scrollbar + frame padding
+    # Let tkinter compute required height from ALL packed widgets
+    win.update_idletasks()
+    req_h = win.winfo_reqheight()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w = min(total_w, int(sw * 0.9))
+    h = min(max(req_h, 300), int(sh * 0.9))
+    x, y = (sw - w) // 2, (sh - h) // 2
+    win.geometry(f'{w}x{h}+{x}+{y}')
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GaitLimbTab
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +175,7 @@ class GaitLimbTab(ttk.Frame):
         self._key_scan_paths: list = []
         self._summary_df: pd.DataFrame = None
         self._bins_df: pd.DataFrame = None
-        self._enable_stats_var       = tk.BooleanVar(value=False)
+        self._enable_stats_var       = tk.BooleanVar(value=True)
         self._stats_test_var         = tk.StringVar(value='auto')
         self._stats_alpha_var        = tk.DoubleVar(value=0.05)
         self._timecourse_posthoc_var = tk.BooleanVar(value=False)
@@ -730,18 +735,19 @@ class GaitLimbTab(ttk.Frame):
         # --- build window ---
         win = tk.Toplevel(self)
         win.title(f"Locomotion Preview — {sess['session_name']}")
-        win.geometry("980x700")
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = int(sw * 0.55), int(sh * 0.60)
+        win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-        canvas = tk.Canvas(win, bg='black', width=680, height=520)
-        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
-
-        # Scrollable ctrl panel
+        # Scrollable ctrl panel — pack FIRST so it gets priority for space
         ctrl_outer = ttk.Frame(win)
-        ctrl_outer.pack(side='right', fill='y', padx=6, pady=6)
-        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=220)
-        ctrl_sb = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
-        ctrl_canvas.configure(yscrollcommand=ctrl_sb.set)
-        ctrl_sb.pack(side='right', fill='y')
+        ctrl_outer.pack(side='right', fill='both', padx=6, pady=6)
+        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=300)
+        ctrl_sb_y = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
+        ctrl_sb_x = ttk.Scrollbar(ctrl_outer, orient='horizontal', command=ctrl_canvas.xview)
+        ctrl_canvas.configure(yscrollcommand=ctrl_sb_y.set, xscrollcommand=ctrl_sb_x.set)
+        ctrl_sb_x.pack(side='bottom', fill='x')
+        ctrl_sb_y.pack(side='right', fill='y')
         ctrl_canvas.pack(side='left', fill='both', expand=True)
         ctrl = ttk.Frame(ctrl_canvas)
         ctrl_win_id = ctrl_canvas.create_window((0, 0), window=ctrl, anchor='nw')
@@ -749,6 +755,10 @@ class GaitLimbTab(ttk.Frame):
                   lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all')))
         ctrl_canvas.bind('<Configure>',
                          lambda e: ctrl_canvas.itemconfig(ctrl_win_id, width=e.width))
+
+        # Video canvas — packed after ctrl so it fills remaining space
+        canvas = tk.Canvas(win, bg='black', width=480, height=380)
+        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
 
         # Frame slider
         ttk.Label(ctrl, text="Frame:").pack(anchor='w')
@@ -787,15 +797,15 @@ class GaitLimbTab(ttk.Frame):
         # Summary stats label
         ttk.Separator(ctrl, orient='horizontal').pack(fill='x', pady=4)
         ttk.Label(ctrl, text="Summary:", font=('Arial', 9, 'bold')).pack(anchor='w')
-        summary_lbl = ttk.Label(ctrl, text="", wraplength=200, justify='left')
+        summary_lbl = ttk.Label(ctrl, text="", wraplength=270, justify='left')
         summary_lbl.pack(anchor='w', pady=(2, 6))
 
         # Current frame readout
         ttk.Separator(ctrl, orient='horizontal').pack(fill='x', pady=4)
         ttk.Label(ctrl, text="Current frame:", font=('Arial', 9, 'bold')).pack(anchor='w')
-        frame_speed_lbl = ttk.Label(ctrl, text="Speed: — px/s", wraplength=200)
+        frame_speed_lbl = ttk.Label(ctrl, text="Speed: — px/s", wraplength=270)
         frame_speed_lbl.pack(anchor='w')
-        frame_state_lbl = ttk.Label(ctrl, text="State: —", wraplength=200)
+        frame_state_lbl = ttk.Label(ctrl, text="State: —", wraplength=270)
         frame_state_lbl.pack(anchor='w', pady=(0, 6))
 
         # Apply button
@@ -969,7 +979,7 @@ class GaitLimbTab(ttk.Frame):
             cw = canvas.winfo_width()  or 680
             ch = canvas.winfo_height() or 520
             vh, vw = vis.shape[:2]
-            scale = min(cw / vw, ch / vh, 1.0)
+            scale = min(cw / vw, ch / vh)
             nw, nh = int(vw * scale), int(vh * scale)
             vis_small = cv2.resize(vis, (nw, nh))
             rgb = cv2.cvtColor(vis_small, cv2.COLOR_BGR2RGB)
@@ -1087,19 +1097,20 @@ class GaitLimbTab(ttk.Frame):
         # --- build window ---
         win = tk.Toplevel(self)
         win.title(f"Brightness Preview — {sess['session_name']}")
-        win.geometry("980x700")
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = int(sw * 0.55), int(sh * 0.60)
+        win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
         win.protocol('WM_DELETE_WINDOW', lambda: (cap.release(), win.destroy()))
 
-        canvas = tk.Canvas(win, bg='black', width=680, height=520)
-        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
-
-        # Scrollable ctrl panel
+        # Scrollable ctrl panel — pack FIRST so it gets priority for space
         ctrl_outer = ttk.Frame(win)
-        ctrl_outer.pack(side='right', fill='y', padx=6, pady=6)
-        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=180)
-        ctrl_sb = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
-        ctrl_canvas.configure(yscrollcommand=ctrl_sb.set)
-        ctrl_sb.pack(side='right', fill='y')
+        ctrl_outer.pack(side='right', fill='both', padx=6, pady=6)
+        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=300)
+        ctrl_sb_y = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
+        ctrl_sb_x = ttk.Scrollbar(ctrl_outer, orient='horizontal', command=ctrl_canvas.xview)
+        ctrl_canvas.configure(yscrollcommand=ctrl_sb_y.set, xscrollcommand=ctrl_sb_x.set)
+        ctrl_sb_x.pack(side='bottom', fill='x')
+        ctrl_sb_y.pack(side='right', fill='y')
         ctrl_canvas.pack(side='left', fill='both', expand=True)
         ctrl = ttk.Frame(ctrl_canvas)
         ctrl_win_id = ctrl_canvas.create_window((0, 0), window=ctrl, anchor='nw')
@@ -1107,6 +1118,10 @@ class GaitLimbTab(ttk.Frame):
                   lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all')))
         ctrl_canvas.bind('<Configure>',
                          lambda e: ctrl_canvas.itemconfig(ctrl_win_id, width=e.width))
+
+        # Video canvas — packed after ctrl so it fills remaining space
+        canvas = tk.Canvas(win, bg='black', width=480, height=380)
+        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
 
         # Frame slider
         ttk.Label(ctrl, text="Frame:").pack(anchor='w')
@@ -1169,12 +1184,12 @@ class GaitLimbTab(ttk.Frame):
         ttk.Label(ctrl, text="Paw readouts:").pack(anchor='w')
         paw_labels = {}
         for role, bp in active_paws.items():
-            lbl = ttk.Label(ctrl, text=f"{role} ({bp}): —", wraplength=170)
+            lbl = ttk.Label(ctrl, text=f"{role} ({bp}): —", wraplength=270)
             lbl.pack(anchor='w')
             paw_labels[role] = lbl
 
         # Auto-detect brightness label
-        auto_lbl = ttk.Label(ctrl, text='', foreground='grey', wraplength=170)
+        auto_lbl = ttk.Label(ctrl, text='', foreground='grey', wraplength=270)
         auto_lbl.pack(anchor='w', pady=(4, 0))
 
         # "Apply all to main settings" button
@@ -1317,7 +1332,7 @@ class GaitLimbTab(ttk.Frame):
             cw = canvas.winfo_width()  or 680
             ch = canvas.winfo_height() or 520
             vh, vw = vis.shape[:2]
-            scale = min(cw / vw, ch / vh, 1.0)
+            scale = min(cw / vw, ch / vh)
             nw, nh = int(vw * scale), int(vh * scale)
             vis_small = cv2.resize(vis, (nw, nh))
             rgb = cv2.cvtColor(vis_small, cv2.COLOR_BGR2RGB)
@@ -1399,19 +1414,20 @@ class GaitLimbTab(ttk.Frame):
         # --- build window ---
         win = tk.Toplevel(self)
         win.title(f"Contour Preview \u2014 {sess['session_name']}")
-        win.geometry("980x700")
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = int(sw * 0.55), int(sh * 0.60)
+        win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
         win.protocol('WM_DELETE_WINDOW', lambda: (cap.release(), win.destroy()))
 
-        canvas = tk.Canvas(win, bg='black', width=680, height=520)
-        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
-
-        # Scrollable ctrl panel
+        # Scrollable ctrl panel — pack FIRST so it gets priority for space
         ctrl_outer = ttk.Frame(win)
-        ctrl_outer.pack(side='right', fill='y', padx=6, pady=6)
-        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=180)
-        ctrl_sb = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
-        ctrl_canvas.configure(yscrollcommand=ctrl_sb.set)
-        ctrl_sb.pack(side='right', fill='y')
+        ctrl_outer.pack(side='right', fill='both', padx=6, pady=6)
+        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0, width=300)
+        ctrl_sb_y = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
+        ctrl_sb_x = ttk.Scrollbar(ctrl_outer, orient='horizontal', command=ctrl_canvas.xview)
+        ctrl_canvas.configure(yscrollcommand=ctrl_sb_y.set, xscrollcommand=ctrl_sb_x.set)
+        ctrl_sb_x.pack(side='bottom', fill='x')
+        ctrl_sb_y.pack(side='right', fill='y')
         ctrl_canvas.pack(side='left', fill='both', expand=True)
         ctrl = ttk.Frame(ctrl_canvas)
         ctrl_win_id = ctrl_canvas.create_window((0, 0), window=ctrl, anchor='nw')
@@ -1419,6 +1435,10 @@ class GaitLimbTab(ttk.Frame):
                   lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all')))
         ctrl_canvas.bind('<Configure>',
                          lambda e: ctrl_canvas.itemconfig(ctrl_win_id, width=e.width))
+
+        # Video canvas — packed after ctrl so it fills remaining space
+        canvas = tk.Canvas(win, bg='black', width=480, height=380)
+        canvas.pack(side='left', fill='both', expand=True, padx=4, pady=4)
 
         # Frame slider
         ttk.Label(ctrl, text="Frame:").pack(anchor='w')
@@ -1487,7 +1507,7 @@ class GaitLimbTab(ttk.Frame):
         ttk.Label(ctrl, text="Paw readouts:").pack(anchor='w')
         paw_labels = {}
         for role, bp in active_paws.items():
-            lbl = ttk.Label(ctrl, text=f"{role} ({bp}): \u2014", wraplength=170)
+            lbl = ttk.Label(ctrl, text=f"{role} ({bp}): \u2014", wraplength=270)
             lbl.pack(anchor='w')
             paw_labels[role] = lbl
 
@@ -1646,7 +1666,7 @@ class GaitLimbTab(ttk.Frame):
             cw = canvas.winfo_width()  or 680
             ch = canvas.winfo_height() or 520
             vh, vw = vis.shape[:2]
-            scale = min(cw / vw, ch / vh, 1.0)
+            scale = min(cw / vw, ch / vh)
             nw, nh = int(vw * scale), int(vh * scale)
             vis_small = cv2.resize(vis, (nw, nh))
             rgb = cv2.cvtColor(vis_small, cv2.COLOR_BGR2RGB)
@@ -1729,7 +1749,6 @@ class GaitLimbTab(ttk.Frame):
         # ── Build dialog ─────────────────────────────────────────────────────
         win = tk.Toplevel(self)
         win.title("Cached Brightness Files")
-        win.geometry("820x420")
         win.resizable(True, True)
 
         if not found:
@@ -1972,6 +1991,7 @@ class GaitLimbTab(ttk.Frame):
         ttk.Button(btn_row, text="Analyze with Current Settings",
                    command=_analyze_current).pack(side='left', padx=6)
         ttk.Button(btn_row, text="Close", command=win.destroy).pack(side='left', padx=6)
+        _autofit_treeview_window(win, tree)
 
     def _detect_contour_caches(self):
         import json, glob as _glob
@@ -2030,7 +2050,6 @@ class GaitLimbTab(ttk.Frame):
         # ── Build dialog ─────────────────────────────────────────────────────
         win = tk.Toplevel(self)
         win.title("Cached Contour Files")
-        win.geometry("780x420")
         win.resizable(True, True)
 
         if not found:
@@ -2246,6 +2265,7 @@ class GaitLimbTab(ttk.Frame):
         ttk.Button(btn_row, text="Analyze with Current Settings",
                    command=_analyze_current).pack(side='left', padx=6)
         ttk.Button(btn_row, text="Close", command=win.destroy).pack(side='left', padx=6)
+        _autofit_treeview_window(win, tree)
 
     # ── Detect both caches (brightness + contour) ──────────────────────────
 
@@ -2311,7 +2331,6 @@ class GaitLimbTab(ttk.Frame):
         # ── Build dialog ──────────────────────────────────────────────────
         win = tk.Toplevel(self)
         win.title("Cached Brightness + Contour Files")
-        win.geometry("950x460")
         win.resizable(True, True)
 
         if not per_session:
@@ -2546,6 +2565,7 @@ class GaitLimbTab(ttk.Frame):
         ttk.Button(btn_row, text="Analyze with Current Settings",
                    command=_analyze_current).pack(side='left', padx=6)
         ttk.Button(btn_row, text="Close", command=win.destroy).pack(side='left', padx=6)
+        _autofit_treeview_window(win, tree)
 
     # ── Right: Results ───────────────────────────────────────────────────────
 
@@ -5647,7 +5667,13 @@ class GaitLimbTab(ttk.Frame):
 
         win = tk.Toplevel(self)
         win.title("Gait & Limb Use — Bin Graphs")
-        win.geometry("960x680")
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        gw = int(sw * 0.75)
+        gh = int(sh * 0.82)
+        gx = (sw - gw) // 2
+        gy = (sh - gh) // 2
+        win.geometry(f"{gw}x{gh}+{gx}+{gy}")
 
         desc_lbl = ttk.Label(win, text='', wraplength=940, foreground='#444',
                              font=('Arial', 9, 'italic'), padding=(6, 2))
@@ -5896,7 +5922,7 @@ class GaitLimbTab(ttk.Frame):
             messagebox.showinfo("No data", "Run analysis first.", parent=self)
             return
 
-        df = self._summary_df.copy()
+        df = self._summary_df
 
         # ── Settings dialog ───────────────────────────────────────────────
         treatments = []
@@ -5918,7 +5944,13 @@ class GaitLimbTab(ttk.Frame):
 
         win = tk.Toplevel(self)
         win.title("Gait & Limb Use Graphs")
-        win.geometry("960x680")
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        gw = int(sw * 0.75)
+        gh = int(sh * 0.82)
+        gx = (sw - gw) // 2
+        gy = (sh - gh) // 2
+        win.geometry(f"{gw}x{gh}+{gx}+{gy}")
 
         desc_lbl = ttk.Label(win, text='', wraplength=940, foreground='#444',
                              font=('Arial', 9, 'italic'), padding=(6, 2))
@@ -5926,6 +5958,23 @@ class GaitLimbTab(ttk.Frame):
 
         outer_nb = ttk.Notebook(win)
         outer_nb.pack(fill='both', expand=True, padx=6, pady=6)
+
+        def _close_figures_recursive(widget):
+            fig_obj = getattr(widget, 'figure', None)
+            if fig_obj is not None:
+                try:
+                    plt.close(fig_obj)
+                except Exception:
+                    pass
+            for child in getattr(widget, 'winfo_children', lambda: [])():
+                _close_figures_recursive(child)
+
+        def _on_graph_win_close():
+            for widget in win.winfo_children():
+                _close_figures_recursive(widget)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_graph_win_close)
 
         _tab_descs = {}
 
@@ -6097,7 +6146,7 @@ class GaitLimbTab(ttk.Frame):
                              reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
                              description=desc)
             if hind_sel['registry']:
-                hind_sel['show'](0)
+                win.after_idle(lambda _s=hind_sel: _s['show'](0))
 
         # ── Fore Paw ──────────────────────────────────────────────────────
         if fore_sel is not None:
@@ -6137,7 +6186,12 @@ class GaitLimbTab(ttk.Frame):
                              reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
                              description=desc)
             if fore_sel['registry']:
-                fore_sel['show'](0)
+                _fore_shown = [False]
+                def _show_fore_first(evt=None):
+                    if not _fore_shown[0]:
+                        _fore_shown[0] = True
+                        fore_sel['show'](0)
+                fore_sel['frame'].bind('<Map>', _show_fore_first)
 
         # ── Contact % ─────────────────────────────────────────────────────
         if contact_sel is not None:
@@ -6166,7 +6220,12 @@ class GaitLimbTab(ttk.Frame):
                      graph_cfg=graph_cfg,
                      description='Ratio of mean hind to mean fore contact % across time bins.')
             if contact_sel['registry']:
-                contact_sel['show'](0)
+                _contact_shown = [False]
+                def _show_contact_first(evt=None):
+                    if not _contact_shown[0]:
+                        _contact_shown[0] = True
+                        contact_sel['show'](0)
+                contact_sel['frame'].bind('<Map>', _show_contact_first)
 
         # ── Brightness ────────────────────────────────────────────────────
         if bright_sel is not None:
@@ -6201,7 +6260,12 @@ class GaitLimbTab(ttk.Frame):
                              reference=ref, y_label=ylbl, graph_cfg=graph_cfg,
                              description=desc)
             if bright_sel['registry']:
-                bright_sel['show'](0)
+                _bright_shown = [False]
+                def _show_bright_first(evt=None):
+                    if not _bright_shown[0]:
+                        _bright_shown[0] = True
+                        bright_sel['show'](0)
+                bright_sel['frame'].bind('<Map>', _show_bright_first)
 
         # ── Gait graphs (deferred) ────────────────────────────────────
         def _build_gait():
@@ -6604,32 +6668,57 @@ class GaitLimbTab(ttk.Frame):
                         contour_all_nb, _contour_metrics, False, df, bdf,
                         'paw_area_ratio_hind', 'contact_intensity_ratio_hind')
 
-                # ── Filter Preview ──
+                # ── Filter Preview (deferred until tab is clicked) ──
                 if has_pawlike_contour:
                     contour_nb_frame = ttk.Frame(contour_nb)
                     contour_nb.add(contour_nb_frame, text='Filter Preview')
+                    _filter_preview_built = [False]
 
-                    # Sync Left/Right checkbox
-                    self._filter_sync_lr_var = tk.BooleanVar(value=True)
-                    self._filter_slider_vars = {}  # role -> (sol_var, ar_var, circ_var)
-                    sync_frame = ttk.Frame(contour_nb_frame, padding=(6, 4, 6, 0))
-                    sync_frame.pack(side='top', fill='x')
-                    ttk.Checkbutton(sync_frame, text="Sync Left/Right thresholds",
-                                    variable=self._filter_sync_lr_var).pack(anchor='w')
+                    def _build_filter_preview_content():
+                        if _filter_preview_built[0]:
+                            return
+                        _filter_preview_built[0] = True
+                        win = contour_nb.winfo_toplevel()
+                        try:
+                            win.config(cursor='watch')
+                            win.update_idletasks()
+                        except Exception:
+                            pass
+                        self._filter_sync_lr_var = tk.BooleanVar(value=True)
+                        self._filter_slider_vars = {}
+                        sync_frame = ttk.Frame(contour_nb_frame, padding=(6, 4, 6, 0))
+                        sync_frame.pack(side='top', fill='x')
+                        ttk.Checkbutton(sync_frame, text="Sync Left/Right thresholds",
+                                        variable=self._filter_sync_lr_var).pack(anchor='w')
+                        filter_nb = ttk.Notebook(contour_nb_frame)
+                        filter_nb.pack(fill='both', expand=True)
+                        _contour_paw_nbs.append(filter_nb)
+                        for role in self.ROLES:
+                            has_paw = any(
+                                f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
+                                for mk, _, _ in _contour_pawlike_metrics
+                            )
+                            if has_paw:
+                                self._add_contour_filter_preview_tab(
+                                    filter_nb, df, self._session_intermediates,
+                                    role, tab_name=_paw_labels.get(role, role),
+                                    graph_cfg=graph_cfg)
+                        filter_nb.bind('<<NotebookTabChanged>>', _on_tab_change)
+                        try:
+                            win.config(cursor='')
+                            win.update_idletasks()
+                        except Exception:
+                            pass
 
-                    filter_nb = ttk.Notebook(contour_nb_frame)
-                    filter_nb.pack(fill='both', expand=True)
-                    _contour_paw_nbs.append(filter_nb)
-                    for role in self.ROLES:
-                        has_paw = any(
-                            f'{mk}_{role}' in df.columns and df[f'{mk}_{role}'].notna().any()
-                            for mk, _, _ in _contour_pawlike_metrics
-                        )
-                        if has_paw:
-                            self._add_contour_filter_preview_tab(
-                                filter_nb, df, self._session_intermediates,
-                                role, tab_name=_paw_labels.get(role, role),
-                                graph_cfg=graph_cfg)
+                    def _check_filter_preview_tab(evt=None):
+                        try:
+                            sel = contour_nb.select()
+                            if sel == str(contour_nb_frame):
+                                _build_filter_preview_content()
+                        except Exception:
+                            pass
+
+                    contour_nb.bind('<<NotebookTabChanged>>', _check_filter_preview_tab, add='+')
                     _tab_descs['Filter Preview'] = (
                         'Interactive preview of the paw-like contour filter. '
                         'Adjust solidity, aspect ratio, and circularity thresholds '
@@ -6714,13 +6803,18 @@ class GaitLimbTab(ttk.Frame):
         if contour_nb is not None:
             _register_deferred(contour_nb.master, _build_contour)
 
-        # ── Statistics tab (added directly to outer notebook) ─────────────
-        if show_stats:
-            self._log("  Building Statistics tables…")
+        # ── Statistics tab (deferred until clicked) ─────────────────────
         if show_stats and bdf is not None:
-            max_t = bdf['bin_start_s'].max() / 60.0
-            self._create_wb_statistics_tab(
-                outer_nb, self._summary_df, bdf, treatments, max_t)
+            _stats_group = ttk.Frame(outer_nb)
+            outer_nb.add(_stats_group, text="\U0001f4ca Statistics")
+
+            def _build_stats():
+                self._log("  Building Statistics tables…")
+                max_t = bdf['bin_start_s'].max() / 60.0
+                self._create_wb_statistics_tab(
+                    _stats_group, self._summary_df, bdf, treatments, max_t)
+
+            _register_deferred(_stats_group, _build_stats)
 
         # ── Tab change handler (works for outer and all inner notebooks) ───
         def _on_tab_change(event):
@@ -6744,7 +6838,9 @@ class GaitLimbTab(ttk.Frame):
         """Show a graph settings dialog and return a config dict or None if cancelled."""
         dlg = tk.Toplevel(parent)
         dlg.title("Graph Settings")
-        dlg.geometry('700x700')
+        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+        dw, dh = int(sw * 0.45), int(sh * 0.7)
+        dlg.geometry(f"{dw}x{dh}+{(sw-dw)//2}+{(sh-dh)//2}")
         dlg.resizable(False, True)
         dlg.grab_set()
         _prev = self._last_graph_cfg or {}
@@ -6891,12 +6987,114 @@ class GaitLimbTab(ttk.Frame):
                 color_vars[t].set('White (black outline)')
                 _update_swatch(t)
 
-        preset_row = ttk.Frame(color_frame)
+        # ── Color mode selection ─────────────────────────────────────────
+        mode_row = ttk.Frame(color_frame)
+        mode_row.pack(fill='x', pady=(4, 2))
+        _prev_color_mode = _prev.get('color_mode', 'individual')
+        color_mode_var = tk.StringVar(value=_prev_color_mode)
+        ttk.Label(mode_row, text="Color mode:", font=('Arial', 9, 'bold')).pack(side='left', padx=(0, 8))
+        ttk.Radiobutton(mode_row, text='Individual',
+                        variable=color_mode_var, value='individual').pack(side='left')
+        ttk.Radiobutton(mode_row, text='Gradient (dose response)',
+                        variable=color_mode_var, value='gradient').pack(side='left', padx=10)
+
+        # ── Gradient controls frame ─────────────────────────────────────
+        gradient_frame = ttk.Frame(color_frame, padding=(8, 4))
+
+        gmap_row = ttk.Frame(gradient_frame)
+        gmap_row.pack(fill='x', pady=2)
+        ttk.Label(gmap_row, text="Colormap:", width=15).pack(side='left')
+        _prev_grad_cmap = _prev.get('gradient_cmap', 'Blues')
+        gradient_cmap_var = tk.StringVar(value=_prev_grad_cmap)
+        gradient_cmaps = [
+            'Blues', 'Purples', 'Oranges', 'Greens', 'Reds',
+            'YlOrRd', 'YlGnBu', 'PuRd', 'BuGn', 'RdPu', 'BuPu', 'GnBu', 'OrRd',
+            'plasma', 'viridis', 'magma', 'inferno', 'cividis',
+            'cool', 'hot', 'copper', 'bone',
+        ]
+        ttk.Combobox(gmap_row, textvariable=gradient_cmap_var,
+                     values=gradient_cmaps, state='readonly', width=15).pack(side='left', padx=5)
+
+        gdir_row = ttk.Frame(gradient_frame)
+        gdir_row.pack(fill='x', pady=2)
+        ttk.Label(gdir_row, text="Direction:", width=15).pack(side='left')
+        _prev_grad_dir = _prev.get('gradient_dir', 'light_to_dark')
+        gradient_dir_var = tk.StringVar(value=_prev_grad_dir)
+        ttk.Radiobutton(gdir_row, text='Light \u2192 Dark (increasing dose)',
+                        variable=gradient_dir_var, value='light_to_dark').pack(side='left')
+        ttk.Radiobutton(gdir_row, text='Dark \u2192 Light',
+                        variable=gradient_dir_var, value='dark_to_light').pack(side='left', padx=10)
+
+        gveh_row = ttk.Frame(gradient_frame)
+        gveh_row.pack(fill='x', pady=2)
+        ttk.Label(gveh_row, text="Vehicle/Control:", width=15).pack(side='left')
+        _auto_veh = next((t for t in treatments if _is_veh(t)), treatments[0])
+        _prev_grad_veh = _prev.get('gradient_vehicle', _auto_veh)
+        if _prev_grad_veh not in treatments:
+            _prev_grad_veh = _auto_veh
+        gradient_veh_var = tk.StringVar(value=_prev_grad_veh)
+        ttk.Combobox(gveh_row, textvariable=gradient_veh_var,
+                     values=list(treatments), state='readonly', width=15).pack(side='left', padx=5)
+        ttk.Label(gveh_row, text='\u2192 white with black outline',
+                  font=('Arial', 9), foreground='gray').pack(side='left')
+
+        # Gradient preview swatches
+        grad_preview_row = ttk.Frame(gradient_frame)
+        grad_preview_row.pack(fill='x', pady=(4, 2))
+        grad_swatch_labels = {}
+        for t in treatments:
+            tf = ttk.Frame(grad_preview_row)
+            tf.pack(side='left', padx=3)
+            gsw = tk.Label(tf, width=2, bg='white', relief='solid', bd=1)
+            gsw.pack(side='left')
+            ttk.Label(tf, text=t, font=('Arial', 8)).pack(side='left', padx=(2, 0))
+            grad_swatch_labels[t] = gsw
+
+        def _refresh_grad_swatches(*_):
+            import matplotlib.colors as mcolors
+            veh = gradient_veh_var.get()
+            try:
+                cmap = plt.get_cmap(gradient_cmap_var.get())
+            except Exception:
+                return
+            non_veh = [t for t in treatments if t != veh]
+            n = len(non_veh)
+            if gradient_dir_var.get() == 'light_to_dark':
+                positions = np.linspace(0.35, 0.90, max(n, 1))
+            else:
+                positions = np.linspace(0.90, 0.35, max(n, 1))
+            for t, gsw in grad_swatch_labels.items():
+                if t == veh:
+                    gsw.configure(bg='white')
+                else:
+                    idx = non_veh.index(t) if t in non_veh else 0
+                    gsw.configure(bg=mcolors.to_hex(cmap(positions[idx])) if idx < len(positions) else '#ccc')
+
+        gradient_cmap_var.trace_add('write', _refresh_grad_swatches)
+        gradient_dir_var.trace_add('write', _refresh_grad_swatches)
+        gradient_veh_var.trace_add('write', _refresh_grad_swatches)
+        _refresh_grad_swatches()
+
+        # ── Individual colors frame (preset + per-treatment rows) ────────
+        individual_frame = ttk.Frame(color_frame)
+
+        preset_row = ttk.Frame(individual_frame)
         preset_row.pack(fill='x', pady=(0, 6))
         ttk.Label(preset_row, text="Quick palettes:", font=('Arial', 9)).pack(side='left', padx=(0, 8))
         for lbl, hexes in PRESETS.items():
             ttk.Button(preset_row, text=lbl, width=16,
                        command=lambda h=hexes: _apply_preset(h)).pack(side='left', padx=3)
+
+        def _toggle_color_mode(*_):
+            if color_mode_var.get() == 'gradient':
+                individual_frame.pack_forget()
+                gradient_frame.pack(fill='x', pady=(4, 2))
+            else:
+                gradient_frame.pack_forget()
+                individual_frame.pack(fill='x')
+
+        color_mode_var.trace_add('write', _toggle_color_mode)
+        _toggle_color_mode()
 
         # ── Per-treatment style option lists ──────────────────────────────
         _LINESTYLE_OPTIONS = [
@@ -6958,7 +7156,7 @@ class GaitLimbTab(ttk.Frame):
 
         _nv_idx = 0
         for _ti, treat in enumerate(treatments):
-            treat_frame = ttk.Frame(color_frame)
+            treat_frame = ttk.Frame(individual_frame)
             treat_frame.pack(fill='x', pady=(4, 2))
 
             # Row 1: color swatch + name + color combo + custom button
@@ -7090,10 +7288,11 @@ class GaitLimbTab(ttk.Frame):
         # Live preview canvas
         _preview_frame = ttk.Frame(disp_frame, padding=(12, 4, 12, 0))
         _preview_frame.pack(anchor='w', fill='x')
-        _prev_fig, _prev_ax = plt.subplots(figsize=(3.5, 1.0))
+        _prev_fig, _prev_ax = plt.subplots(figsize=(3.5, 1.0), constrained_layout=True)
         _prev_fig.patch.set_facecolor('#f0f0f0')
         _prev_canvas = FigureCanvasTkAgg(_prev_fig, master=_preview_frame)
-        _prev_canvas.get_tk_widget().pack(fill='x')
+        _prev_canvas.get_tk_widget().pack(fill='both', expand=True)
+        _bind_tight_layout_on_resize(_prev_canvas, _prev_fig)
 
         def _resolve_preview_colors():
             """Get first two treatment colors + raw values from the picker."""
@@ -7209,7 +7408,6 @@ class GaitLimbTab(ttk.Frame):
             _prev_ax.text(0.99, 0.02, _edisp_lbl,
                           transform=_prev_ax.transAxes, ha='right', va='bottom',
                           fontsize=8, color='gray', fontstyle='italic')
-            _prev_fig.tight_layout(pad=0.2)
             _prev_canvas.draw_idle()
 
         # Bind per-treatment combos/spinboxes to preview update
@@ -7359,12 +7557,29 @@ class GaitLimbTab(ttk.Frame):
         def _on_ok():
             order = ([listbox.get(i) for i in range(listbox.size())]
                      if listbox is not None else list(treatments))
-            colors = {}
-            for t in treatments:
-                if t in picked_hex:
-                    colors[t] = picked_hex[t]
+            if color_mode_var.get() == 'gradient':
+                import matplotlib.colors as mcolors
+                veh = gradient_veh_var.get()
+                cmap = plt.get_cmap(gradient_cmap_var.get())
+                non_veh = [t for t in order if t != veh]
+                n = len(non_veh)
+                if gradient_dir_var.get() == 'light_to_dark':
+                    positions = np.linspace(0.35, 0.90, max(n, 1))
                 else:
-                    colors[t] = color_options[color_vars[t].get()]
+                    positions = np.linspace(0.90, 0.35, max(n, 1))
+                colors = {t: mcolors.to_hex(cmap(pos))
+                          for t, pos in zip(non_veh, positions)}
+                colors[veh] = 'white_black'
+                for t in treatments:
+                    if t not in colors:
+                        colors[t] = '#b3b3b3'
+            else:
+                colors = {}
+                for t in treatments:
+                    if t in picked_hex:
+                        colors[t] = picked_hex[t]
+                    else:
+                        colors[t] = color_options[color_vars[t].get()]
             # Propagate stats settings back to instance vars
             self._stats_test_var.set(dlg_test_var.get())
             self._stats_alpha_var.set(dlg_alpha_var.get())
@@ -7408,6 +7623,10 @@ class GaitLimbTab(ttk.Frame):
                 'rebin_minutes':   float(rebin_var.get()) if rebin_var is not None else 0,
                 'sig_style':       sig_style_var.get(),
                 'graph_sets':      {k: v.get() for k, v in gs_vars.items()},
+                'color_mode':       color_mode_var.get(),
+                'gradient_cmap':    gradient_cmap_var.get(),
+                'gradient_dir':     gradient_dir_var.get(),
+                'gradient_vehicle': gradient_veh_var.get(),
             }
             dlg.destroy()
 
@@ -7485,7 +7704,6 @@ class GaitLimbTab(ttk.Frame):
 
     def _embed_figure(self, frame, fig, ax=None):
         canvas = FigureCanvasTkAgg(fig, master=frame)
-        canvas.draw()
 
         # Pack bottom widgets first (side='bottom') so canvas can expand
         if ax is not None:
@@ -7547,7 +7765,8 @@ class GaitLimbTab(ttk.Frame):
         toolbar = NavigationToolbar2Tk(canvas, frame)
         toolbar.update()
         canvas.get_tk_widget().pack(fill='both', expand=True)
-        plt.close(fig)
+        _bind_tight_layout_on_resize(canvas, fig)
+        _draw_canvas_fit(canvas, fig)
 
     def _style_ax(self, ax, title='', xlabel='', ylabel=''):
         """Apply publication-quality styling to an axes."""
@@ -7731,7 +7950,7 @@ class GaitLimbTab(ttk.Frame):
     def _build_bar_graph(self, frame, df, metric, tab_name,
                          reference=None, y_label='', graph_cfg=None):
         """Create a bar chart figure and embed it in the given frame."""
-        fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
+        fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center',
@@ -7783,7 +8002,7 @@ class GaitLimbTab(ttk.Frame):
     def _build_box_graph(self, frame, df, metric, tab_name,
                          reference=None, y_label='', graph_cfg=None):
         """Create a box plot figure and embed it in the given frame."""
-        fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
+        fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center',
@@ -7828,7 +8047,7 @@ class GaitLimbTab(ttk.Frame):
     def _build_violin_graph(self, frame, df, metric, tab_name,
                             reference=None, y_label='', graph_cfg=None):
         """Create a violin plot figure and embed it in the given frame."""
-        fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
+        fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
         groups = self._treatment_groups(df, metric)
         if not groups:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center',
@@ -7877,7 +8096,7 @@ class GaitLimbTab(ttk.Frame):
                                 reference=None, y_label=None,
                                 graph_cfg=None):
         """Create a timecourse figure and embed it in the given frame."""
-        fig, ax = plt.subplots(figsize=(8, 5), tight_layout=True)
+        fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
 
         if reference is None:
             if 'SI' in metric or 'symmetry' in metric.lower():
@@ -7894,7 +8113,7 @@ class GaitLimbTab(ttk.Frame):
         # extend beyond the requested range.
         if graph_cfg and graph_cfg.get('time_window') is not None:
             _tw_sec = graph_cfg['time_window'] * 60.0
-            bins_df = bins_df[bins_df['bin_start_s'] <= _tw_sec].copy()
+            bins_df = bins_df[bins_df['bin_start_s'] <= _tw_sec]
 
         if ('treatment' in bins_df.columns
                 and bins_df['treatment'].ne('').any()):
@@ -8033,104 +8252,110 @@ class GaitLimbTab(ttk.Frame):
 
             if self._enable_stats_var.get() and len(ordered) >= 2:
                 from matplotlib.transforms import blended_transform_factory
+                import warnings as _warnings
                 trans = blended_transform_factory(ax.transData, ax.transAxes)
                 tw = graph_cfg.get('time_window') if graph_cfg else None
-                _rebin_min = (graph_cfg.get('rebin_minutes')
-                              if graph_cfg else None)
-                if _rebin_min and _rebin_min > 0:
-                    _rebin_s = _rebin_min * 60.0
-                    _all_bins = sorted(bins_df['bin_start_s'].unique())
-                    _rebin_windows = {}
-                    for bs in _all_bins:
-                        win_start = int(bs // _rebin_s) * _rebin_s
-                        _rebin_windows.setdefault(win_start, []).append(bs)
-                    # Count testable windows for Bonferroni
-                    _n_tests_r = 0
-                    for ws_bins in _rebin_windows.values():
-                        wd = bins_df[bins_df['bin_start_s'].isin(ws_bins)]
-                        _gc = [wd[wd['treatment'] == t].groupby('subject')[metric]
-                               .mean().dropna().values for t in ordered]
-                        _gc = [g for g in _gc if len(g) >= 2]
-                        if len(_gc) >= 2:
-                            _n_tests_r += 1
-                    _n_tests_r = max(_n_tests_r, 1)
-                    for win_start in sorted(_rebin_windows.keys()):
-                        t_min_val = win_start / 60.0
+                alpha = self._stats_alpha_var.get()
+
+                # Step 1: Two-way ANOVA gatekeeper
+                _do_posthoc = False
+                _anova_text = ''
+                try:
+                    import statsmodels.api as _sm
+                    from statsmodels.formula.api import ols as _ols
+                    _adf = bins_df[['subject', 'treatment', 'bin_start_s', metric]].dropna().copy()
+                    _adf['treatment'] = _adf['treatment'].astype('category')
+                    _adf['bin_start_s'] = _adf['bin_start_s'].astype('category')
+                    with _warnings.catch_warnings():
+                        _warnings.filterwarnings('ignore', module='statsmodels')
+                        _model = _ols(f'{metric} ~ C(treatment) + C(bin_start_s) + C(treatment):C(bin_start_s)',
+                                      data=_adf).fit()
+                        _at = _sm.stats.anova_lm(_model, typ=2)
+                    _treat_p = _at.loc['C(treatment)', 'PR(>F)']
+                    _inter_p = _at.loc['C(treatment):C(bin_start_s)', 'PR(>F)']
+                    if _inter_p < alpha or _treat_p < alpha:
+                        _do_posthoc = True
+                    def _pfmt(p):
+                        if p < 0.001: return 'p<0.001***'
+                        if p < 0.01:  return f'p={p:.3f}**'
+                        if p < alpha: return f'p={p:.3f}*'
+                        return f'p={p:.3f} ns'
+                    _anova_text = f"Two-way ANOVA: Treatment {_pfmt(_treat_p)}, Interaction {_pfmt(_inter_p)}"
+                except Exception:
+                    _do_posthoc = True
+
+                # Step 2: Per-bin post-hoc (only if ANOVA is significant)
+                if _do_posthoc:
+                    _rebin_min = graph_cfg.get('rebin_minutes') if graph_cfg else None
+                    if _rebin_min and _rebin_min > 0:
+                        _rebin_s = _rebin_min * 60.0
+                        _all_bins = sorted(bins_df['bin_start_s'].unique())
+                        _rebin_windows = {}
+                        for bs in _all_bins:
+                            win_start = int(bs // _rebin_s) * _rebin_s
+                            _rebin_windows.setdefault(win_start, []).append(bs)
+                        _bin_iter = [
+                            (win_start / 60.0,
+                             bins_df[bins_df['bin_start_s'].isin(win_bins)])
+                            for win_start, win_bins in sorted(_rebin_windows.items())
+                        ]
+                    else:
+                        _bin_iter = [
+                            (bin_t / 60.0, bgrp)
+                            for bin_t, bgrp in bins_df.groupby('bin_start_s')
+                        ]
+
+                    paradigm = self._stats_paradigm_var.get()
+                    for t_min_val, bin_data in _bin_iter:
                         if tw is not None and t_min_val > tw:
                             continue
-                        win_bins = _rebin_windows[win_start]
-                        win_data = bins_df[
-                            bins_df['bin_start_s'].isin(win_bins)]
                         gvals = []
                         for t in ordered:
-                            t_data = win_data[win_data['treatment'] == t]
-                            if t_data.empty:
-                                continue
-                            subj_means = (t_data.groupby('subject')[metric]
-                                          .mean().dropna().values)
-                            if len(subj_means) >= 2:
-                                gvals.append(subj_means)
+                            if _rebin_min and _rebin_min > 0:
+                                t_data = bin_data[bin_data['treatment'] == t]
+                                vals = t_data.groupby('subject')[metric].mean().dropna().values
+                            else:
+                                vals = bin_data[bin_data['treatment'] == t][metric].dropna().values
+                            if len(vals) >= 2:
+                                gvals.append(vals)
                         if len(gvals) < 2:
                             continue
+
+                        use_nonparam = paradigm == 'nonparametric'
+                        if paradigm == 'auto':
+                            for g in gvals:
+                                if len(g) >= 3:
+                                    try:
+                                        _, sw_p = _sp_stats.shapiro(g)
+                                        if sw_p < 0.05:
+                                            use_nonparam = True
+                                            break
+                                    except Exception:
+                                        pass
+
                         try:
                             if len(gvals) == 2:
-                                _, p = _sp_stats.ttest_ind(
-                                    gvals[0], gvals[1], equal_var=False)
-                                if np.isnan(p):
-                                    continue
-                                p = min(p * _n_tests_r, 1.0)
+                                if use_nonparam:
+                                    _, p = _sp_stats.mannwhitneyu(gvals[0], gvals[1], alternative='two-sided')
+                                else:
+                                    _, p = _sp_stats.ttest_ind(gvals[0], gvals[1], equal_var=False)
                             else:
-                                _, p = _sp_stats.f_oneway(*gvals)
-                                if np.isnan(p):
-                                    continue
+                                if use_nonparam:
+                                    _, p = _sp_stats.kruskal(*gvals)
+                                else:
+                                    _, p = _sp_stats.f_oneway(*gvals)
                             lbl = _p_label(p, self._sig_style)
                             if lbl:
-                                ax.text(t_min_val, 0.98, lbl,
-                                        transform=trans, ha='center',
-                                        va='top', fontsize=9, color='black')
+                                ax.text(t_min_val, 0.98, lbl, transform=trans,
+                                        ha='center', va='top', fontsize=9, color='black')
                         except Exception:
                             pass
-                else:
-                    # Count testable bins for Bonferroni
-                    _n_tests_nb = 0
-                    for _, bgrp in bins_df.groupby('bin_start_s'):
-                        _gc = [bgrp[bgrp['treatment'] == t][metric]
-                               .dropna().values for t in ordered
-                               if t in bgrp['treatment'].values]
-                        _gc = [v for v in _gc if len(v) >= 2]
-                        if len(_gc) >= 2:
-                            _n_tests_nb += 1
-                    _n_tests_nb = max(_n_tests_nb, 1)
-                    for bin_t, bgrp in bins_df.groupby('bin_start_s'):
-                        t_min_val = bin_t / 60.0
-                        if tw is not None and t_min_val > tw:
-                            continue
-                        gvals = [
-                            bgrp[bgrp['treatment'] == t][metric]
-                            .dropna().values
-                            for t in ordered
-                            if t in bgrp['treatment'].values]
-                        gvals = [v for v in gvals if len(v) >= 2]
-                        if len(gvals) < 2:
-                            continue
-                        try:
-                            if len(gvals) == 2:
-                                _, p = _sp_stats.ttest_ind(
-                                    gvals[0], gvals[1], equal_var=False)
-                                if np.isnan(p):
-                                    continue
-                                p = min(p * _n_tests_nb, 1.0)
-                            else:
-                                _, p = _sp_stats.f_oneway(*gvals)
-                                if np.isnan(p):
-                                    continue
-                            lbl = _p_label(p, self._sig_style)
-                            if lbl:
-                                ax.text(t_min_val, 0.98, lbl,
-                                        transform=trans, ha='center',
-                                        va='top', fontsize=9, color='black')
-                        except Exception:
-                            pass
+
+                # Show ANOVA annotation
+                if _anova_text:
+                    ax.text(0.02, 0.98, _anova_text, transform=ax.transAxes,
+                            va='top', ha='left', fontsize=7, family='monospace',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='gray'))
         else:
             tg = bins_df.groupby('bin_start_s')[metric]
             tmean = tg.mean()
@@ -8428,7 +8653,7 @@ class GaitLimbTab(ttk.Frame):
             nb.add(frame, text='Contact %')
 
         fig, ax = plt.subplots(
-            figsize=(max(5, len(active) * 1.4 + 1), 4), tight_layout=True)
+            figsize=(max(5, len(active) * 1.4 + 1), 4), constrained_layout=True)
         x     = np.arange(len(active))
         bar_w = 0.7 / n_treats
         rng   = np.random.default_rng(42)
@@ -8564,7 +8789,7 @@ class GaitLimbTab(ttk.Frame):
             nb.add(frame, text='Support Patterns')
 
         fig, ax = plt.subplots(figsize=(max(5, len(treatment_labels) * 1.5 + 1), 4),
-                               tight_layout=True)
+                               constrained_layout=True)
         x = np.arange(len(treatment_labels))
         _support_colors = ['#d62728', '#ff7f0e', '#2ca02c', '#1f77b4', '#9467bd']
         _support_labels = ['0 paw', '1 paw', '2 paw', '3 paw', '4 paw']
@@ -8667,6 +8892,28 @@ class GaitLimbTab(ttk.Frame):
         circ = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0.0
         return ar, circ
 
+    @staticmethod
+    def _shape_metrics_batch(stacked):
+        """Vectorized aspect_ratio + circularity for (N, 64, 2) contour array."""
+        mins = stacked.min(axis=1)
+        maxs = stacked.max(axis=1)
+        wh = maxs - mins
+        dim_max = wh.max(axis=1)
+        dim_min = wh.min(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ar = np.where(dim_min > 0, dim_max / dim_min, 999.0)
+        closed = np.concatenate([stacked, stacked[:, 0:1, :]], axis=1)
+        diffs = np.diff(closed, axis=1)
+        perimeter = np.sqrt((diffs ** 2).sum(axis=2)).sum(axis=1)
+        x, y = stacked[:, :, 0], stacked[:, :, 1]
+        area = 0.5 * np.abs(
+            (x * np.roll(y, -1, axis=1)).sum(axis=1) -
+            (y * np.roll(x, -1, axis=1)).sum(axis=1))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            circ = np.where(perimeter > 0,
+                            (4 * np.pi * area) / (perimeter ** 2), 0.0)
+        return ar, circ
+
     def _add_contour_shape_tab(self, nb, sessions_df, intermediates,
                                role, tab_name='Shape', graph_cfg=None,
                                filter_paw=False, as_frame=False):
@@ -8718,13 +8965,13 @@ class GaitLimbTab(ttk.Frame):
                 if not shapes:
                     continue
                 treat_total[treat] = len(shapes)
-                filtered = []
-                for i, s in enumerate(shapes):
-                    ar_i, circ_i = self._shape_metrics(s)
-                    sol_i = treat_sols[treat][i] if i < len(treat_sols[treat]) else 1.0
-                    if sol_i <= sol_thresh and ar_i <= ar_thresh and circ_i >= circ_thresh:
-                        filtered.append(s)
-                treat_shapes[treat] = filtered
+                stacked_t = np.array(shapes)
+                ar_t, circ_t = self._shape_metrics_batch(stacked_t)
+                sols_t = np.array(treat_sols[treat][:len(shapes)], dtype=float)
+                if len(sols_t) < len(shapes):
+                    sols_t = np.concatenate([sols_t, np.ones(len(shapes) - len(sols_t))])
+                mask = (sols_t <= sol_thresh) & (ar_t <= ar_thresh) & (circ_t >= circ_thresh)
+                treat_shapes[treat] = [shapes[i] for i in np.where(mask)[0]]
 
         # Check we have any shapes
         if not any(treat_shapes.values()):
@@ -8736,7 +8983,7 @@ class GaitLimbTab(ttk.Frame):
             frame = ttk.Frame(nb)
             nb.add(frame, text=tab_name)
 
-        fig, ax = plt.subplots(figsize=(5, 5), tight_layout=True)
+        fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
         ax.set_aspect('equal')
 
         paw_label = {'HL': 'Hind Left', 'HR': 'Hind Right',
@@ -8901,7 +9148,7 @@ class GaitLimbTab(ttk.Frame):
         n_cols = min(n_groups, max_cols)
         fig, axes = plt.subplots(n_rows, n_cols,
                                  figsize=(4.5 * n_cols, 4.5 * n_rows),
-                                 tight_layout=True, squeeze=False)
+                                 constrained_layout=True, squeeze=False)
         axes_flat = axes.ravel()
 
         paw_label = {'HL': 'Hind Left', 'HR': 'Hind Right',
@@ -8929,11 +9176,10 @@ class GaitLimbTab(ttk.Frame):
                 ar_thresh = self._pawlike_thresholds.get('aspect_ratio', 1.6)
                 circ_thresh = self._pawlike_thresholds.get('circularity', 0.10)
                 grp_sols = np.array(group_solidities.get(grp, [1.0] * total_all))
-                paw_mask = grp_sols <= sol_thresh
-                for si in range(total_all):
-                    ar_i, circ_i = self._shape_metrics(stacked[si])
-                    if ar_i > ar_thresh or circ_i < circ_thresh:
-                        paw_mask[si] = False
+                ar_all, circ_all = self._shape_metrics_batch(stacked)
+                paw_mask = ((grp_sols <= sol_thresh)
+                            & (ar_all <= ar_thresh)
+                            & (circ_all >= circ_thresh))
                 sorted_idx = np.array([i for i in sorted_idx if paw_mask[i]])
                 if len(sorted_idx) == 0:
                     sorted_idx = np.argsort(dists)[:1]  # fallback: keep closest
@@ -8958,7 +9204,7 @@ class GaitLimbTab(ttk.Frame):
 
             fig, axes = plt.subplots(n_rows, n_cols,
                                      figsize=(4.5 * n_cols, 4.5 * n_rows),
-                                     tight_layout=True, squeeze=False)
+                                     constrained_layout=True, squeeze=False)
             axes_flat = axes.ravel()
 
             for idx, gd in enumerate(group_data):
@@ -9011,15 +9257,16 @@ class GaitLimbTab(ttk.Frame):
                 axes_flat[j].set_visible(False)
 
             if group_by == 'subject':
-                fig.suptitle(f'Paw Print — {paw_label} (by Subject)', fontsize=12, y=1.02)
+                fig.suptitle(f'Paw Print — {paw_label} (by Subject)', fontsize=12)
             elif n_groups > 1:
-                fig.suptitle(f'Paw Print — {paw_label}', fontsize=12, y=1.02)
+                fig.suptitle(f'Paw Print — {paw_label}', fontsize=12)
 
             state['fig'] = fig
             canvas = FigureCanvasTkAgg(fig, master=frame)
-            canvas.draw()
             cw = canvas.get_tk_widget()
             cw.pack(fill='both', expand=True)
+            _bind_tight_layout_on_resize(canvas, fig)
+            _draw_canvas_fit(canvas, fig)
             state['canvas_widget'] = cw
             # Update button states
             if max_offset > 0:
@@ -9097,11 +9344,8 @@ class GaitLimbTab(ttk.Frame):
         sol_vals = np.array(all_sols, dtype=float)
         total_all = len(stacked)
 
-        # Pre-compute aspect ratio and circularity for all shapes (cheap on 64-point)
-        ar_vals = np.zeros(total_all, dtype=float)
-        circ_vals = np.zeros(total_all, dtype=float)
-        for i in range(total_all):
-            ar_vals[i], circ_vals[i] = self._shape_metrics(stacked[i])
+        # Pre-compute aspect ratio and circularity for all shapes (vectorized)
+        ar_vals, circ_vals = self._shape_metrics_batch(stacked)
 
         paw_label = {'HL': 'Hind Left', 'HR': 'Hind Right',
                      'FL': 'Fore Left', 'FR': 'Fore Right'}.get(role, role)
@@ -9222,7 +9466,7 @@ class GaitLimbTab(ttk.Frame):
 
             fig, axes = plt.subplots(n_r, n_c,
                                      figsize=(2.5 * n_c, 2.5 * n_r),
-                                     tight_layout=True, squeeze=False)
+                                     constrained_layout=True, squeeze=False)
             axes_flat = axes.ravel()
 
             for i, si in enumerate(page_indices):
@@ -9253,9 +9497,10 @@ class GaitLimbTab(ttk.Frame):
 
             state['fig'] = fig
             canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
-            canvas.draw()
             cw = canvas.get_tk_widget()
             cw.pack(fill='both', expand=True)
+            _bind_tight_layout_on_resize(canvas, fig)
+            _draw_canvas_fit(canvas, fig)
             state['canvas_widget'] = cw
 
             btn_prev.config(state='disabled' if page == 0 else 'normal')
@@ -9334,9 +9579,14 @@ class GaitLimbTab(ttk.Frame):
 
         ttk.Button(btn_bar, text="Apply", command=_apply).pack(side='right', padx=4)
 
-        # Initial draw
-        _compute_mask()
-        _draw_page(0)
+        # Defer initial draw until this paw tab becomes visible
+        _initial_drawn = [False]
+        def _on_map(evt=None):
+            if not _initial_drawn[0]:
+                _initial_drawn[0] = True
+                _compute_mask()
+                _draw_page(0)
+        frame.bind('<Map>', _on_map)
 
     def _add_contour_grouped_bar_tab(self, nb, df, metric_key, tab_name,
                                       y_label='', graph_cfg=None):
@@ -9367,7 +9617,7 @@ class GaitLimbTab(ttk.Frame):
         nb.add(frame, text=tab_name)
 
         fig, ax = plt.subplots(
-            figsize=(max(5, len(paw_cols) * 1.4 + 1), 4), tight_layout=True)
+            figsize=(max(5, len(paw_cols) * 1.4 + 1), 4), constrained_layout=True)
         x     = np.arange(len(paw_cols))
         bar_w = 0.7 / n_treats
         rng   = np.random.default_rng(42)
@@ -9532,7 +9782,7 @@ class GaitLimbTab(ttk.Frame):
             paw_frame = ttk.Frame(paw_nb)
             paw_nb.add(paw_frame, text=role)
 
-            fig, ax = plt.subplots(figsize=(8, 5), tight_layout=True)
+            fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
 
             for ti, treat in enumerate(treatment_labels):
                 if has_treats and len(treatment_labels) > 1:
@@ -9637,48 +9887,91 @@ class GaitLimbTab(ttk.Frame):
             if len(treatment_labels) > 1:
                 ax.legend(fontsize=10)
 
-            # Per-bin significance markers (Bonferroni-corrected for 2 groups)
+            # Per-bin significance markers (two-way ANOVA gatekeeper)
             if self._enable_stats_var.get() and len(treatment_labels) >= 2 and has_treats:
                 from matplotlib.transforms import blended_transform_factory
+                import warnings as _warnings
                 trans = blended_transform_factory(ax.transData, ax.transAxes)
                 tw = graph_cfg.get('time_window') if graph_cfg else None
-                bins_unique = sorted(bdf['bin_start_s'].unique())
-                # Count testable bins for Bonferroni
-                _n_tests_c = 0
-                for _bt in bins_unique:
-                    _bd = bdf[bdf['bin_start_s'] == _bt]
-                    _gc = [_bd[_bd['treatment'] == t][col].dropna().values
-                           for t in treatment_labels if t in _bd['treatment'].values]
-                    _gc = [v for v in _gc if len(v) >= 2]
-                    if len(_gc) >= 2:
-                        _n_tests_c += 1
-                _n_tests_c = max(_n_tests_c, 1)
-                for bin_t in bins_unique:
-                    t_min_val = bin_t / 60.0
-                    if tw is not None and t_min_val > tw:
-                        continue
-                    bin_df = bdf[bdf['bin_start_s'] == bin_t]
-                    gvals = [bin_df[bin_df['treatment'] == t][col].dropna().values
-                             for t in treatment_labels if t in bin_df['treatment'].values]
-                    gvals = [v for v in gvals if len(v) >= 2]
-                    if len(gvals) < 2:
-                        continue
-                    try:
-                        if len(gvals) == 2:
-                            _, p = _sp_stats.ttest_ind(gvals[0], gvals[1], equal_var=False)
-                            if np.isnan(p):
-                                continue
-                            p = min(p * _n_tests_c, 1.0)
-                        else:
-                            _, p = _sp_stats.f_oneway(*gvals)
-                            if np.isnan(p):
-                                continue
-                        lbl = _p_label(p, self._sig_style)
-                        if lbl:
-                            ax.text(t_min_val, 0.98, lbl, transform=trans,
-                                    ha='center', va='top', fontsize=9, color='black')
-                    except Exception:
-                        pass
+                alpha = self._stats_alpha_var.get()
+
+                # Step 1: Two-way ANOVA gatekeeper
+                _do_posthoc = False
+                _anova_text = ''
+                try:
+                    import statsmodels.api as _sm
+                    from statsmodels.formula.api import ols as _ols
+                    _adf = bdf[['subject', 'treatment', 'bin_start_s', col]].dropna().copy()
+                    _adf['treatment'] = _adf['treatment'].astype('category')
+                    _adf['bin_start_s'] = _adf['bin_start_s'].astype('category')
+                    with _warnings.catch_warnings():
+                        _warnings.filterwarnings('ignore', module='statsmodels')
+                        _model = _ols(f'{col} ~ C(treatment) + C(bin_start_s) + C(treatment):C(bin_start_s)',
+                                      data=_adf).fit()
+                        _at = _sm.stats.anova_lm(_model, typ=2)
+                    _treat_p = _at.loc['C(treatment)', 'PR(>F)']
+                    _inter_p = _at.loc['C(treatment):C(bin_start_s)', 'PR(>F)']
+                    if _inter_p < alpha or _treat_p < alpha:
+                        _do_posthoc = True
+                    def _pfmt(p):
+                        if p < 0.001: return 'p<0.001***'
+                        if p < 0.01:  return f'p={p:.3f}**'
+                        if p < alpha: return f'p={p:.3f}*'
+                        return f'p={p:.3f} ns'
+                    _anova_text = f"Two-way ANOVA: Treatment {_pfmt(_treat_p)}, Interaction {_pfmt(_inter_p)}"
+                except Exception:
+                    _do_posthoc = True
+
+                # Step 2: Per-bin post-hoc (only if ANOVA is significant)
+                if _do_posthoc:
+                    bins_unique = sorted(bdf['bin_start_s'].unique())
+                    paradigm = self._stats_paradigm_var.get()
+                    for bin_t in bins_unique:
+                        t_min_val = bin_t / 60.0
+                        if tw is not None and t_min_val > tw:
+                            continue
+                        bin_data = bdf[bdf['bin_start_s'] == bin_t]
+                        gvals = [bin_data[bin_data['treatment'] == t][col].dropna().values
+                                 for t in treatment_labels if t in bin_data['treatment'].values]
+                        gvals = [v for v in gvals if len(v) >= 2]
+                        if len(gvals) < 2:
+                            continue
+
+                        use_nonparam = paradigm == 'nonparametric'
+                        if paradigm == 'auto':
+                            for g in gvals:
+                                if len(g) >= 3:
+                                    try:
+                                        _, sw_p = _sp_stats.shapiro(g)
+                                        if sw_p < 0.05:
+                                            use_nonparam = True
+                                            break
+                                    except Exception:
+                                        pass
+
+                        try:
+                            if len(gvals) == 2:
+                                if use_nonparam:
+                                    _, p = _sp_stats.mannwhitneyu(gvals[0], gvals[1], alternative='two-sided')
+                                else:
+                                    _, p = _sp_stats.ttest_ind(gvals[0], gvals[1], equal_var=False)
+                            else:
+                                if use_nonparam:
+                                    _, p = _sp_stats.kruskal(*gvals)
+                                else:
+                                    _, p = _sp_stats.f_oneway(*gvals)
+                            lbl = _p_label(p, self._sig_style)
+                            if lbl:
+                                ax.text(t_min_val, 0.98, lbl, transform=trans,
+                                        ha='center', va='top', fontsize=9, color='black')
+                        except Exception:
+                            pass
+
+                # Show ANOVA annotation
+                if _anova_text:
+                    ax.text(0.02, 0.98, _anova_text, transform=ax.transAxes,
+                            va='top', ha='left', fontsize=7, family='monospace',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='gray'))
 
             if graph_cfg and graph_cfg.get('time_window') is not None:
                 ax.set_xlim(-0.5, graph_cfg['time_window'] + 0.5)
@@ -9857,10 +10150,13 @@ class GaitLimbTab(ttk.Frame):
             anova_df['treatment'] = anova_df['treatment'].astype('category')
             anova_df['bin_start_s'] = anova_df['bin_start_s'].astype('category')
 
-            model = _ols(
-                f'{metric} ~ C(treatment) + C(bin_start_s) + C(treatment):C(bin_start_s)',
-                data=anova_df).fit()
-            anova_table = _sm.stats.anova_lm(model, typ=2)
+            import warnings as _warnings
+            with _warnings.catch_warnings():
+                _warnings.filterwarnings('ignore', module='statsmodels')
+                model = _ols(
+                    f'{metric} ~ C(treatment) + C(bin_start_s) + C(treatment):C(bin_start_s)',
+                    data=anova_df).fit()
+                anova_table = _sm.stats.anova_lm(model, typ=2)
 
             main_effects_frame = ttk.Frame(section_frame)
             main_effects_frame.pack(fill='x', pady=5, padx=20)
@@ -10064,8 +10360,7 @@ class GaitLimbTab(ttk.Frame):
         treatments    — ordered list of treatment labels
         max_time_min  — maximum time in minutes (from bins_df)
         """
-        frame = ttk.Frame(nb)
-        nb.add(frame, text="\U0001f4ca Statistics")
+        frame = nb  # Build directly into passed frame (deferred tab)
 
         max_time_int = max(1, int(max_time_min))
 

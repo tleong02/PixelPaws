@@ -20,11 +20,19 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
+from ui_utils import _bind_tight_layout_on_resize
+
+
 class BrightnessPreview:
     def __init__(self, root, video_path=None, features_path=None):
         self.root = root
         self.root.title("Brightness Preview")
-        self.root.geometry("500x650")
+        _sw = self.root.winfo_screenwidth()
+        _sh = self.root.winfo_screenheight()
+        _w = min(520, int(_sw * 0.30))
+        _h = min(580, int(_sh * 0.50))
+        self.root.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
+        self.root.resizable(True, True)
         
         self.video_path = video_path
         self.features_path = features_path
@@ -619,13 +627,19 @@ class BrightnessPreview:
         
         self.graph_win = tk.Toplevel(self.root)
         self.graph_win.title("Timeline")
-        self.graph_win.geometry("800x400")
+        _sw = self.graph_win.winfo_screenwidth()
+        _sh = self.graph_win.winfo_screenheight()
+        _w = int(_sw * 0.65)
+        _h = int(_sh * 0.50)
+        self.graph_win.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
+        self.graph_win.resizable(True, True)
         
-        self.fig = Figure(figsize=(8, 4), dpi=100)
+        self.fig = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, self.graph_win)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
-        
+        _bind_tight_layout_on_resize(self.canvas, self.fig)
+
         self.canvas.mpl_connect('button_press_event', self.on_graph_click)
         self.plot_graph()
     
@@ -677,7 +691,12 @@ class BrightnessPreview:
         
         self.video_win = tk.Toplevel(self.root)
         self.video_win.title("Video")
-        self.video_win.geometry("900x700")
+        _sw = self.video_win.winfo_screenwidth()
+        _sh = self.video_win.winfo_screenheight()
+        _w = int(_sw * 0.50)
+        _h = int(_sh * 0.55)
+        self.video_win.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
+        self.video_win.resizable(True, True)
         
         self.video_canvas = tk.Canvas(self.video_win, bg='black')
         self.video_canvas.pack(fill='both', expand=True)

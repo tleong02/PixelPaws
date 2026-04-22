@@ -22,6 +22,9 @@ from multiprocessing import Pool, cpu_count
 import warnings
 warnings.filterwarnings('ignore')
 
+# Increment this when the brightness feature set changes so cached files are invalidated
+BRIGHTNESS_FEATURE_VERSION = 1
+
 
 class PixelBrightnessExtractorOptimized:
     """
@@ -133,8 +136,56 @@ class PixelBrightnessExtractorOptimized:
         brightness_diff = brightness.diff(periods=dt_vel).abs()
         brightness_diff.columns = [f"|d/dt({col})|" for col in brightness.columns]
         
-        # Combine original and derivative features
-        X = pd.concat([brightness, brightness_diff], axis=1)
+        # --- Additional brightness features (v1) ---
+        feature_parts = [brightness, brightness_diff]
+
+        # Multi-scale derivatives (dt=1 and dt=5 in addition to existing dt_vel)
+        for dt_extra in (1, 5):
+            if dt_extra == dt_vel:
+                continue  # already computed above
+            diff_extra = brightness.diff(periods=dt_extra).abs()
+            diff_extra.columns = [f"|d/dt{dt_extra}({col})|" for col in brightness.columns]
+            feature_parts.append(diff_extra)
+
+        # Per-body-part derived features from base brightness columns
+        pix_cols = [c for c in brightness.columns if c.startswith('Pix_')]
+        for col in pix_cols:
+            bp_tag = col  # e.g. "Pix_hl"
+            raw = brightness[col]
+            d1 = raw.diff(1).fillna(0)  # first derivative at dt=1
+
+            # Brightness onset peak: rolling max of |d/dt| over 5-frame window
+            onset_peak = d1.abs().rolling(5, center=True, min_periods=1).max()
+            onset_peak.name = f'{bp_tag}_BrightOnsetPeak'
+            feature_parts.append(onset_peak.to_frame())
+
+            # Brightness acceleration: 2nd derivative
+            bright_accel = d1.diff(1).fillna(0)
+            bright_accel.name = f'{bp_tag}_BrightAccel'
+            feature_parts.append(bright_accel.to_frame())
+
+            # Brightness rise/fall asymmetry (mirrors velocity asymmetry)
+            pos_d1 = d1.clip(lower=0)
+            neg_d1_abs = (-d1).clip(lower=0)
+            roll_max_pos = pos_d1.rolling(30, min_periods=1).max()
+            roll_mean_neg = neg_d1_abs.rolling(30, min_periods=1).mean()
+            bright_asym = roll_max_pos / (roll_mean_neg + 1e-6)
+            bright_asym.name = f'{bp_tag}_BrightAsymmetry'
+            feature_parts.append(bright_asym.fillna(0).to_frame())
+
+            # Paw-surface contact z-score and transition rate
+            roll_med = raw.rolling(500, min_periods=1).median()
+            roll_std = raw.rolling(500, min_periods=1).std().fillna(1)
+            surface_z = (raw - roll_med) / (roll_std + 1e-6)
+            surface_z.name = f'{bp_tag}_SurfaceZ'
+            feature_parts.append(surface_z.fillna(0).to_frame())
+
+            surface_z_vel = surface_z.diff(1).fillna(0)
+            surface_z_vel.name = f'{bp_tag}_SurfaceZVel'
+            feature_parts.append(surface_z_vel.to_frame())
+
+        # Combine all features
+        X = pd.concat(feature_parts, axis=1)
         
         elapsed = time.time() - start_time
         fps_proc = len(X) / elapsed
@@ -198,9 +249,11 @@ class PixelBrightnessExtractorOptimized:
             
             if x_col and y_col and prob_col:
                 try:
-                    # Load original coordinates
-                    x_orig = label[x_col].values.astype(np.int32)
-                    y_orig = label[y_col].values.astype(np.int32)
+                    # Load original coordinates (NaN-safe: NaN → -1 sentinel)
+                    x_float = label[x_col].values.astype(np.float64)
+                    y_float = label[y_col].values.astype(np.float64)
+                    x_orig = np.where(np.isnan(x_float), -1, x_float).astype(np.int32)
+                    y_orig = np.where(np.isnan(y_float), -1, y_float).astype(np.int32)
                     
                     # Apply crop offset
                     coords[bp] = {
@@ -306,6 +359,10 @@ class PixelBrightnessExtractorOptimized:
                 x = coords[bp]['x'][i_frame]
                 y = coords[bp]['y'][i_frame]
                 prob = coords[bp]['prob'][i_frame]
+
+                # Skip invalid coordinates (NaN in DLC → sentinel -1)
+                if x < 0 or y < 0:
+                    continue
 
                 # Extract brightness regardless of confidence
                 # (User can filter by confidence later if needed)

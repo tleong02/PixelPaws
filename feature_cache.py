@@ -25,7 +25,12 @@ import pandas as pd
 try:
     from pose_features import POSE_FEATURE_VERSION
 except ImportError:
-    POSE_FEATURE_VERSION = 3
+    POSE_FEATURE_VERSION = 5
+
+try:
+    from brightness_features import BRIGHTNESS_FEATURE_VERSION
+except ImportError:
+    BRIGHTNESS_FEATURE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +60,7 @@ class FeatureCacheManager:
             'square_size':          [int(x) for x in cfg.get('square_size', [])],
             'pix_threshold':        round(float(cfg.get('pix_threshold', 0.3)), 6),
             'pose_feature_version': int(POSE_FEATURE_VERSION),
+            'brightness_feature_version': int(BRIGHTNESS_FEATURE_VERSION),
             'include_optical_flow': bool(cfg.get('include_optical_flow', False)),
             'bp_optflow_list':      list(cfg.get('bp_optflow_list', [])),
         }
@@ -150,9 +156,11 @@ class FeatureCacheManager:
 
     @staticmethod
     def save_cache(df, target_path: str) -> None:
-        """Write a DataFrame (or any picklable object) atomically.
-
-        Writes to a temp file in the same directory, then renames.
+        """Write a DataFrame (or any picklable object) atomically, plus a
+        sidecar `.version.json` describing the feature versions that produced
+        this cache.  The sidecar is best-effort — a save failure there never
+        aborts the primary pickle write, and missing sidecars are tolerated
+        by all readers (fall back to column-name heuristics).
         """
         dir_path = os.path.dirname(target_path) or '.'
         os.makedirs(dir_path, exist_ok=True)
@@ -167,6 +175,106 @@ class FeatureCacheManager:
             except OSError:
                 pass
             raise
+
+        # Sidecar — records pose & brightness versions alongside the pkl.
+        # Readers tolerate its absence.
+        try:
+            import json
+            from datetime import datetime as _dt
+            sidecar = {
+                'pose_feature_version':       int(POSE_FEATURE_VERSION),
+                'brightness_feature_version': int(BRIGHTNESS_FEATURE_VERSION),
+                'saved_at':                   _dt.now().isoformat(timespec='seconds'),
+                'column_count': (int(df.shape[1])
+                                 if hasattr(df, 'shape') and len(df.shape) == 2 else None),
+                'row_count':    (int(df.shape[0])
+                                 if hasattr(df, 'shape') and len(df.shape) >= 1 else None),
+            }
+            sidecar_path = target_path + '.version.json'
+            with open(sidecar_path, 'w', encoding='utf-8') as f:
+                json.dump(sidecar, f, indent=2)
+        except Exception:
+            pass   # never abort on sidecar failure
+
+    @staticmethod
+    def load_cache_meta(target_path: str) -> dict:
+        """Read the `.version.json` sidecar next to a feature cache pkl.
+
+        Returns a dict with keys:
+          pose_feature_version, brightness_feature_version, saved_at,
+          column_count, row_count
+        — all None when the sidecar is missing or unreadable.
+        """
+        sidecar_path = target_path + '.version.json'
+        if not os.path.isfile(sidecar_path):
+            return {
+                'pose_feature_version':       None,
+                'brightness_feature_version': None,
+                'saved_at':                   None,
+                'column_count': None, 'row_count': None,
+            }
+        try:
+            import json
+            with open(sidecar_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {
+                'pose_feature_version':       None,
+                'brightness_feature_version': None,
+                'saved_at':                   None,
+                'column_count': None, 'row_count': None,
+            }
+
+    @staticmethod
+    def check_feature_versions(cache_path: str) -> dict:
+        """Inspect a feature cache and report its version state.
+
+        Prefers the sidecar `.version.json`.  Falls back to column-name
+        heuristics when the sidecar is missing (older caches).  Returns a
+        dict with: pose_version (int|None), brightness_version (int|None),
+        current_pose_version, current_brightness_version, up_to_date (bool),
+        source ('sidecar' | 'column-heuristic' | 'none').
+        """
+        meta = FeatureCacheManager.load_cache_meta(cache_path)
+        pose_v = meta.get('pose_feature_version')
+        brt_v  = meta.get('brightness_feature_version')
+        source = 'sidecar' if pose_v is not None else 'none'
+
+        if pose_v is None and os.path.isfile(cache_path):
+            # Column-heuristic fallback — works for bare-DataFrame caches
+            try:
+                with open(cache_path, 'rb') as f:
+                    X = pickle.load(f)
+                if isinstance(X, dict) and 'X' in X:
+                    X = X['X']
+                cols = list(X.columns) if hasattr(X, 'columns') else []
+                if any('_PreQuiescence' in c for c in cols):
+                    pose_v = 5
+                elif any('_VelAsymmetry' in c for c in cols):
+                    pose_v = 4
+                elif any('_Jerk1' in c for c in cols):
+                    pose_v = 3
+                elif any('_Vel1' in c for c in cols):
+                    pose_v = 2
+                else:
+                    pose_v = None  # pre-v2 or unknown
+                # Brightness versioning was introduced at v1; assume v1 if Pix_* cols exist
+                if brt_v is None and any(c.startswith('Pix_') for c in cols):
+                    brt_v = 1
+                source = 'column-heuristic'
+            except Exception:
+                pass
+
+        return {
+            'pose_version':                 pose_v,
+            'brightness_version':           brt_v,
+            'current_pose_version':         int(POSE_FEATURE_VERSION),
+            'current_brightness_version':   int(BRIGHTNESS_FEATURE_VERSION),
+            'pose_up_to_date':       (pose_v == int(POSE_FEATURE_VERSION)) if pose_v is not None else False,
+            'brightness_up_to_date': (brt_v  == int(BRIGHTNESS_FEATURE_VERSION)) if brt_v  is not None else False,
+            'saved_at':                     meta.get('saved_at'),
+            'source':                       source,
+        }
 
     # ------------------------------------------------------------------
     # Version upgrade (v2 → v3)
@@ -215,4 +323,99 @@ class FeatureCacheManager:
                 return None
         except Exception as e:
             _log(f"  [Cache] Upgrade attempt failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Version upgrade (v3 → v4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def try_upgrade_v3_to_v4(old_path: str, target_path: str,
+                             cfg: dict, pose_path: str,
+                             log_fn=None) -> pd.DataFrame | None:
+        """Attempt an incremental upgrade from a v3 cache (missing flinch features).
+
+        If the old cache has Jerk columns but no VelAsymmetry columns, extracts
+        only the missing v4 flinch features from the DLC file (no video re-read).
+
+        Returns the upgraded DataFrame on success, or ``None`` on failure.
+        The upgraded cache is saved atomically to *target_path*.
+        """
+        _log = log_fn or (lambda msg: None)
+        try:
+            with open(old_path, 'rb') as fh:
+                old_X = pickle.load(fh)
+            has_v3 = any('_Jerk1' in c for c in old_X.columns)
+            needs_v4 = not any('_VelAsymmetry' in c for c in old_X.columns)
+            if not (has_v3 and needs_v4):
+                return None
+
+            _log("  [Cache] Found v3 cache → upgrading to v4 (no video re-read)")
+            from pose_features import PoseFeatureExtractor
+            upg_extractor = PoseFeatureExtractor(
+                bodyparts=cfg.get('bp_include_list') or [],
+                likelihood_threshold=cfg.get('pix_threshold', 0.8),
+                velocity_delta=cfg.get('dt_vel', 2),
+            )
+            new_feats = upg_extractor.extract_v4_features_only(pose_path)
+            if len(new_feats) > len(old_X):
+                new_feats = new_feats.iloc[:len(old_X)].reset_index(drop=True)
+
+            if len(new_feats) == len(old_X):
+                X_full = pd.concat(
+                    [old_X, new_feats.reset_index(drop=True)], axis=1)
+                FeatureCacheManager.save_cache(X_full, target_path)
+                _log(f"  ✓ Cache upgraded v3→v4: +{len(new_feats.columns)} flinch columns → {target_path}")
+                return X_full
+            else:
+                _log(f"  [Cache] Row count mismatch ({len(old_X)} vs {len(new_feats)}) — full extraction needed")
+                return None
+        except Exception as e:
+            _log(f"  [Cache] v3→v4 upgrade attempt failed: {e}")
+            return None
+
+    @staticmethod
+    def try_upgrade_v4_to_v5(old_path: str, target_path: str,
+                             cfg: dict, pose_path: str,
+                             log_fn=None) -> pd.DataFrame | None:
+        """Attempt an incremental upgrade from a v4 cache (missing v5 temporal-context features).
+
+        If the old cache has VelAsymmetry columns but no PreQuiescence columns,
+        extracts only the four new v5 columns per body part (PreQuiescence,
+        Jy_signed, OnsetSharpness, HFEnergy) from the DLC file — no video re-read.
+
+        Returns the upgraded DataFrame on success, or ``None`` on failure.
+        The upgraded cache is saved atomically to *target_path*.
+        """
+        _log = log_fn or (lambda msg: None)
+        try:
+            with open(old_path, 'rb') as fh:
+                old_X = pickle.load(fh)
+            has_v4 = any('_VelAsymmetry' in c for c in old_X.columns)
+            needs_v5 = not any('_PreQuiescence' in c for c in old_X.columns)
+            if not (has_v4 and needs_v5):
+                return None
+
+            _log("  [Cache] Found v4 cache → upgrading to v5 (no video re-read)")
+            from pose_features import PoseFeatureExtractor
+            upg_extractor = PoseFeatureExtractor(
+                bodyparts=cfg.get('bp_include_list') or [],
+                likelihood_threshold=cfg.get('pix_threshold', 0.8),
+                velocity_delta=cfg.get('dt_vel', 2),
+            )
+            new_feats = upg_extractor.extract_v5_features_only(pose_path)
+            if len(new_feats) > len(old_X):
+                new_feats = new_feats.iloc[:len(old_X)].reset_index(drop=True)
+
+            if len(new_feats) == len(old_X):
+                X_full = pd.concat(
+                    [old_X, new_feats.reset_index(drop=True)], axis=1)
+                FeatureCacheManager.save_cache(X_full, target_path)
+                _log(f"  ✓ Cache upgraded v4→v5: +{len(new_feats.columns)} temporal-context columns → {target_path}")
+                return X_full
+            else:
+                _log(f"  [Cache] Row count mismatch ({len(old_X)} vs {len(new_feats)}) — full extraction needed")
+                return None
+        except Exception as e:
+            _log(f"  [Cache] v4→v5 upgrade attempt failed: {e}")
             return None

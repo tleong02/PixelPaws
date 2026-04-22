@@ -46,3 +46,17 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# ── Pre-refactor snapshot (kept locally only) ────────────────────────────────
+backup_pre_refactor_20260418/
+
+# ── Local research materials (papers, datasheets, raw screenshots) ───────────
+lupe.pdf
+lupe_page*.png
+s41467-021-25420-x.pdf
+263001 ImageJ IL10 juv v adult.xlsx
+screenshot_*.png
+theme_*.png
+
+# ── Local working notes (not part of the shipped project) ────────────────────
+behavior_labeling_guide.md
