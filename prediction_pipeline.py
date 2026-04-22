@@ -732,6 +732,21 @@ def augment_features_post_cache(X, clf_data, model, dlc_path, log_fn=None):
         if log_fn:
             log_fn(f'  ⚠️  Normalized-distance augmentation failed: {e}')
 
+    # --- Final sanitization — no inf / NaN / huge values reach the trainer.
+    # XGBoost rejects inf outright; cheap belt-and-suspenders that catches
+    # anything that snuck through from the base cache or any augmentation.
+    try:
+        _num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(_num_cols) > 0:
+            _inf_mask = np.isinf(X[_num_cols].values)
+            if _inf_mask.any():
+                if log_fn:
+                    log_fn(f'  ⚠️  Sanitized {int(_inf_mask.sum())} inf values in features')
+                X[_num_cols] = X[_num_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                X[_num_cols] = X[_num_cols].clip(lower=-1e9, upper=1e9)
+    except Exception:
+        pass
+
     return X
 
 
@@ -754,10 +769,16 @@ def compute_normalized_distances(X, log_fn=None):
         _dmax = float(X[_dis_cols].abs().max().max())
     except Exception:
         _dmax = 0.0
-    if _dmax <= 0:
+    # Guard against vanishingly-small normalizers — dividing by 1e-40 would
+    # produce float32-overflowing values that XGBoost rejects as inf.
+    if _dmax < 1e-6:
         return X
     _norm_df = X[_dis_cols] / _dmax
     _norm_df.columns = [c.replace('Dis_', 'Dis_norm_', 1) for c in _dis_cols]
+    # Sanitize — defensive even after the guard above, in case upstream
+    # distances themselves contained inf/NaN.
+    _norm_df = _norm_df.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    _norm_df = _norm_df.clip(lower=-1e9, upper=1e9)
     X = pd.concat([X.reset_index(drop=True),
                    _norm_df.reset_index(drop=True)], axis=1)
     if log_fn:
@@ -874,6 +895,12 @@ def compute_brightness_category_b(X, log_fn=None):
 
     if _aug_dfs:
         _brightness_b = pd.concat(_aug_dfs, axis=1)
+        # Sanitize: Pix_prequi's 1/(var+1e-3) can still overshoot float32 when
+        # rolling variance underflows on constant regions; XGBoost rejects inf.
+        _brightness_b = _brightness_b.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        # Clip to a large-but-safe bound (well below float32 max) so gain
+        # comparisons stay meaningful.
+        _brightness_b = _brightness_b.clip(lower=-1e9, upper=1e9)
         X = pd.concat([X.reset_index(drop=True),
                        _brightness_b.reset_index(drop=True)], axis=1)
         if log_fn:

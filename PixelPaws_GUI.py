@@ -4575,6 +4575,20 @@ class PixelPawsGUI:
             except Exception as _nd_err:
                 self.log_train(f"  ⚠️  Normalized-distance augmentation failed: {_nd_err}")
 
+            # Defensive: ensure no inf / NaN reaches XGBoost or the correlation
+            # filter.  Training does its own augmentation inline (not via
+            # augment_features_post_cache), so we need this duplicate of the
+            # sanitize step here too.  Float32 max is ~3.4e38; clip at 1e9.
+            try:
+                _num_cols_t = X.select_dtypes(include=[np.number]).columns
+                _inf_count_t = int(np.isinf(X[_num_cols_t].values).sum())
+                if _inf_count_t > 0:
+                    self.log_train(f"  ⚠️  Sanitizing {_inf_count_t} inf values before training")
+                    X[_num_cols_t] = X[_num_cols_t].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                    X[_num_cols_t] = X[_num_cols_t].clip(lower=-1e9, upper=1e9)
+            except Exception as _sanitize_err:
+                self.log_train(f"  ⚠️  Pre-train sanitization failed: {_sanitize_err}")
+
             # ── Lag/lead features (computed post-concat) ──────────────
             if self.train_use_lag_features.get():
                 from pose_features import PoseFeatureExtractor
