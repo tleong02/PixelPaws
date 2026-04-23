@@ -315,31 +315,87 @@ class PixelBrightnessExtractorOptimized:
                        unit="frames", ncols=100, smoothing=0.1,
                        bar_format=bar_format)
 
+        # ── Reader-thread prefetching ──────────────────────────────────────
+        # cv2.VideoCapture.read() releases the GIL during H.264 decode, so we
+        # overlap frame I/O with feature computation.  Producer thread reads
+        # + grayscales; consumer (this thread) does ROI + LK optical flow +
+        # feature-dict assembly.  Queue items are:
+        #   None                            → EOF / cancellation sentinel
+        #   (i_frame, None, None)           → skipped frame (progress tick only)
+        #   (i_frame, frame_bgr, gray_u8)   → decoded frame ready for compute
+        import threading
+        from queue import Queue, Empty
+
+        frames_q = Queue(maxsize=4)
+        reader_exc = [None]   # one-slot list to relay exceptions from reader
+
+        def _reader():
+            try:
+                for i_read in range(num_frames):
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        break
+                    skip = (i_read % stride != 0) or (
+                        frame_mask is not None
+                        and i_read < len(frame_mask)
+                        and not frame_mask[i_read]
+                    )
+                    if skip:
+                        cap.grab()
+                        frames_q.put((i_read, None, None))
+                        continue
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Grayscale here in the producer — cvtColor releases the
+                    # GIL, so it stays overlapped with the consumer's work.
+                    gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Only keep the BGR frame if a callback actually needs it
+                    # (most runs don't); saves ~900 KB per queued item.
+                    _frame_for_cb = frame if frame_callback is not None else None
+                    frames_q.put((i_read, _frame_for_cb, gray_u8))
+            except Exception as _re:
+                reader_exc[0] = _re
+            finally:
+                frames_q.put(None)  # EOF sentinel
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
         prev_gray_u8 = None  # kept for optical flow (uint8, pre-threshold)
 
-        # Process frames
-        for i_frame in range(num_frames):
+        # Process frames (consumer loop)
+        while True:
             if cancel_flag is not None and cancel_flag.is_set():
+                # Tell producer to stop; drain queue until sentinel
+                while True:
+                    try:
+                        item = frames_q.get(timeout=0.2)
+                    except Empty:
+                        continue
+                    if item is None:
+                        break
+                reader_thread.join(timeout=2.0)
                 cap.release()
                 raise InterruptedError("Brightness extraction cancelled.")
-            # Determine whether to skip this frame (grab only, no decode)
-            skip = (i_frame % stride != 0) or (
-                frame_mask is not None
-                and i_frame < len(frame_mask)
-                and not frame_mask[i_frame]
-            )
-            if skip:
-                cap.grab()
+
+            try:
+                item = frames_q.get(timeout=0.5)
+            except Empty:
+                continue
+            if item is None:
+                # EOF — producer is done
+                if reader_exc[0] is not None:
+                    cap.release()
+                    raise reader_exc[0]
+                break
+
+            i_frame, frame, gray_u8 = item
+
+            if gray_u8 is None:
+                # Skipped frame — just advance the progress bar
                 if use_progress:
                     pbar.update(1)
                 continue
-
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # uint8 grayscale — used as-is for Lucas-Kanade
-            gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # Per-frame callback (e.g. contour extraction piggy-backing on this pass)
             if frame_callback is not None:
@@ -422,6 +478,9 @@ class PixelBrightnessExtractorOptimized:
         if use_progress:
             pbar.close()
 
+        # Reader thread has already terminated (we drained the sentinel above),
+        # but join defensively in case it's still winding down.
+        reader_thread.join(timeout=2.0)
         cap.release()
 
         # Forward-fill skipped frames (carry last sampled value forward)
