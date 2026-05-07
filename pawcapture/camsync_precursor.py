@@ -4,7 +4,7 @@ PawCapture — Multi-Camera Controller for PixelPaws
 Clean rebuild: OpenCV-only capture (single handle = props always work).
 FFmpeg used only for recording output. No secondary handle needed.
 """
-import sys, json, subprocess, threading, time, shutil
+import sys, json, subprocess, threading, time, shutil, re
 from pathlib import Path
 from datetime import datetime
 
@@ -39,9 +39,10 @@ PAWCAPTURE_VERSION = "1.0.0"
 PREVIEW_W, PREVIEW_H = 360, 203
 DEFAULT_W, DEFAULT_H, DEFAULT_FPS = 1280, 720, 60
 
-PROFILES_DIR   = Path.home() / "PawCapture" / "profiles"
-RECORDINGS_DIR = Path.home() / "PawCapture" / "recordings"
-LOGS_DIR       = Path.home() / "PawCapture" / "logs"
+PROFILES_DIR     = Path.home() / "PawCapture" / "profiles"
+RECORDINGS_DIR   = Path.home() / "PawCapture" / "recordings"
+LOGS_DIR         = Path.home() / "PawCapture" / "logs"
+OFRS_CONFIG_FILE = Path.home() / "PawCapture" / "ofrs_config.json"
 
 PROBE_RESOLUTIONS = [
     (640,360),(640,480),(800,600),(1024,576),
@@ -85,6 +86,110 @@ def _load_slots() -> dict:
 def _save_slots(slots: dict):
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(slots, indent=2))
+
+# ── RWD OFRS pairing ──────────────────────────────────────────────────────────
+# OFRS (RWD's fiber photometry app) writes per-recording session folders named
+# `YYYY_MM_DD-HH_MM_SS` containing Events.csv (`TimeStamp,Name,State`) where
+# TimeStamps are *session-relative ms* (same clock as Fluorescence.csv, which
+# starts at 0.000). The folder name is the session wall-clock start. Both
+# facts are used by `_align_ofrs_events` to merge events into the PawCapture
+# session manifest as MARKs.
+OFRS_SESSION_RE = re.compile(r"^\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$")
+
+def _load_ofrs_config() -> dict:
+    try:
+        if OFRS_CONFIG_FILE.exists():
+            return json.loads(OFRS_CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_ofrs_config(cfg: dict):
+    OFRS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OFRS_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+def _scan_ofrs_sessions(root) -> set:
+    """Walk `root` recursively and return a set of resolved Paths to OFRS
+    session folders (folder name matches OFRS_SESSION_RE and contains
+    Events.csv). Empty set on missing/unreadable root. We anchor on the
+    Events.csv file rather than on directory names alone so a half-written
+    folder without Events.csv yet doesn't get picked up as a "new" session."""
+    if not root:
+        return set()
+    p = Path(root)
+    if not p.exists():
+        return set()
+    out = set()
+    try:
+        for events_csv in p.rglob("Events.csv"):
+            d = events_csv.parent
+            if OFRS_SESSION_RE.match(d.name):
+                try:
+                    out.add(d.resolve())
+                except OSError:
+                    out.add(d)
+    except OSError:
+        pass
+    return out
+
+def _parse_ofrs_session_start(session_dir):
+    """OFRS folder name → naive local datetime. Returns None on bad shape."""
+    name = Path(session_dir).name
+    if not OFRS_SESSION_RE.match(name):
+        return None
+    try:
+        return datetime.strptime(name, "%Y_%m_%d-%H_%M_%S")
+    except ValueError:
+        return None
+
+def _read_ofrs_events(session_dir):
+    """Parse Events.csv into [{'ts_ms': float, 'name': str, 'state': int|str}].
+    Returns [] on missing/unreadable file. Header row is skipped."""
+    f = Path(session_dir) / "Events.csv"
+    if not f.exists():
+        return []
+    rows = []
+    try:
+        text = f.read_text(errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines()[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3 or not parts[0]:
+            continue
+        try:
+            ts_ms = float(parts[0])
+        except ValueError:
+            continue
+        try:
+            state = int(parts[2])
+        except ValueError:
+            state = parts[2]
+        rows.append({"ts_ms": ts_ms, "name": parts[1], "state": state})
+    return rows
+
+def _align_ofrs_events(session_dir, pawcapture_start):
+    """Read OFRS Events.csv and translate each row into a (t_seconds, label,
+    wall_time) mark relative to `pawcapture_start` (a datetime). Returns
+    list of mark dicts with the same shape as MainWindow._session_marks."""
+    ofrs_start = _parse_ofrs_session_start(session_dir)
+    events     = _read_ofrs_events(session_dir)
+    if ofrs_start is None or not events:
+        return []
+    base_offset_s = (ofrs_start - pawcapture_start).total_seconds()
+    marks = []
+    for ev in events:
+        t = base_offset_s + ev["ts_ms"] / 1000.0
+        # Wall time of the event = OFRS folder start + ts. Round to ms.
+        wall = (ofrs_start.timestamp() + ev["ts_ms"] / 1000.0)
+        wall_iso = datetime.fromtimestamp(wall).isoformat(timespec="milliseconds")
+        marks.append({
+            "t_seconds": round(t, 3),
+            "label":     f"OFRS:{ev['name']}={ev['state']}",
+            "wall_time": wall_iso,
+            "source":    "ofrs",
+        })
+    return marks
 
 def _usb_port_label(device_id: str) -> str:
     """Short, human-readable disambiguator from a USB DeviceID or PnP path.
@@ -4210,6 +4315,9 @@ slider values, output dir, filename, suffix format, and calibration.</p>
 <h2>📍 MARK button (sync markers)</h2>
 <p>Only enabled while RECORD ALL is active. Drops a timestamped marker (with optional label) into the session manifest at the current recording offset. Bound to <kbd>M</kbd>.</p>
 
+<h2>OFRS pairing (RWD photometry)</h2>
+<p>Click <b>OFRS…</b> in the legend bar to set RWD-FPsystem's data root (typically <code>D:\\RWD-OFRS\\RWD-Data</code>) and toggle auto-pair. When auto-pair is on, PawCapture snapshots existing OFRS session folders at RECORD ALL start and, on stop, locates any new session folder created during the recording window. Events from that session's <code>Events.csv</code> are aligned to the PawCapture timeline (folder name → wall-clock start; <code>TimeStamp</code> column → session-relative ms) and merged as <b>MARKs</b>. The raw OFRS session metadata also lands in the manifest under <code>ofrs_sessions</code> so PixelPaws can read it without re-walking disk.</p>
+
 <h2>Session manifest sidecar</h2>
 <p>Every RECORD ALL session writes a <code>session_YYYYMMDD_HHMMSS.json</code> next to the recordings (in the day-folder) with:</p>
 <ul>
@@ -4288,6 +4396,74 @@ class _HelpDialog(QDialog):
         root.addWidget(bb)
 
 
+class _OfrsConfigDialog(QDialog):
+    """Sets the OFRS data root + auto-pair toggle. Persisted to
+    OFRS_CONFIG_FILE. The dialog returns the new config dict via .result()
+    when accepted; cancel leaves disk unchanged."""
+
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QCheckBox
+        self.setWindowTitle("OFRS pairing")
+        self.resize(580, 240)
+        self._cfg = dict(cfg or {})
+        self.setStyleSheet(f"QDialog{{background:{BG_DEEP};color:{TEXT_HI};}}"
+                           f"QLabel{{color:{TEXT_HI};font:11px {FONT};}}")
+
+        v = QVBoxLayout(self); v.setContentsMargins(14, 12, 14, 12); v.setSpacing(8)
+        title = QLabel("Auto-merge RWD OFRS events into the session manifest")
+        title.setStyleSheet(f"color:{ACCENT};font:bold 12px {FONT};letter-spacing:1px;")
+        v.addWidget(title)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(QLabel("Data root:"))
+        self.root_edit = QLineEdit(self._cfg.get("data_root", ""))
+        self.root_edit.setStyleSheet(f"""QLineEdit{{background:#0C0C1E;color:{TEXT_MED};
+            border:1px solid {BORDER};border-radius:3px;padding:4px 8px;font:10px {FONT};}}
+            QLineEdit:focus{{border-color:{ACCENT};color:{TEXT_HI};}}""")
+        row.addWidget(self.root_edit)
+        pick = QPushButton("Browse…"); pick.setFixedHeight(26)
+        pick.setStyleSheet(f"""QPushButton{{color:{TEXT_HI};background:{BG_MID};
+            border:1px solid {BORDER};border-radius:3px;padding:2px 10px;font:10px {FONT};}}
+            QPushButton:hover{{border-color:{ACCENT};}}""")
+        pick.clicked.connect(self._pick_root)
+        row.addWidget(pick)
+        v.addLayout(row)
+
+        self.auto_cb = QCheckBox("Auto-pair OFRS session on RECORD ALL stop")
+        self.auto_cb.setChecked(bool(self._cfg.get("auto_pair", True)))
+        self.auto_cb.setStyleSheet(f"QCheckBox{{color:{TEXT_HI};font:11px {FONT};}}")
+        v.addWidget(self.auto_cb)
+
+        desc = QLabel(
+            "When on, PawCapture snapshots OFRS session folders under the data "
+            "root at RECORD ALL start, then on stop locates any new OFRS "
+            "session(s) created during the recording window and merges "
+            "Events.csv into the session manifest as MARKs.\n\n"
+            "Default root for RWD-FPsystem on this machine is typically "
+            "D:\\RWD-OFRS\\RWD-Data."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{TEXT_MED};font:10px {FONT};")
+        v.addWidget(desc)
+        v.addStretch()
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def _pick_root(self):
+        d = QFileDialog.getExistingDirectory(self, "OFRS data root", self.root_edit.text() or str(Path.home()))
+        if d:
+            self.root_edit.setText(d)
+
+    def chosen_config(self):
+        return {
+            "data_root": self.root_edit.text().strip(),
+            "auto_pair": self.auto_cb.isChecked(),
+        }
+
+
 # ── Main Window ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -4306,6 +4482,11 @@ class MainWindow(QMainWindow):
         self._session_id     = None
         self._session_marks  = []   # list of {"t_seconds": float, "label": str}
         self._session_panels = []
+        # OFRS pairing state. Snapshot of OFRS session folders that exist at
+        # RECORD ALL start; the diff at stop is what we merge.
+        self._ofrs_cfg          = _load_ofrs_config()
+        self._ofrs_pre_snapshot = set()
+        self._ofrs_session_info = []  # populated at stop, used by manifest writer
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -4475,11 +4656,27 @@ class MainWindow(QMainWindow):
         lrow.addSpacing(6); lrow.addWidget(self.phase_pos_combo)
         lrow.addSpacing(8); lrow.addWidget(self.phase_preview_lbl)
         lrow.addStretch()
+
+        # OFRS pairing — opens a small dialog; the status label reflects the
+        # current config so users can tell at a glance whether events from
+        # RWD's photometry app will be auto-merged into the manifest.
+        self.ofrs_btn = QPushButton("OFRS…"); self.ofrs_btn.setFixedHeight(22)
+        self.ofrs_btn.setToolTip("Configure RWD OFRS session pairing")
+        self.ofrs_btn.setStyleSheet(f"""QPushButton{{color:{TEXT_MED};background:{BG_DEEP};
+            border:1px solid {BORDER};border-radius:3px;padding:1px 8px;font:bold 9px {FONT};letter-spacing:1px;}}
+            QPushButton:hover{{color:{ACCENT};border-color:{ACCENT};}}""")
+        self.ofrs_btn.clicked.connect(self._open_ofrs_dialog)
+        self.ofrs_status_lbl = QLabel("")
+        self.ofrs_status_lbl.setStyleSheet(f"color:{TEXT_DIM};font:9px {FONT};")
+        lrow.addWidget(self.ofrs_btn); lrow.addSpacing(4); lrow.addWidget(self.ofrs_status_lbl)
+        lrow.addSpacing(20)
+
         for color, text in [(ACCENT,"● Auto — camera controls value"),(ACCENT2,"● Manual — slider sets value directly")]:
             l = QLabel(text); l.setStyleSheet(f"color:{color};font:9px {FONT};")
             lrow.addWidget(l); lrow.addSpacing(20)
         vbox.addWidget(legend)
         self._update_phase_preview()
+        self._update_ofrs_status()
 
         # Camera panels
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -4561,6 +4758,74 @@ class MainWindow(QMainWindow):
         sample = f"{tag}_CAM_N" if pos == "prefix" else f"CAM_N_{tag}"
         self.phase_preview_lbl.setText(f"→ recordings/YYYY-MM-DD/{tag}/{sample}.mp4")
 
+    # ── RWD OFRS pairing ──────────────────────────────────────────────────────
+    def _update_ofrs_status(self):
+        cfg = self._ofrs_cfg or {}
+        root = cfg.get("data_root", "")
+        auto = bool(cfg.get("auto_pair", False))
+        if not root:
+            self.ofrs_status_lbl.setText("not configured")
+            self.ofrs_status_lbl.setStyleSheet(f"color:{TEXT_DIM};font:9px {FONT};")
+            return
+        short = _short_path(Path(root)) if root else ""
+        if auto:
+            self.ofrs_status_lbl.setText(f"auto-pair on  ({short})")
+            self.ofrs_status_lbl.setStyleSheet(f"color:{SUCCESS};font:9px {FONT};")
+        else:
+            self.ofrs_status_lbl.setText(f"off  ({short})")
+            self.ofrs_status_lbl.setStyleSheet(f"color:{TEXT_DIM};font:9px {FONT};")
+
+    def _open_ofrs_dialog(self):
+        dlg = _OfrsConfigDialog(self, self._ofrs_cfg)
+        if dlg.exec_() == QDialog.Accepted:
+            self._ofrs_cfg = dlg.chosen_config()
+            try:
+                _save_ofrs_config(self._ofrs_cfg)
+            except OSError as e:
+                QMessageBox.warning(self, "OFRS config",
+                                    f"Couldn't save {OFRS_CONFIG_FILE}:\n{e}")
+            self._update_ofrs_status()
+
+    def _ofrs_should_pair(self):
+        cfg = self._ofrs_cfg or {}
+        return bool(cfg.get("auto_pair")) and bool(cfg.get("data_root"))
+
+    def _ofrs_take_snapshot(self):
+        """Called at RECORD ALL start. Captures the set of existing OFRS
+        session folders so the diff at stop is what was just recorded."""
+        if not self._ofrs_should_pair():
+            self._ofrs_pre_snapshot = set()
+            return
+        try:
+            self._ofrs_pre_snapshot = _scan_ofrs_sessions(self._ofrs_cfg.get("data_root"))
+        except Exception:
+            self._ofrs_pre_snapshot = set()
+
+    def _ofrs_collect_new(self, session_start, session_end):
+        """Return a list of OFRS session folders that appeared during the
+        recording window. Filters by folder-name datetime falling within
+        [start - 60 s, end + 60 s] to absorb minor clock skew between OFRS
+        and PawCapture (both run on this host so the slack is generous)."""
+        if not self._ofrs_should_pair():
+            return []
+        post = _scan_ofrs_sessions(self._ofrs_cfg.get("data_root"))
+        new  = post - (self._ofrs_pre_snapshot or set())
+        if not new:
+            return []
+        from datetime import timedelta
+        lo = session_start - timedelta(seconds=60)
+        hi = session_end   + timedelta(seconds=60)
+        out = []
+        for d in new:
+            ofrs_t = _parse_ofrs_session_start(d)
+            if ofrs_t is None:
+                continue
+            if lo <= ofrs_t <= hi:
+                out.append(d)
+        # Deterministic order: by folder-name datetime (== creation time).
+        out.sort(key=lambda d: _parse_ofrs_session_start(d) or datetime.min)
+        return out
+
     def _topbtn(self, fg, bg):
         return (f"QPushButton{{color:{fg};background:{bg};border:1px solid {fg};"
                 f"border-radius:4px;padding:4px 10px;font:bold 10px {FONT};letter-spacing:1px;}}"
@@ -4594,6 +4859,11 @@ class MainWindow(QMainWindow):
                 paths.append(str(path))
                 cam_data["file"] = str(path)
             cam_records.append(cam_data)
+        # Resolve any new OFRS sessions that appeared during the recording
+        # window and merge their events into the marks list. Done before
+        # writing the manifest so it captures both the raw OFRS records and
+        # the aligned marks.
+        ofrs_msg = self._merge_ofrs_for_session(end_time)
         manifest_path = self._write_session_manifest(cam_records, end_time)
         self.is_recording = False
         self._global_tick.stop()
@@ -4601,12 +4871,44 @@ class MainWindow(QMainWindow):
         self._rec_start = None
         self._session_panels = []
         self._session_marks  = []
+        self._ofrs_session_info = []
         self.rec_btn.setText("⏺  RECORD ALL"); self.rec_btn.setStyleSheet(self._rec_style(False))
         if hasattr(self, "mark_btn"): self.mark_btn.setEnabled(False)
         msg = f"Saved: {' | '.join(paths) if paths else 'no files'}"
         if manifest_path:
             msg += f"  |  manifest: {manifest_path.name}"
+        if ofrs_msg:
+            msg += f"  |  {ofrs_msg}"
         self.sb.showMessage(msg)
+
+    def _merge_ofrs_for_session(self, end_time):
+        """Find OFRS sessions created during the recording window and merge
+        their events into self._session_marks. Records the session metadata
+        on self._ofrs_session_info so the manifest writer can emit it. Returns
+        a short status string for the status bar, or '' when nothing merged."""
+        self._ofrs_session_info = []
+        if not self._ofrs_should_pair() or self._rec_start is None:
+            return ""
+        new_dirs = self._ofrs_collect_new(self._rec_start, end_time)
+        if not new_dirs:
+            return "OFRS: no new session"
+        total_events = 0
+        for d in new_dirs:
+            ofrs_start = _parse_ofrs_session_start(d)
+            events     = _read_ofrs_events(d)
+            marks      = _align_ofrs_events(d, self._rec_start)
+            self._session_marks.extend(marks)
+            total_events += len(events)
+            self._ofrs_session_info.append({
+                "session_dir":  str(d),
+                "session_name": Path(d).name,
+                "session_start_local": (ofrs_start.isoformat(timespec="seconds")
+                                        if ofrs_start else None),
+                "event_count":  len(events),
+                "events":       events,
+            })
+        n_sess = len(new_dirs)
+        return f"OFRS: paired {n_sess} session{'s' if n_sess != 1 else ''} ({total_events} events)"
 
     def _start_recording_session(self):
         live = [p for p in self.panels if p._live]
@@ -4631,6 +4933,8 @@ class MainWindow(QMainWindow):
         self._session_id     = self._rec_start.strftime("%Y%m%d_%H%M%S")
         self._session_marks  = []
         self._session_panels = list(started)
+        self._ofrs_session_info = []
+        self._ofrs_take_snapshot()
         if hasattr(self, "mark_btn"): self.mark_btn.setEnabled(True)
         codecs    = [getattr(p.recorder, "codec_used", "?") for p in started]
         gpu_codecs = ("h264_nvenc", "h264_qsv", "h264_amf")
@@ -4707,6 +5011,8 @@ class MainWindow(QMainWindow):
             "marks":         list(self._session_marks),
             "cameras":       cam_records,
         }
+        if self._ofrs_session_info:
+            manifest["ofrs_sessions"] = list(self._ofrs_session_info)
         out_path = target_dir / f"session_{self._session_id}.json"
         try:
             out_path.write_text(json.dumps(manifest, indent=2))

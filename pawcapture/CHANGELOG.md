@@ -4,6 +4,25 @@ Working log so context can be restored across sessions. Newest first.
 
 ---
 
+## 2026-05-07 (round 2) — RWD OFRS auto-pairing
+
+Pairs PawCapture sessions with RWD-FPsystem (OFRS) photometry sessions automatically. Targets the typical single-animal workflow where one PawCapture recording corresponds to one OFRS session.
+
+### How it works
+- **Config** — `OFRS…` button on the legend bar opens a dialog to set the OFRS data root (typically `D:\RWD-OFRS\RWD-Data`) and toggle auto-pair. Persisted to `~/PawCapture/ofrs_config.json`.
+- **Snapshot at start** — `_ofrs_take_snapshot` walks the data root for folders matching `\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}` containing `Events.csv` and stores the set on `self._ofrs_pre_snapshot`. Anchored on `Events.csv` rather than directory name alone so a half-written folder doesn't get treated as a new session.
+- **Diff at stop** — `_ofrs_collect_new` rescans, set-diffs, and filters by folder-name datetime falling within `[start - 60 s, end + 60 s]` (slack covers OFRS folder-create vs PawCapture wall-clock skew on the same host).
+- **Alignment** — folder name parses to OFRS session wall-clock start; `Events.csv` `TimeStamp` column is session-relative ms (verified against three sessions: matches `Fluorescence.csv`'s 0-based clock). Each event becomes a `MARK` at `(ofrs_start - pawcapture_start).total_seconds() + ts_ms/1000`.
+- **Manifest** — events land in `marks` with `label = "OFRS:<name>=<state>"` and `source = "ofrs"`. Raw OFRS metadata (folder path, event count, full event list) lives in a new top-level `ofrs_sessions` array so PixelPaws doesn't have to walk OFRS disk.
+
+### Why
+One animal at a time, both apps running on the same host. User wanted to skip the post-hoc alignment step. Auto-pair-on-stop hides the post-hoc work behind RECORD ALL — start OFRS, start PawCapture, stop both, manifest has everything. No OFRS-side changes, no hardware sync.
+
+### Smoke-tested
+Helpers exercised against the live `D:\RWD-OFRS\RWD-Data` tree (143 existing sessions). Parse, scan, and alignment all produce sane results. Wall-time stamping verified end-to-end (folder `2025_11_11-10_11_20` + first STIM `ts=96877 ms` → wall time `10:12:56.877`).
+
+---
+
 ## 2026-05-07 — phase tag (baseline / post-drug / antagonist) folder + filename
 
 Adds a session-global **Phase** selector to the legend bar with options *None / Baseline / Post-Drug / Antagonist / Custom…* plus a *Prefix / Suffix* position toggle. When a phase is set, recordings land in `recordings/YYYY-MM-DD/<phase>/` and the tag is added to the filename (`baseline_CAM_1_…mp4` or `CAM_1_…_baseline.mp4`). Date folder stays auto. None reproduces the prior path layout exactly.
