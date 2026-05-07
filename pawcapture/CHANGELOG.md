@@ -4,6 +4,20 @@ Working log so context can be restored across sessions. Newest first.
 
 ---
 
+## 2026-05-07 — phase tag (baseline / post-drug / antagonist) folder + filename
+
+Adds a session-global **Phase** selector to the legend bar with options *None / Baseline / Post-Drug / Antagonist / Custom…* plus a *Prefix / Suffix* position toggle. When a phase is set, recordings land in `recordings/YYYY-MM-DD/<phase>/` and the tag is added to the filename (`baseline_CAM_1_…mp4` or `CAM_1_…_baseline.mp4`). Date folder stays auto. None reproduces the prior path layout exactly.
+
+### Implementation
+- `Recorder._resolve_path` / `Recorder.start` gain `phase_tag` + `phase_position` kwargs. Empty `phase_tag` short-circuits back to the old `day_dir / f"{label}{ts}.mp4"` shape, so existing behavior is preserved when phase is unset.
+- `MainWindow.current_phase_tag()` / `current_phase_position()` are read by `CameraPanel.start_rec` via `self.window()`. Custom names are sanitized to `[a-z0-9_-]` (lowercase, spaces → `_`, leading/trailing punctuation stripped).
+- Per-camera RECORD and global RECORD ALL both honor the phase. Session manifest sidecar lands inside the phase folder alongside the recordings (no manifest code changes needed — it derives `target_dir` from the first cam's file path).
+
+### Why
+Drug-experiment workflow: each session is one phase, three cameras roll, files need to be sorted into baseline/post-drug/antagonist buckets at write time so PixelPaws sees the right grouping without manual triage.
+
+---
+
 ## 2026-05-06 (round 14) — feature bundle: manifest, reader, marks, scale bar, etc.
 
 Bumped to `PAWCAPTURE_VERSION = "1.0.0"` — first stable release. Pairs with the `pawcapture.session/v1` manifest schema and the `pixelpaws_calibrated=1` mp4 sentinel: PawCapture is now declaring a stable interface for PixelPaws to consume. Adds 10 features in one pass — they're loosely coupled and the testing surface is mostly UI-level.

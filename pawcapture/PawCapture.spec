@@ -7,7 +7,7 @@
 #   *.dll, Qt plugins, etc. ← Python + PyQt5 + cv2 runtime
 #
 # Build:  py -3 -m PyInstaller --noconfirm --clean PawCapture.spec
-# (or run build.ps1 from the camsync directory)
+# (or run build.ps1 from the pawcapture directory)
 
 from pathlib import Path
 
@@ -16,7 +16,7 @@ FFMPEG_SRC = ROOT / "ffmpeg" / "ffmpeg.exe"
 if not FFMPEG_SRC.exists():
     raise SystemExit(
         f"ffmpeg.exe not found at {FFMPEG_SRC}. "
-        "Drop the official Windows ffmpeg build into camsync\\ffmpeg\\ before building."
+        "Drop the official Windows ffmpeg build into pawcapture\\ffmpeg\\ before building."
     )
 
 a = Analysis(

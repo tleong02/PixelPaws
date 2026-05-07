@@ -1,6 +1,6 @@
 # build.ps1 — build PawCapture as a portable PyInstaller --onedir bundle.
 #
-# Usage (from the camsync directory):
+# Usage (from the pawcapture directory):
 #   .\build.ps1            # incremental build
 #   .\build.ps1 -Clean     # wipe build/ and dist/ first
 #
@@ -9,7 +9,7 @@
 #
 # First-time setup on a clean machine:
 #   1. Install Python 3.10+ (python.org installer, "Add to PATH").
-#   2. Drop ffmpeg.exe into camsync\ffmpeg\  (official Windows build).
+#   2. Drop ffmpeg.exe into pawcapture\ffmpeg\  (official Windows build).
 #   3. Run this script — it will install requirements.txt and build.
 
 param(

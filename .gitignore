@@ -47,7 +47,7 @@ Thumbs.db
 .idea/
 *.swp
 
-# ── camsync (camera capture app) ─────────────────────────────────────────────
-/camsync/ffmpeg/
-/camsync/dist/
-/camsync/build/
+# ── pawcapture (camera capture app) ──────────────────────────────────────────
+/pawcapture/ffmpeg/
+/pawcapture/dist/
+/pawcapture/build/

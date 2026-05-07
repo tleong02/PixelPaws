@@ -6,7 +6,7 @@ REM         build.bat --clean   (wipe build/ and dist/ first)
 REM
 REM First-time setup:
 REM   1. Install Python 3.10+ (python.org installer, "Add to PATH").
-REM   2. Drop ffmpeg.exe into camsync\ffmpeg\ (official Windows build).
+REM   2. Drop ffmpeg.exe into pawcapture\ffmpeg\ (official Windows build).
 REM   3. Run this script.
 
 setlocal

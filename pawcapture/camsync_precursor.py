@@ -1847,7 +1847,7 @@ class Recorder:
         """Bind to a CameraThread before start() so Phase 1 can use inline mode."""
         self._cam_thread = cam_thread
 
-    def _resolve_path(self, out_dir, suffix_fmt):
+    def _resolve_path(self, out_dir, suffix_fmt, phase_tag="", phase_position="prefix"):
         now = datetime.now()
         try:
             ts = now.strftime(suffix_fmt) if suffix_fmt else ""
@@ -1856,13 +1856,20 @@ class Recorder:
         # Group recordings by day so a `recordings/` folder doesn't grow into
         # one giant flat list. The day folder is created on demand by start().
         day_dir = out_dir / now.strftime("%Y-%m-%d")
-        return day_dir / f"{self.label}{ts}.mp4", ts
+        target_dir = day_dir / phase_tag if phase_tag else day_dir
+        if phase_tag and phase_position == "suffix":
+            stem = f"{self.label}{ts}_{phase_tag}"
+        elif phase_tag:
+            stem = f"{phase_tag}_{self.label}{ts}"
+        else:
+            stem = f"{self.label}{ts}"
+        return target_dir / f"{stem}.mp4", ts
 
     def start(self, out_dir, width=DEFAULT_W, height=DEFAULT_H,
               fps=DEFAULT_FPS, bitrate_mbps=8, suffix_fmt="_%Y%m%d_%H%M%S",
-              metadata=None):
+              metadata=None, phase_tag="", phase_position="prefix"):
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        self.path, ts = self._resolve_path(out_dir, suffix_fmt)
+        self.path, ts = self._resolve_path(out_dir, suffix_fmt, phase_tag, phase_position)
         # _resolve_path returns a path inside a YYYY-MM-DD subfolder; make
         # sure that subfolder exists before FFmpeg tries to write into it.
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -3875,10 +3882,14 @@ class CameraPanel(QWidget):
         else:
             fps_note = ""
 
+        win = self.window()
+        phase_tag = win.current_phase_tag() if hasattr(win, "current_phase_tag") else ""
+        phase_pos = win.current_phase_position() if hasattr(win, "current_phase_position") else "prefix"
         ok, err = self.recorder.start(self._out_dir, width=self._cap_w, height=self._cap_h,
                                       fps=rec_fps, bitrate_mbps=self._cap_bitrate,
                                       suffix_fmt=self._suffix_fmt,
-                                      metadata=self._calibration_metadata())
+                                      metadata=self._calibration_metadata(),
+                                      phase_tag=phase_tag, phase_position=phase_pos)
         if ok:
             # recorder_ref is still set so the Phase-2 capture loop can write()
             # frames to the recorder's own subprocess.  In Phase 1 the recorder
@@ -4187,6 +4198,8 @@ slider values, output dir, filename, suffix format, and calibration.</p>
   <li>Encoder: NVENC → QSV → AMF → libx264, picked once at startup. Button label shows which.</li>
   <li>Default output dir: <code>~/PawCapture/recordings/</code>. Override per-camera in the panel.</li>
   <li>Recordings are grouped by day: <code>recordings/YYYY-MM-DD/</code>. The day folder is created on demand at record start.</li>
+  <li><b>Phase</b> (top bar) tags a session as <i>baseline</i>, <i>post-drug</i>, <i>antagonist</i>, or a custom name.
+      When set, files go into <code>recordings/YYYY-MM-DD/&lt;phase&gt;/</code> and the tag is added as a prefix or suffix on the filename.</li>
   <li>Default filename: <code>CAM_N_YYYYMMDD_HHMMSS.mp4</code>. Suffix format is configurable per camera.</li>
   <li>Before RECORD ALL starts, free space on each output drive is checked — you'll be warned if there's less than ~1 GB per active camera.</li>
 </ul>
@@ -4409,14 +4422,64 @@ class MainWindow(QMainWindow):
                   activated=_guarded(self._record_mark))
         vbox.addWidget(topbar)
 
-        # Legend
-        legend = QWidget(); legend.setFixedHeight(24)
+        # Legend / phase bar. Phase = experimental stage tag (baseline,
+        # post-drug, antagonist, custom). When set, recordings are placed in
+        # a phase subfolder under the auto YYYY-MM-DD folder and the tag is
+        # added as a prefix/suffix on the filename. Date folder stays auto.
+        legend = QWidget(); legend.setFixedHeight(28)
         legend.setStyleSheet(f"background:{BG_MID};border-bottom:1px solid {BORDER};")
-        lrow = QHBoxLayout(legend); lrow.setContentsMargins(20,0,20,0); lrow.addStretch()
+        lrow = QHBoxLayout(legend); lrow.setContentsMargins(20,0,20,0); lrow.setSpacing(6)
+
+        phase_lbl = QLabel("PHASE:")
+        phase_lbl.setStyleSheet(f"color:{TEXT_DIM};font:bold 10px {FONT};letter-spacing:1px;")
+        self.phase_combo = QComboBox(); self.phase_combo.setFixedWidth(130)
+        self.phase_combo.setStyleSheet(f"""QComboBox{{background:{BG_DEEP};color:{TEXT_HI};
+            border:1px solid {BORDER};border-radius:3px;padding:2px 6px;font:10px {FONT};}}
+            QComboBox:hover{{border-color:{ACCENT};}}
+            QComboBox::drop-down{{border:none;width:18px;}}
+            QComboBox QAbstractItemView{{background:{BG_MID};color:{TEXT_HI};
+                selection-background-color:{BORDER};}}""")
+        # userData is the sanitized tag used in folder/filename (None / "" =
+        # off; "__custom__" sentinel reveals the free-text edit).
+        for label, tag in [
+            ("None",       ""),
+            ("Baseline",   "baseline"),
+            ("Post-Drug",  "post-drug"),
+            ("Antagonist", "antagonist"),
+            ("Custom…",    "__custom__"),
+        ]:
+            self.phase_combo.addItem(label, userData=tag)
+        self.phase_custom_edit = QLineEdit()
+        self.phase_custom_edit.setPlaceholderText("custom phase…")
+        self.phase_custom_edit.setFixedWidth(140); self.phase_custom_edit.setVisible(False)
+        self.phase_custom_edit.setStyleSheet(f"""QLineEdit{{background:{BG_DEEP};color:{ACCENT};
+            border:1px solid {BORDER};border-radius:3px;padding:2px 6px;font:10px {FONT};}}
+            QLineEdit:focus{{border-color:{ACCENT};}}""")
+        self.phase_pos_combo = QComboBox(); self.phase_pos_combo.setFixedWidth(80)
+        self.phase_pos_combo.setStyleSheet(f"""QComboBox{{background:{BG_DEEP};color:{TEXT_MED};
+            border:1px solid {BORDER};border-radius:3px;padding:2px 6px;font:10px {FONT};}}
+            QComboBox::drop-down{{border:none;width:18px;}}
+            QComboBox QAbstractItemView{{background:{BG_MID};color:{TEXT_HI};
+                selection-background-color:{BORDER};}}""")
+        self.phase_pos_combo.addItem("Prefix", userData="prefix")
+        self.phase_pos_combo.addItem("Suffix", userData="suffix")
+        self.phase_preview_lbl = QLabel("")
+        self.phase_preview_lbl.setStyleSheet(f"color:{TEXT_DIM};font:9px {FONT};")
+
+        self.phase_combo.currentIndexChanged.connect(self._on_phase_changed)
+        self.phase_pos_combo.currentIndexChanged.connect(self._update_phase_preview)
+        self.phase_custom_edit.textChanged.connect(self._update_phase_preview)
+
+        lrow.addWidget(phase_lbl); lrow.addWidget(self.phase_combo)
+        lrow.addWidget(self.phase_custom_edit)
+        lrow.addSpacing(6); lrow.addWidget(self.phase_pos_combo)
+        lrow.addSpacing(8); lrow.addWidget(self.phase_preview_lbl)
+        lrow.addStretch()
         for color, text in [(ACCENT,"● Auto — camera controls value"),(ACCENT2,"● Manual — slider sets value directly")]:
             l = QLabel(text); l.setStyleSheet(f"color:{color};font:9px {FONT};")
             lrow.addWidget(l); lrow.addSpacing(20)
         vbox.addWidget(legend)
+        self._update_phase_preview()
 
         # Camera panels
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -4455,6 +4518,48 @@ class MainWindow(QMainWindow):
 
     def _update_remove_btn(self):
         self.rem_cam_btn.setEnabled(len(self.panels) > 1)
+
+    # ── Phase tag (baseline / post-drug / antagonist / custom) ────────────────
+    @staticmethod
+    def _sanitize_phase_tag(s):
+        """Strip phase tag down to filename-safe chars (alnum, dash, under).
+        Spaces collapse to underscore, everything else dropped, lowercase."""
+        out = []
+        for ch in (s or "").strip().lower():
+            if ch.isalnum() or ch in "-_":
+                out.append(ch)
+            elif ch.isspace():
+                out.append("_")
+        # Avoid leading/trailing punctuation that would look weird in a path.
+        return "".join(out).strip("-_")
+
+    def current_phase_tag(self):
+        """Sanitized phase tag for folder + filename, or '' when off."""
+        if not hasattr(self, "phase_combo"):
+            return ""
+        raw = self.phase_combo.currentData()
+        if raw == "__custom__":
+            raw = self.phase_custom_edit.text()
+        return self._sanitize_phase_tag(raw)
+
+    def current_phase_position(self):
+        if not hasattr(self, "phase_pos_combo"):
+            return "prefix"
+        return self.phase_pos_combo.currentData() or "prefix"
+
+    def _on_phase_changed(self, idx):
+        is_custom = (self.phase_combo.itemData(idx) == "__custom__")
+        self.phase_custom_edit.setVisible(is_custom)
+        self._update_phase_preview()
+
+    def _update_phase_preview(self):
+        tag = self.current_phase_tag()
+        if not tag:
+            self.phase_preview_lbl.setText("→ recordings/YYYY-MM-DD/CAM_N.mp4")
+            return
+        pos = self.current_phase_position()
+        sample = f"{tag}_CAM_N" if pos == "prefix" else f"CAM_N_{tag}"
+        self.phase_preview_lbl.setText(f"→ recordings/YYYY-MM-DD/{tag}/{sample}.mp4")
 
     def _topbtn(self, fg, bg):
         return (f"QPushButton{{color:{fg};background:{bg};border:1px solid {fg};"
