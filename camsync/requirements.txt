@@ -1,0 +1,7 @@
+# Runtime deps
+PyQt5>=5.15,<6
+opencv-python>=4.8,<5
+numpy>=1.24,<3
+
+# Build-only (PyInstaller bundle). Safe to leave installed at runtime.
+pyinstaller>=6.0,<7

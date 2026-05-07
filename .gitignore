@@ -46,3 +46,8 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# ── camsync (camera capture app) ─────────────────────────────────────────────
+/camsync/ffmpeg/
+/camsync/dist/
+/camsync/build/
