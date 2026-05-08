@@ -888,7 +888,7 @@ class AnalysisTab(ttk.Frame):
         filtered_parts = []
         for part in parts:
             # Skip if it's a date (6 digits) or subject ID (4 digits)
-            if part.isdigit() and len(part) in [4, 6]:
+            if part.isdigit() and len(part) in [4, 6, 7]:
                 continue
             # Skip common experiment/metadata words
             if part.lower() in ['pixelpaws', 'results', 'formalin', 'formoxy']:
