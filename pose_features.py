@@ -188,9 +188,11 @@ class PoseFeatureExtractor:
                     BC = np.sqrt(BC)
                     AB = np.sqrt(AB)
                     
-                    # Angle in degrees
-                    AngleC = np.arccos((BC**2 + AC**2 - AB**2) / (2 * AC * BC))
-                    AngleC = np.rad2deg(AngleC)
+                    # Angle in degrees (safe: handle zero denominators and clamp for arccos)
+                    denom = 2 * AC * BC
+                    denom = denom.replace(0, np.nan)
+                    cos_val = ((BC**2 + AC**2 - AB**2) / denom).clip(-1, 1)
+                    AngleC = np.rad2deg(np.arccos(cos_val))
                     
                     angle_column = f'Ang_{bp1name}-{bp3name}-{bp2name}'
                     BP_angles = pd.concat([BP_angles, pd.DataFrame(AngleC, columns=[angle_column])], axis=1)

@@ -2,7 +2,6 @@
 Ultra-Optimized CPU Brightness Extraction
 
 This version uses NumPy vectorization and parallel processing to maximize CPU speed.
-Often faster than naive GPU approaches due to zero transfer overhead.
 
 Speed: 2-3x faster than standard CPU implementation
 
@@ -34,13 +33,11 @@ class PixelBrightnessExtractorOptimized:
                  square_size: int = 50,
                  pixel_threshold: Optional[float] = None,
                  min_prob: float = 0.8,
-                 use_gpu: bool = True,  # Ignored, for compatibility
-                 batch_size: Optional[int] = None,  # Ignored, for compatibility
-                 crop_offset_x: int = 0,  # NEW: DLC crop offset
-                 crop_offset_y: int = 0):  # NEW: DLC crop offset
+                 crop_offset_x: int = 0,
+                 crop_offset_y: int = 0):
         """
         Initialize optimized CPU brightness extractor.
-        
+
         Args:
             crop_offset_x: X offset to add to DLC coordinates (for cropped videos)
             crop_offset_y: Y offset to add to DLC coordinates (for cropped videos)
@@ -72,7 +69,11 @@ class PixelBrightnessExtractorOptimized:
                                     video_file: str,
                                     dt_vel: int = 2,
                                     create_video: bool = False,
-                                    optical_flow_extractor=None) -> pd.DataFrame:
+                                    optical_flow_extractor=None,
+                                    stride: int = 1,
+                                    frame_mask=None,
+                                    cancel_flag=None,
+                                    frame_callback=None) -> pd.DataFrame:
         """
         Extract brightness features using optimized CPU processing.
 
@@ -120,6 +121,10 @@ class PixelBrightnessExtractorOptimized:
         brightness = self._extract_vectorized(
             video_file, label, pix_threshold, frame_width, frame_height, num_frames,
             optical_flow_extractor=optical_flow_extractor,
+            stride=stride,
+            frame_mask=frame_mask,
+            cancel_flag=cancel_flag,
+            frame_callback=frame_callback,
         )
         
         # Calculate absolute first derivative (temporal changes)
@@ -140,7 +145,11 @@ class PixelBrightnessExtractorOptimized:
     
     def _extract_vectorized(self, video_file, label, pix_threshold,
                            frame_width, frame_height, num_frames,
-                           optical_flow_extractor=None):
+                           optical_flow_extractor=None,
+                           stride: int = 1,
+                           frame_mask=None,
+                           cancel_flag=None,
+                           frame_callback=None):
         """
         Vectorized extraction - pre-allocate arrays and minimize Python loops
         """
@@ -224,6 +233,9 @@ class PixelBrightnessExtractorOptimized:
                         'prob': np.zeros(num_frames, dtype=np.float32)
                     }
             else:
+                import warnings
+                warnings.warn(f"Brightness features: body part '{bp}' not found in DLC columns. "
+                              f"Using zero coordinates — features for this body part will be invalid.")
                 print(f"  ✗ Could not find columns for bodypart: {bp}")
                 print(f"     Looking for variations of: {bp}_x, {bp}_y, {bp}_prob")
                 coords[bp] = {
@@ -232,11 +244,17 @@ class PixelBrightnessExtractorOptimized:
                     'prob': np.zeros(num_frames, dtype=np.float32)
                 }
         
-        brightness_features = []
+        brightness_features = [None] * num_frames
         cap = cv2.VideoCapture(video_file)
 
         if optical_flow_extractor is not None:
             print("  Co-extracting optical flow in the same video pass...")
+
+        if stride > 1:
+            print(f"  Extraction stride={stride} (~{stride}× faster, forward-fill between samples)")
+        if frame_mask is not None:
+            n_decode = int(np.sum(frame_mask[:num_frames])) if hasattr(frame_mask, '__len__') else num_frames
+            print(f"  Frame mask active: decoding ~{n_decode} / {num_frames} frames")
 
         if use_progress:
             _desc = "  🐁 Analyzing + Flow" if optical_flow_extractor is not None else "  🐁 Analyzing"
@@ -248,6 +266,21 @@ class PixelBrightnessExtractorOptimized:
 
         # Process frames
         for i_frame in range(num_frames):
+            if cancel_flag is not None and cancel_flag.is_set():
+                cap.release()
+                raise InterruptedError("Brightness extraction cancelled.")
+            # Determine whether to skip this frame (grab only, no decode)
+            skip = (i_frame % stride != 0) or (
+                frame_mask is not None
+                and i_frame < len(frame_mask)
+                and not frame_mask[i_frame]
+            )
+            if skip:
+                cap.grab()
+                if use_progress:
+                    pbar.update(1)
+                continue
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -255,21 +288,25 @@ class PixelBrightnessExtractorOptimized:
             # uint8 grayscale — used as-is for Lucas-Kanade
             gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+            # Per-frame callback (e.g. contour extraction piggy-backing on this pass)
+            if frame_callback is not None:
+                frame_callback(i_frame, gray_u8, frame)
+
             # float32 copy for brightness (with threshold applied)
             frame_gray = gray_u8.astype(np.float32)
 
             # Vectorized threshold application
             mask = frame_gray < pix_threshold
             frame_gray[mask] = 1.0
-            
+
             # Extract brightness for all body parts
             brightness_values = np.zeros(n_bodyparts, dtype=np.float32)  # Default to 0 instead of 1
-            
+
             for idx, bp in enumerate(self.bodyparts_to_track):
                 x = coords[bp]['x'][i_frame]
                 y = coords[bp]['y'][i_frame]
                 prob = coords[bp]['prob'][i_frame]
-                
+
                 # Extract brightness regardless of confidence
                 # (User can filter by confidence later if needed)
                 size = self.square_sizes[bp]
@@ -277,27 +314,27 @@ class PixelBrightnessExtractorOptimized:
                 x_max = min(frame_width, x + size // 2)
                 y_min = max(0, y - size // 2)
                 y_max = min(frame_height, y + size // 2)
-                
+
                 # Vectorized ROI mean
                 roi = frame_gray[y_min:y_max, x_min:x_max]
                 if roi.size > 0:
                     brightness_values[idx] = np.mean(roi)
-            
+
             # Build feature dict
             bp_data = {}
-            
+
             # Individual brightness
             for idx, bp in enumerate(self.bodyparts_to_track):
                 bp_data[f'Pix_{bp}'] = brightness_values[idx]
-            
+
             # Pairwise ratios (vectorized where possible)
             for i in range(len(self.bodyparts_to_track)):
                 for j in range(i + 1, len(self.bodyparts_to_track)):
                     bp1 = self.bodyparts_to_track[i]
                     bp2 = self.bodyparts_to_track[j]
                     ratio = brightness_values[i] / max(brightness_values[j], 1e-10)
-                    bp_data[f'Log10(Pix_{bp1}/Pix_{bp2})'] = np.log10(ratio)
-            
+                    bp_data[f'Log10(Pix_{bp1}/Pix_{bp2})'] = np.log10(max(ratio, 1e-10))
+
             # Optical flow — same frame, no extra video read
             if optical_flow_extractor is not None and prev_gray_u8 is not None:
                 flow = optical_flow_extractor.compute_flow_for_frame(
@@ -307,7 +344,7 @@ class PixelBrightnessExtractorOptimized:
                     bp_data[f'{bp}_FlowX']   = vals['x']
                     bp_data[f'{bp}_FlowY']   = vals['y']
 
-            brightness_features.append(bp_data)
+            brightness_features[i_frame] = bp_data
             prev_gray_u8 = gray_u8
 
             if use_progress:
@@ -321,14 +358,24 @@ class PixelBrightnessExtractorOptimized:
                     mouse_anim = "🐭💨💨"
                 else:
                     mouse_anim = "🐭💨🏁"
-                
+
                 pbar.set_postfix_str(mouse_anim, refresh=False)
                 pbar.update(1)
-        
+
         if use_progress:
             pbar.close()
-        
+
         cap.release()
+
+        # Forward-fill skipped frames (carry last sampled value forward)
+        last = None
+        for i in range(num_frames):
+            if brightness_features[i] is not None:
+                last = brightness_features[i]
+            elif last is not None:
+                brightness_features[i] = last
+
+        brightness_features = [b for b in brightness_features if b is not None]
         return pd.DataFrame(brightness_features)
     
     def _auto_threshold(self, video_file: str, n_sample: int = 100) -> float:
@@ -357,33 +404,8 @@ class PixelBrightnessExtractorOptimized:
             return 30.0
 
 
-def extract_pixel_brightness_features_gpu(dlc_file: str,
-                                          video_file: str,
-                                          bodyparts: List[str],
-                                          square_size: int = 50,
-                                          pixel_threshold: Optional[float] = None,
-                                          dt_vel: int = 2,
-                                          min_prob: float = 0.8,
-                                          use_gpu: bool = True,
-                                          batch_size: Optional[int] = None,
-                                          crop_offset_x: int = 0,  # NEW
-                                          crop_offset_y: int = 0) -> pd.DataFrame:  # NEW
-    """
-    Convenience function (use_gpu ignored, always uses optimized CPU)
-    
-    Args:
-        crop_offset_x: X offset for DLC cropped videos (e.g., x1 from config.yaml)
-        crop_offset_y: Y offset for DLC cropped videos (e.g., y1 from config.yaml)
-    """
-    extractor = PixelBrightnessExtractorOptimized(bodyparts, square_size, pixel_threshold, 
-                                                   min_prob, use_gpu, batch_size,
-                                                   crop_offset_x, crop_offset_y)
-    return extractor.extract_brightness_features(dlc_file, video_file, dt_vel)
-
-
 # Backward compatibility alias
 PixelBrightnessExtractor = PixelBrightnessExtractorOptimized
-PixelBrightnessExtractorGPU = PixelBrightnessExtractorOptimized  # Both point to CPU version
 
 
 if __name__ == "__main__":

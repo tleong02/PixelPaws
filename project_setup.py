@@ -27,6 +27,13 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 _BP_DEFAULTS = ['hrpaw', 'hlpaw', 'snout']
 
+try:
+    from project_config import ProjectConfig
+    _PROJECT_CONFIG_AVAILABLE = True
+except ImportError:
+    ProjectConfig = None
+    _PROJECT_CONFIG_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Recent projects persistence
 # ---------------------------------------------------------------------------
@@ -348,6 +355,24 @@ class ProjectSetupWizard(tk.Toplevel):
             row=row, column=1, sticky='w', padx=5, pady=4)
         row += 1
 
+        # ---- Optical Flow ----
+        self._include_optflow = tk.BooleanVar(
+            value=existing.get('include_optical_flow', True))
+        ttk.Checkbutton(cf, text="Include Optical Flow Features (slower)",
+                        variable=self._include_optflow).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2))
+        row += 1
+
+        ttk.Label(cf, text="Optical Flow Body Parts:").grid(
+            row=row, column=0, sticky='w', pady=2)
+        saved_optflow = existing.get('bp_optflow_list', ['hrpaw', 'hlpaw', 'snout'])
+        if isinstance(saved_optflow, list):
+            saved_optflow = ','.join(saved_optflow)
+        self._bp_optflow = tk.StringVar(value=saved_optflow)
+        ttk.Entry(cf, textvariable=self._bp_optflow, width=30).grid(
+            row=row, column=1, sticky='w', padx=5, pady=2)
+        row += 1
+
         # ---- Populate body parts: saved config → defaults ----
         saved_bp = existing.get('bp_pixbrt_list', [])
         if isinstance(saved_bp, str):
@@ -419,6 +444,23 @@ class ProjectSetupWizard(tk.Toplevel):
 
     def _save_step2_config(self):
         """Persist Step 2 fields to PixelPaws_project.json."""
+        try:
+            roi = int(self._roi_size.get())
+        except ValueError:
+            roi = 20
+
+        if _PROJECT_CONFIG_AVAILABLE:
+            cfg = ProjectConfig.load(self.project_folder)
+            cfg.video_ext = self._video_ext.get()
+            cfg.behaviors = self._get_behaviors()
+            cfg.bp_pixbrt_list = self._get_selected_bodyparts()
+            cfg.roi_size = roi
+            cfg.include_optical_flow = self._include_optflow.get()
+            cfg.bp_optflow_list = [x.strip() for x in self._bp_optflow.get().split(',') if x.strip()]
+            cfg.save(self.project_folder)
+            return
+
+        # Inline fallback
         config_path = os.path.join(self.project_folder, 'PixelPaws_project.json')
         existing = {}
         if os.path.isfile(config_path):
@@ -427,18 +469,17 @@ class ProjectSetupWizard(tk.Toplevel):
                     existing = json.load(f)
             except Exception:
                 pass
-        try:
-            roi = int(self._roi_size.get())
-        except ValueError:
-            roi = 20
         existing.update({
             'project_folder': self.project_folder,
             'video_ext':      self._video_ext.get(),
             'behaviors':      self._get_behaviors(),
             'bp_pixbrt_list': self._get_selected_bodyparts(),
             'roi_size':       roi,
+            'include_optical_flow': self._include_optflow.get(),
+            'bp_optflow_list': [x.strip() for x in self._bp_optflow.get().split(',') if x.strip()],
         })
         try:
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
             with open(config_path, 'w') as f:
                 json.dump(existing, f, indent=2)
         except Exception as e:
@@ -457,11 +498,14 @@ class ProjectSetupWizard(tk.Toplevel):
         videos_dir = os.path.join(self.project_folder, 'videos')
         ext = getattr(self, '_video_ext', tk.StringVar(value='.mp4')).get()
 
-        # Find paired video + h5 files
+        # Find paired video + h5 files (deduplicate across case variants)
         self._video_pairs = []
         if os.path.isdir(videos_dir):
-            for vf in sorted(_glob.glob(os.path.join(videos_dir, f'*{ext}')) +
-                              _glob.glob(os.path.join(videos_dir, f'*{ext.upper()}'))):
+            _seen = {}
+            for vf in (_glob.glob(os.path.join(videos_dir, f'*{ext}')) +
+                       _glob.glob(os.path.join(videos_dir, f'*{ext.upper()}'))):
+                _seen[os.path.normcase(vf)] = vf
+            for vf in sorted(_seen.values()):
                 base = os.path.splitext(os.path.basename(vf))[0]
                 h5_matches = _glob.glob(os.path.join(videos_dir, f'{base}DLC*.h5'))
                 if h5_matches:
@@ -503,6 +547,9 @@ class ProjectSetupWizard(tk.Toplevel):
             state='normal' if self._video_pairs else 'disabled')
         self._extract_btn.pack(side='left', padx=4)
 
+        ttk.Button(btn_row, text="📋 Key File",
+                   command=self._open_key_file_dialog).pack(side='left', padx=4)
+
         ttk.Button(btn_row, text="⏭ Skip — I'll do this later",
                    command=self._skip_extraction).pack(side='left', padx=4)
 
@@ -513,36 +560,77 @@ class ProjectSetupWizard(tk.Toplevel):
         self._extract_log.config(state='disabled')
 
     def _run_extraction(self):
-        # Capture widget values on the main thread before spawning worker
-        bp_list = self._get_selected_bodyparts()
-        try:
-            roi = int(self._roi_size.get())
-        except ValueError:
-            roi = 20
+        # Use cached values from Step 2 (widgets are destroyed by _show_step3)
+        bp_list = self._saved_bp_list
+        roi = self._saved_roi
 
         self._extract_btn.config(state='disabled')
         self.btn_back.config(state='disabled')
 
         def worker():
             try:
-                from pixelpaws_easy import extract_all_features_auto
-            except ImportError:
+                from PixelPaws_GUI import (PixelPaws_ExtractFeatures,
+                                           _atomic_pickle_save,
+                                           PixelPawsGUI)
+            except ImportError as imp_err:
                 self.after(0, lambda: self._log_extract(
-                    "ERROR: pixelpaws_easy.py not found — cannot extract features."))
+                    f"ERROR: Could not import extraction functions — {imp_err}"))
                 self.after(0, lambda: self.btn_next.config(state='normal'))
                 return
 
+            # Read optical flow settings from Step 2 widgets
+            include_optflow = getattr(self, '_include_optflow',
+                                      tk.BooleanVar(value=False)).get()
+            bp_optflow_list = ([x.strip() for x in getattr(self, '_bp_optflow',
+                tk.StringVar(value='')).get().split(',') if x.strip()]
+                if include_optflow else [])
+
+            # Build config dict matching the main GUI's cache scheme
+            cfg = {
+                'bp_include_list': None,  # all body parts for pose
+                'bp_pixbrt_list': bp_list,
+                'square_size': [roi],
+                'pix_threshold': 0.3,
+                'include_optical_flow': include_optflow,
+                'bp_optflow_list': bp_optflow_list,
+            }
+            cfg_hash = PixelPawsGUI._feature_hash_key(cfg)
+            cache_dir = os.path.join(self.project_folder, 'features')
+            os.makedirs(cache_dir, exist_ok=True)
+
             for vf, h5f in self._video_pairs:
                 name = os.path.basename(vf)
+                session_name = os.path.splitext(name)[0]
+                cache_file = os.path.join(
+                    cache_dir, f"{session_name}_features_{cfg_hash}.pkl")
+
+                if os.path.isfile(cache_file):
+                    self.after(0, lambda n=name: self._log_extract(
+                        f"Skipping (cached): {n}"))
+                    continue
+
                 self.after(0, lambda n=name: self._log_extract(f"Processing: {n}"))
                 try:
-                    extract_all_features_auto(
-                        video_path=vf,
-                        dlc_path=h5f,
+                    X = PixelPaws_ExtractFeatures(
+                        pose_data_file=h5f,
+                        video_file_path=vf,
                         bp_pixbrt_list=bp_list,
                         square_size=roi,
+                        pix_threshold=0.3,
+                        bp_include_list=None,
+                        include_optical_flow=include_optflow,
+                        bp_optflow_list=bp_optflow_list,
                     )
-                    self.after(0, lambda n=name: self._log_extract(f"  ✓ Done: {n}"))
+                    X = X.reset_index(drop=True)
+                    nan_mask = X.isna().any(axis=1)
+                    if nan_mask.any():
+                        self.after(0, lambda n=name, cnt=int(nan_mask.sum()):
+                                   self._log_extract(
+                                       f"  Dropped {cnt} NaN rows"))
+                        X = X[~nan_mask].reset_index(drop=True)
+                    _atomic_pickle_save(X, cache_file)
+                    self.after(0, lambda n=name: self._log_extract(
+                        f"  ✓ Done: {n}"))
                 except Exception as e:
                     self.after(0, lambda n=name, err=str(e):
                                self._log_extract(f"  ✗ Error ({n}): {err}"))
@@ -552,6 +640,36 @@ class ProjectSetupWizard(tk.Toplevel):
             self.after(0, lambda: self.btn_back.config(state='normal'))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _open_key_file_dialog(self):
+        """Open KeyFileGeneratorDialog for videos in this project."""
+        videos_dir = os.path.join(self.project_folder, 'videos')
+        # Collect all video basenames (already discovered in _video_pairs, plus any without h5)
+        ext = getattr(self, '_video_ext', tk.StringVar(value='.mp4')).get()
+        _seen = {}
+        if os.path.isdir(videos_dir):
+            for vf in (_glob.glob(os.path.join(videos_dir, f'*{ext}')) +
+                       _glob.glob(os.path.join(videos_dir, f'*{ext.upper()}'))):
+                _seen[os.path.normcase(vf)] = vf
+        basenames = [os.path.splitext(os.path.basename(v))[0]
+                     for v in sorted(_seen.values())]
+        if not basenames:
+            messagebox.showinfo("No Videos",
+                                "No video files found in videos/.\n"
+                                "Add your videos first.", parent=self)
+            return
+        # Load existing key file if present
+        existing = {}
+        key_path = os.path.join(self.project_folder, 'key_file.csv')
+        if os.path.isfile(key_path):
+            try:
+                import csv
+                with open(key_path, newline='') as f:
+                    for row in csv.DictReader(f):
+                        existing[row.get('Subject', '')] = row.get('Treatment', '')
+            except Exception as _key_err:
+                print(f"Warning: could not load existing key file: {_key_err}")
+        KeyFileGeneratorDialog(self, self.project_folder, basenames, existing)
 
     def _skip_extraction(self):
         self._log_extract("(Skipped — you can run feature extraction later.)")
@@ -569,6 +687,11 @@ class ProjectSetupWizard(tk.Toplevel):
         if self._current_step == 1:
             pass  # handled by the New / Open buttons
         elif self._current_step == 2:
+            self._saved_bp_list = self._get_selected_bodyparts()
+            try:
+                self._saved_roi = int(self._roi_size.get())
+            except (ValueError, tk.TclError):
+                self._saved_roi = 20
             self._save_step2_config()
             self._show_step3()
         elif self._current_step == 3:
@@ -586,7 +709,131 @@ class ProjectSetupWizard(tk.Toplevel):
         self.root.deiconify()
 
     def _on_close(self):
-        """User closed the wizard — shut down the app."""
+        """User closed the wizard — exit at startup, return to main window mid-session."""
         self.grab_release()
         self.destroy()
-        self.root.destroy()
+        if self.root.winfo_viewable():
+            self.root.deiconify()   # mid-session: just go back to main window
+        else:
+            self.root.destroy()     # startup: exit the app
+
+
+# ---------------------------------------------------------------------------
+# KeyFileGeneratorDialog
+# ---------------------------------------------------------------------------
+class KeyFileGeneratorDialog(tk.Toplevel):
+    """
+    Modal dialog for assigning group labels (e.g. Control / Treatment) to
+    each video in a project.  Saves to <project>/key_file.csv and records
+    the path in PixelPaws_project.json.
+    """
+
+    def __init__(self, parent, project_folder: str, video_basenames: list,
+                 existing_groups: dict = None, on_save=None):
+        super().__init__(parent)
+        self.title("PixelPaws — Key File")
+        self.project_folder = project_folder
+        self.video_basenames = list(video_basenames)
+        self.on_save = on_save
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        existing_groups = existing_groups or {}
+
+        w = 540
+        h = min(80 + 36 * len(video_basenames) + 120, 620)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        # Header
+        hdr = tk.Frame(self, bg='#2c5f8a', pady=10)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text="📋 Key File — Group Assignment",
+                 bg='#2c5f8a', fg='white', font=('Arial', 12, 'bold')).pack()
+        tk.Label(hdr,
+                 text="Assign each video to a group (e.g. Control, Treatment, Sham).",
+                 bg='#2c5f8a', fg='#c8e0f4', font=('Arial', 9)).pack()
+
+        # Quick-fill bar
+        qf = ttk.Frame(self, padding=(10, 6, 10, 2))
+        qf.pack(fill='x')
+        ttk.Label(qf, text="Set all to:").pack(side='left')
+        self._qf_var = tk.StringVar()
+        ttk.Entry(qf, textvariable=self._qf_var, width=14).pack(side='left', padx=4)
+        ttk.Button(qf, text="Apply", command=self._apply_quick_fill).pack(side='left')
+
+        # Scrollable table
+        cf = ttk.Frame(self, padding=6)
+        cf.pack(fill='both', expand=True)
+        canvas = tk.Canvas(cf, highlightthickness=0)
+        vsb = ttk.Scrollbar(cf, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+
+        self._table = ttk.Frame(canvas)
+        _cwin = canvas.create_window((0, 0), window=self._table, anchor='nw')
+
+        ttk.Label(self._table, text="Subject (video base name)", font=('Arial', 9, 'bold'),
+                  width=38).grid(row=0, column=0, sticky='w', padx=4, pady=2)
+        ttk.Label(self._table, text="Treatment / Group", font=('Arial', 9, 'bold'),
+                  width=16).grid(row=0, column=1, sticky='w', padx=4, pady=2)
+        ttk.Separator(self._table, orient='horizontal').grid(
+            row=1, column=0, columnspan=2, sticky='ew', pady=2)
+
+        self._group_vars = {}
+        for i, base in enumerate(self.video_basenames):
+            ttk.Label(self._table, text=base, anchor='w').grid(
+                row=i + 2, column=0, sticky='w', padx=4, pady=2)
+            var = tk.StringVar(value=existing_groups.get(base, ''))
+            ttk.Entry(self._table, textvariable=var, width=20).grid(
+                row=i + 2, column=1, padx=4, pady=2, sticky='w')
+            self._group_vars[base] = var
+
+        self._table.bind('<Configure>',
+                         lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda _e: canvas.itemconfig(_cwin, width=_e.width))
+
+        # Buttons
+        bf = ttk.Frame(self, padding=(10, 6))
+        bf.pack(fill='x', side='bottom')
+        ttk.Button(bf, text="💾 Save", command=self._save).pack(side='right', padx=4)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side='right', padx=4)
+
+    def _apply_quick_fill(self):
+        val = self._qf_var.get().strip()
+        if val:
+            for var in self._group_vars.values():
+                var.set(val)
+
+    def _save(self):
+        import csv
+        key_path = os.path.join(self.project_folder, 'key_file.csv')
+        rows = [(base, self._group_vars[base].get().strip())
+                for base in self.video_basenames]
+        try:
+            with open(key_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Subject', 'Treatment'])
+                writer.writerows(rows)
+            # Record path in project JSON
+            config_path = os.path.join(self.project_folder, 'PixelPaws_project.json')
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path) as f:
+                        cfg = json.load(f)
+                    cfg['key_file'] = 'key_file.csv'
+                    with open(config_path, 'w') as f:
+                        json.dump(cfg, f, indent=2)
+                except Exception:
+                    pass
+            if self.on_save:
+                self.on_save({base: grp for base, grp in rows})
+            messagebox.showinfo("Saved",
+                                f"Key file saved to:\n{key_path}", parent=self)
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Save Error",
+                                 f"Could not save key file:\n{e}", parent=self)

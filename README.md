@@ -1,6 +1,19 @@
 # PixelPaws — User Guide
 
-Desktop GUI for automated animal behavior classification using DeepLabCut pose data and XGBoost. PixelPaws takes the `.h5` output from DeepLabCut, extracts kinematic and pixel-brightness features, trains an XGBoost classifier to detect a target behavior frame-by-frame, and then runs batch predictions and group statistics — all through a point-and-click interface with no coding required.
+Desktop GUI for automated animal behavior classification using DeepLabCut pose data and XGBoost. PixelPaws takes the `.h5` output from DeepLabCut, extracts kinematic and pixel-brightness features, trains an XGBoost classifier to detect a target behavior frame-by-frame, and then runs batch predictions and group statistics.
+
+## Demo
+
+Example of automated behavior scoring using a scratching classifier. Behavior detections are overlaid frame-by-frame on the video.
+
+
+
+
+
+
+
+
+<video src="https://github.com/user-attachments/assets/e0a584de-79b6-440f-a04d-0090ccbda179" controls width="720"></video>
 
 ---
 
@@ -16,9 +29,10 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 6. [Tab-by-Tab Guide](#tab-by-tab-guide)
    - [Train](#train-tab)
    - [Predict](#predict-tab)
+   - [Batch](#batch-tab)
    - [Evaluate](#evaluate-tab)
    - [Analyze](#analyze-tab)
-   - [Active Learning](#active-learning-tab)
+   - [Gait & Limb Use](#gait--limb-use-tab)
    - [Tools](#tools-tab)
 7. [Project Folder Layout](#project-folder-layout)
 8. [Requirements](#requirements)
@@ -28,16 +42,9 @@ Desktop GUI for automated animal behavior classification using DeepLabCut pose d
 
 ## Installation
 
-**GPU (recommended — faster brightness extraction):**
 ```bash
 git clone https://github.com/rslivicki/PixelPaws.git
 cd PixelPaws
-pip install -r requirements_gpu.txt
-python enable_pytorch_gpu.py
-```
-
-**CPU only:**
-```bash
 pip install -r requirements.txt
 ```
 
@@ -172,10 +179,33 @@ The Train tab is where you build a classifier for a single behavior.
 
 **Feature settings.**
 - *Pose features* — kinematic features computed from body-part coordinates: pairwise distances, joint angles, velocities at multiple timescales, and in-frame probability (confidence) scores.
-- *Brightness features* — pixel brightness in square ROIs around selected body parts, extracted directly from video frames. Requires the video file. PyTorch/CUDA accelerates this significantly on GPU.
+- *Brightness features* — pixel brightness in square ROIs around selected body parts, extracted directly from video frames. Requires the video file.
 - Choose which body parts to include. Fewer body parts = faster extraction; more = richer features.
 
-**Bout parameters.** Set the minimum bout duration (frames) and minimum inter-bout interval to merge adjacent detections. These are applied at prediction time, not during training.
+**Bout parameters.** Set the minimum bout duration (frames) and minimum inter-bout interval to merge adjacent detections. These are applied at prediction time, not during training. Click **Auto-Suggest Bout Parameters** to analyze your label files and get recommended values based on the observed bout-length distribution.
+
+**Scan Sessions.** Click to open a popup listing all discovered session triplets (video + H5 + label CSV) with their file paths and match status — useful for verifying PixelPaws found the files you expect.
+
+**XGBoost hyperparameters.** All core XGBoost parameters are exposed and tunable:
+- *Number of Trees* (default 1700) — maximum boosting rounds
+- *Max Depth* (default 6) — maximum tree depth
+- *Learning Rate* (default 0.01) — step-size shrinkage
+- *Subsample* (default 0.8) — fraction of training rows sampled per tree
+- *Feature Sampling* (colsample_bytree, default 0.2) — fraction of features sampled per tree
+
+**Cross-validation folds.** Adjustable from 2 to 10 folds (default 5).
+
+**Early stopping.** On by default. Training halts when validation F1 stops improving for a configurable number of rounds (10–200, default 50) and selects the optimal number of trees automatically.
+
+**Class imbalance handling.** `scale_pos_weight` is on by default — it up-weights the positive (behavior-present) class proportionally so that rare behaviors are not overwhelmed by majority-class frames, without requiring downsampling.
+
+**SHAP prune + retrain.** Optional two-pass training workflow: the first pass trains a full model and computes SHAP importance, then prunes to the top N features (configurable, default 40) and retrains on the reduced feature set. This can improve generalization and reduce overfitting on noisy features.
+
+**Trim to last labeled event.** On by default. Removes all frames after the last positive label in each session before training. This prevents BORIS trailing zeros (unlabeled tail of the video) from flooding the training set with false negatives.
+
+**Optical flow features.** Toggle to include optical-flow-based features alongside pose and brightness. A configurable body-part list controls which body parts flow is computed around.
+
+**Save / Load Configuration.** Persist all training settings (hyperparameters, feature options, body-part lists, bout parameters) to a JSON file for reuse across sessions or sharing with collaborators.
 
 **Start Training.** Click to begin. A training visualization window opens showing:
 - Cross-validation F1 scores across folds
@@ -204,7 +234,7 @@ The Predict tab runs a trained classifier on a single video and reports behavior
 #### What it does
 
 1. Loads the classifier and reads its stored behavior name, threshold, body-part lists, bout-filtering parameters, and feature settings.
-2. Extracts pose + brightness features if no cached file is provided (this is the slow step — expect 2–10 minutes depending on video length and whether GPU is available).
+2. Extracts pose + brightness features if no cached file is provided (this is the slow step — expect 2–10 minutes depending on video length).
 3. Runs the XGBoost model on every frame to produce a per-frame probability score.
 4. Applies the trained threshold to produce binary frame labels (0 = absent, 1 = present).
 5. Applies **bout filtering**: removes detections shorter than the minimum bout duration and fills gaps shorter than the maximum inter-bout interval. These parameters are stored in the classifier file, not set manually here.
@@ -223,6 +253,24 @@ The Predict tab runs a trained classifier on a single video and reports behavior
 
 The Predict tab includes an optional **Human Labels** field where you can point to a ground-truth label CSV for the session. This path is stored with the prediction for reference but the Predict tab itself does not compute agreement metrics. For a full evaluation — confusion matrix, precision, recall, F1 at the trained threshold, precision-recall curve, and SHAP feature importance — use the **Evaluate tab**, which is designed specifically for that purpose.
 
+### Batch Tab
+
+The Batch tab runs one or more classifiers across an entire folder of videos in a single operation.
+
+**Inputs:**
+- **Data folder** — select the folder containing your videos (and their corresponding DLC H5 files).
+- **Video extension** — filter by file extension (e.g., `.mp4`, `.avi`).
+- **Classifiers** — add multiple classifiers from `classifiers/`. Use **Auto-Detect** to find all `.pkl` files in the project, or add/remove individually.
+- **Prefer filtered DLC files** — when checked, PixelPaws uses filtered DLC output (e.g., `*_filtered.h5`) over unfiltered when both exist for the same session.
+
+**Feature status checker.** Before running, click **Check Feature Status** to see which sessions already have cached features and which will require extraction from video. This lets you estimate how long the batch will take.
+
+**Preview mapping.** Click **Preview** to see which classifier will be applied to which video, confirming the mapping before committing to a long batch run.
+
+**Per-classifier settings.** Each classifier in the list can have its own `min_bout_sec` and `bin_size_sec` overrides for bout filtering and time binning in the output.
+
+**Output.** For each video × classifier combination, a prediction CSV is written to the output folder (one file per video per classifier). These CSVs are in the same format as single-session Predict output and can be loaded directly into the Analyze tab.
+
 ### Evaluate Tab
 
 The Evaluate tab measures how well a classifier performs against hand-labeled ground truth.
@@ -231,11 +279,14 @@ The Evaluate tab measures how well a classifier performs against hand-labeled gr
 2. PixelPaws discovers available labeled test sessions automatically (same triplet logic as training). You can also point it to a specific session manually.
 3. Click **Run Evaluation**.
 
+Evaluation can run in **per-session** mode (one report per session) or **pooled** mode (aggregate all selected sessions into a single evaluation).
+
 Results include:
 - Confusion matrix
 - Precision, Recall, and F1 score at the trained threshold
 - Precision-recall curve
 - SHAP summary plot showing which features most influence predictions
+- Bout-level statistics (bout count agreement, mean bout duration comparison between predicted and ground truth)
 
 All outputs are saved to `evaluations/` as a text report and image files.
 
@@ -253,7 +304,11 @@ The Analyze tab performs cohort-level batch analysis: it loads prediction CSVs f
 - *Show cumulative time plot* — running total of behavior time over the session, mean ± error per treatment.
 - *Show latency to first bout* — for each animal, the time of the first bin with any detected behavior; displayed as a bar + scatter plot per treatment. Animals with no bouts are excluded and noted on the graph.
 - *Formalin phase analysis* — splits the session into Acute (default 0–10 min) and Phase II (default 10–60 min) windows.
+- *Bout analysis graph* — bar + scatter plots of bout count and mean bout duration per treatment group.
+- *Heatmap* — time-bin × animal matrix color-coded by behavior intensity, with two variants: all-time (total seconds per bin) and bouts-only (bout count per bin).
+- *Cumulative bouts* — running bout count over the session, mean ± error per treatment group.
 - *Statistical testing* — adds significance markers using two-way ANOVA (time × treatment) with Tukey HSD post-hoc for the time course, and one-way ANOVA or t-test for the bar graphs.
+- *Statistics summary tab* — a tabbed output showing the full ANOVA table (F-statistics, p-values, effect sizes) alongside the graphs.
 
 **Graph Settings dialog.** Click **Generate Graphs** to open the dialog before plotting:
 1. *Time window* — maximum minutes to display.
@@ -265,18 +320,29 @@ The Analyze tab performs cohort-level batch analysis: it loads prediction CSVs f
 
 Each graph opens in a tabbed window with **Save Figure** (PNG/PDF/SVG at 300 dpi) and **Export Data** (CSV) buttons.
 
-### Active Learning Tab
+### Gait & Limb Use Tab
 
-Active Learning minimizes the number of frames you need to hand-label by having the model identify the frames where it is most uncertain.
+The Gait & Limb Use tab analyzes paw contact patterns, gait timing, and limb symmetry from DLC pose data — no force plate or pressure mat needed.
 
-**Workflow:**
-1. Train an initial classifier on a small set of labeled frames (or use a starter classifier).
-2. On the Active Learning tab, point PixelPaws at an unlabeled video and run **Select Frames**. The model scores every frame and selects the most informative ones (highest prediction entropy or proximity to the 0.5 decision boundary).
-3. Open the selected frames in the built-in labeling interface. Label each frame (1 = behavior present, 0 = absent).
-4. The new labels are merged with the existing label set and the classifier is retrained.
-5. Repeat until performance plateaus — typically 3–5 iterations reduces labeling effort by 50–80% compared to labeling a random sample.
+**Paw contact detection.** Three methods are available:
+- *Height* — paw is "in contact" when its vertical coordinate falls below a threshold
+- *Speed* — paw is "in contact" when its speed drops below a threshold (Kumar Lab, Cell Reports 2022)
+- *Combined* — both height AND speed criteria must agree
 
-The active learning label files are saved in `behavior_labels/` and are compatible with the standard training pipeline.
+**Metrics computed per session:**
+- **Contact percentages** — % frames each paw is in stance (ground contact) for hind-left, hind-right, fore-left, fore-right
+- **Weight-bearing index (WBI)** — HL / (HL+HR) × 100 (50 = symmetric); also computed for fore paws
+- **Symmetry index (SI)** — (HL−HR) / (HL+HR) × 100 (0 = symmetric)
+- **Brightness during contact** — mean ROI brightness during stance frames (optional, requires video)
+- **Gait timing** — stance duration, swing duration, stride duration, duty cycle, cadence, and stride count per paw
+- **Gait spatial** — stride length per paw, step length and step width for hind/fore pairs
+- **Interlimb coordination** — phase coupling between left-right hind paws and diagonal pairs
+- **Gait symmetry** — stance symmetry index, stride length symmetry index
+- **Paw contour analysis** — paw area, spread, contact intensity, width, solidity, aspect ratio, circularity (optional, requires video)
+
+**Time binning.** All metrics can be computed in user-defined time bins (e.g., 5-minute windows) for tracking changes over a session.
+
+**Batch processing.** Select multiple sessions and run analysis across all of them. Results are saved to `gait_limb_analysis/` inside the project folder as CSV files and summary plots.
 
 ### Tools Tab
 
@@ -297,6 +363,7 @@ The Tools tab provides quick access to a set of utilities that complement the ma
 | **BORIS to PixelPaws** | Converts a BORIS event-log export (CSV) into the frame-indexed label CSV format that PixelPaws expects, using the video frame rate to map timestamps to frame numbers. |
 | **Optimize Parameters** | Grid-searches bout-filtering parameters (minimum bout duration, minimum inter-bout interval) to maximize agreement with hand labels on a selected session. |
 | **Feature Extraction** | Runs feature extraction manually on a selected video + H5 pair and saves the result to `features/`; useful for pre-caching before a training run. |
+| **Skeleton Video Renderer** | Render skeleton overlays on video with customizable colors, glow effects, paw trails, and bout-clipping. Multiple colorway presets available. |
 | **Theme Switcher** | Toggles between light and dark UI themes. |
 
 ---
@@ -312,6 +379,7 @@ my_project/
 ├── results/           # Prediction outputs (per-video CSVs, videos, ethograms)
 ├── analysis/          # Batch analysis outputs
 ├── evaluations/       # Evaluation reports + SHAP plots
+├── gait_limb_analysis/ # Gait & Limb Use outputs
 └── PixelPaws_project.json
 ```
 
@@ -332,7 +400,8 @@ my_project/
 | h5py / tables | ≥ 3.8 | Reading DLC HDF5 output |
 | matplotlib | ≥ 3.7 | Graphs |
 | seaborn | ≥ 0.12 | Heatmaps |
-| torch *(optional)* | ≥ 2.0 | GPU-accelerated brightness extraction |
+| PyYAML | ≥ 6.0 | Reading DLC config.yaml |
+| openpyxl | ≥ 3.1 | XLSX key file support in Analyze tab |
 
 ---
 
